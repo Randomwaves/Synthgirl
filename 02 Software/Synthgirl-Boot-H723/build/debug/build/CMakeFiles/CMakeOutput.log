@@ -1,0 +1,64 @@
+The target system is: Generic -  - arm
+The host system is: Darwin - 23.0.0 - arm64
+Compiling the C compiler identification source file "CMakeCCompilerId.c" succeeded.
+Compiler: /Library/Developer/CommandLineTools/usr/bin/cc 
+Build flags: 
+Id flags: -c 
+
+The output was:
+0
+
+
+Compilation of the C compiler identification source "CMakeCCompilerId.c" produced "CMakeCCompilerId.o"
+
+The C compiler identification is AppleClang, found in "/Users/eeyurdakul/Library/CloudStorage/Dropbox/STM32Cube/Synthgirl/Synthgirl-Boot-H723/build/debug/build/CMakeFiles/3.25.1/CompilerIdC/CMakeCCompilerId.o"
+
+Compiling the CXX compiler identification source file "CMakeCXXCompilerId.cpp" succeeded.
+Compiler: /Library/Developer/CommandLineTools/usr/bin/CC 
+Build flags: 
+Id flags: -c 
+
+The output was:
+0
+
+
+Compilation of the CXX compiler identification source "CMakeCXXCompilerId.cpp" produced "CMakeCXXCompilerId.o"
+
+The CXX compiler identification is AppleClang, found in "/Users/eeyurdakul/Library/CloudStorage/Dropbox/STM32Cube/Synthgirl/Synthgirl-Boot-H723/build/debug/build/CMakeFiles/3.25.1/CompilerIdCXX/CMakeCXXCompilerId.o"
+
+Checking whether the ASM compiler is Clang using "--version" matched "(clang version)":
+Apple clang version 12.0.5 (clang-1205.0.22.9)
+Target: arm64-apple-darwin23.1.0
+Thread model: posix
+InstalledDir: /Library/Developer/CommandLineTools/usr/bin
+Compiling the C compiler identification source file "CMakeCCompilerId.c" succeeded.
+Compiler: /Library/Developer/CommandLineTools/usr/bin/cc 
+Build flags: 
+Id flags: -c 
+
+The output was:
+0
+
+
+Compilation of the C compiler identification source "CMakeCCompilerId.c" produced "CMakeCCompilerId.o"
+
+The C compiler identification is AppleClang, found in "/Users/eeyurdakul/Library/CloudStorage/Dropbox/STM32Cube/Synthgirl/Synthgirl-Boot-H723/build/debug/build/CMakeFiles/3.25.1/CompilerIdC/CMakeCCompilerId.o"
+
+Compiling the CXX compiler identification source file "CMakeCXXCompilerId.cpp" succeeded.
+Compiler: /Library/Developer/CommandLineTools/usr/bin/CC 
+Build flags: 
+Id flags: -c 
+
+The output was:
+0
+
+
+Compilation of the CXX compiler identification source "CMakeCXXCompilerId.cpp" produced "CMakeCXXCompilerId.o"
+
+The CXX compiler identification is AppleClang, found in "/Users/eeyurdakul/Library/CloudStorage/Dropbox/STM32Cube/Synthgirl/Synthgirl-Boot-H723/build/debug/build/CMakeFiles/3.25.1/CompilerIdCXX/CMakeCXXCompilerId.o"
+
+Checking whether the ASM compiler is Clang using "--version" matched "(clang version)":
+Apple clang version 12.0.5 (clang-1205.0.22.9)
+Target: arm64-apple-darwin23.1.0
+Thread model: posix
+InstalledDir: /Library/Developer/CommandLineTools/usr/bin
