@@ -269,6 +269,7 @@ bool Controller::sendMidiCommand(uint8_t command_, uint8_t data0_, uint8_t data1
 void Controller::receiveMidiCommand() {
     if (system.midi.rxActive) {
         uint8_t rxData = midiRxData;
+
         // note on
         if ((system.midi.rxNoteOnReadStage == 0) && (rxData == (0x90 + system.midi.rxChannel))) {
             system.midi.rxNoteOnReadStage = 1;
@@ -278,7 +279,16 @@ void Controller::receiveMidiCommand() {
         } else if (system.midi.rxNoteOnReadStage == 2) {
             system.midi.rxNoteOnVelocity = rxData;
             system.midi.rxNoteOnReadStage = 0;
-            system.midi.rxNoteOnWriteFlag = 1;
+            system.midi.rxNoteOffVelocity = rxData;
+            if (system.midi.rxNoteOffVelocity == 0) {
+                // Treat as note off
+                system.midi.rxNoteOffKey = system.midi.rxNoteOnKey;
+                system.midi.rxNoteOffVelocity = 0;
+                system.midi.rxNoteOffWriteFlag = 1;
+            } else {
+                // Normal note on
+                system.midi.rxNoteOnWriteFlag = 1;
+            }
         }
 
         // note off
