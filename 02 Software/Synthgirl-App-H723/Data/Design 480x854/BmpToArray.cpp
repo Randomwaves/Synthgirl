@@ -3,8 +3,8 @@
 
 using namespace std;
 
-const char sourceName[] = "Image_Menu.bmp";
-const char targetName[] = "Image_Menu.rwi";
+const char sourceName[] = "Image_Logo.bmp";
+const char targetName[] = "Image_Logo.rwi";
 const uint16_t paletteType = 16; 	// 16 | 24
 
 struct RGB24Color {

@@ -17,7 +17,6 @@ Controller::Controller()
 
       audioMetronome(0),
       audioSong(0),
-      audioLpf(0),
       audioEq(0),
       audioFilter(0),
       audioEffect(0),
@@ -76,10 +75,14 @@ Controller::Controller()
 
       playActive(false),
       recordActive(false),
+      syncInPlayArmed(false),
+      syncInRecordArmed(false),
 
       triggerMode(TRIG_BAR),
 
       playTimerPeriod(0),
+      midiSyncStopRewindPending(false),
+      ignoreNextMidiStopAfterSpecialCmd(false),
 
       playX(0),
       playXRatio((float)songInterval / kPlayWidth),
@@ -95,8 +98,10 @@ Controller::Controller()
       upButtonFlag(false),
       downButtonFlag(false),
       upDownButtonCounter(0),
+      upDownRepeatCount(0),
 
       songBeatButtonFlag(false),
+      songShiftButtonFlag(false),
       songClearButtonFlag(false),
 
       songCopyButtonFlag(false),
@@ -111,6 +116,7 @@ Controller::Controller()
 
       limitAlertShowFlag(false),
       limitAlertClearFlag(false),
+      lastArmedAlertState(false),
 
       copyBeatNote(-1),
       copyBeatOctave(-1),
@@ -130,7 +136,6 @@ Controller::Controller()
 Controller::~Controller() {}
 
 void Controller::initialize() {
-    lpf.initialize();
     eq.initialize();
     filter[0].initialize();
     filter[1].initialize();
@@ -141,6 +146,9 @@ void Controller::initialize() {
 
     filter_reset(0);
     filter_reset(1);
+
+    lpf[0].initialize(true, 8500, 0.00f, 1.00f);
+    lpf[1].initialize(true, 8500, 0.00f, 1.00f);
 
     effect_setDData(0, EF_DELAY, kInitialDelayDry);
     effect_setEData(0, EF_DELAY, kInitialDelayWet);
@@ -172,6 +180,8 @@ void Controller::initialize() {
 }
 
 void Controller::systemStart() {
+    dwt_initialize();
+
     lcd.displayOn();
     dac.audioOn();
 
@@ -185,17 +195,15 @@ void Controller::systemStart() {
     lcd_drawPage();
 
     updatePlayTimerPeriod();
+    startMidiClockTimer();
 
     startSdTimer();
     startTransitionTimer();
 
-    HAL_HalfDuplex_EnableTransmitter(&huart4);
-    HAL_UART_Receive_DMA(&huart7, syncInData, 2);
-
     HAL_HalfDuplex_EnableReceiver(&huart1);
     HAL_HalfDuplex_EnableTransmitter(&huart6);
 
-    HAL_UART_Receive_IT(&huart1, &midiRxData, 1);
+    HAL_UART_Receive_DMA(&huart1, &midiRxData, 1);
 
     HAL_Delay(100);
 }
@@ -225,14 +233,16 @@ void Controller::systemUpdate_B() {
     }
 
     for (uint8_t i = 0; i < 2; i++) {
-        if ((system.midi.txActive) && (system.midi.txTriggerNoteOn[i]) && (!midiTxBusy)) {
-            if (sendMidiCommand(0x90 + system.midi.txChannel, system.midi.txDataNoteOn[i], 0x64)) {
+        if ((system.midi.txNotes) && (system.midi.txTriggerNoteOn[i])) {
+            uint8_t msg[3] = {(uint8_t)(0x90 + system.midi.txChannel), system.midi.txDataNoteOn[i], 0x64};
+            if (enqueueMidiTx(msg, 3)) {
                 system.midi.txTriggerNoteOn[i] = false;
             }
         }
 
-        if ((system.midi.txActive) && (system.midi.txTriggerNoteOff[i]) && (!midiTxBusy)) {
-            if (sendMidiCommand(0x80 + system.midi.txChannel, system.midi.txDataNoteOff[i], 0x64)) {
+        if ((system.midi.txNotes) && (system.midi.txTriggerNoteOff[i])) {
+            uint8_t msg[3] = {(uint8_t)(0x80 + system.midi.txChannel), system.midi.txDataNoteOff[i], 0x64};
+            if (enqueueMidiTx(msg, 3)) {
                 system.midi.txTriggerNoteOff[i] = false;
             }
         }
@@ -248,109 +258,479 @@ void Controller::systemUpdate_B() {
     }
 
     if (system.midi.rxNoteOffWriteFlag == 1) {
-        if ((sD.activeBeatNum != -1) && (system.midi.rxNoteOffKey == sD.beatPlayData[sD.activeBeatNum].noteData)) {
+        uint8_t releaseNoteData = system.midi.rxNoteOffKey + key.note - 1;
+        if ((sD.activeBeatNum != -1) && (releaseNoteData == sD.beatPlayData[sD.activeBeatNum].noteData)) {
             releaseNote();
         }
         system.midi.rxNoteOffWriteFlag = 0;
     }
-}
 
-bool Controller::sendMidiCommand(uint8_t command_, uint8_t data0_, uint8_t data1_) {
-    if (!midiTxBusy) {
-        uint8_t dataSend[3] = {command_, data0_, data1_};
-        midiTxBusy = true;
-        HAL_UART_Transmit_DMA(&huart6, dataSend, 3);
-        return true;
-    } else {
-        return false;
+    if (system.midi.rxPlayFlag) {
+        system.midi.rxPlayFlag = false;
+        if (system.syncIn == 0) {
+            // A later PLAY cancels any queued trigger stop/reset from special commands.
+            stopFlag = false;
+            resetFlag = false;
+            ignoreNextMidiStopAfterSpecialCmd = false;
+            system.midi.rxClockRunning = true;
+            if (system.midi.rxSync) {
+                if (syncInPlayArmed || syncInRecordArmed) {
+                    bool wasPlayArmed = syncInPlayArmed;
+                    bool wasRecordArmed = syncInRecordArmed;
+                    syncInPlayArmed = false;
+                    syncInRecordArmed = false;
+                    playIcon.flag = true;
+                    playIcon.mode = false;
+                    recordIcon.flag = true;
+                    recordIcon.mode = false;
+                    if (wasPlayArmed) play();
+                    if (wasRecordArmed) record(true);
+                }
+            } else if (syncInPlayArmed || syncInRecordArmed) {
+                if (syncInPlayArmed) play();
+                if (syncInRecordArmed) record(true);
+                syncInPlayArmed = false;
+                syncInRecordArmed = false;
+            } else if (!playActive) {
+                play();
+            }
+        }
+    }
+
+    if (system.midi.rxContinueFlag) {
+        system.midi.rxContinueFlag = false;
+        if (system.syncIn == 0) {
+            stopFlag = false;
+            resetFlag = false;
+            ignoreNextMidiStopAfterSpecialCmd = false;
+            system.midi.rxClockRunning = true;
+            if (system.midi.rxSync) {
+                if (syncInPlayArmed || syncInRecordArmed) {
+                    bool wasPlayArmed = syncInPlayArmed;
+                    bool wasRecordArmed = syncInRecordArmed;
+                    syncInPlayArmed = false;
+                    syncInRecordArmed = false;
+                    playIcon.flag = true;
+                    playIcon.mode = false;
+                    recordIcon.flag = true;
+                    recordIcon.mode = false;
+                    if (wasPlayArmed) play();
+                    if (wasRecordArmed) record(true);
+                }
+            } else if (syncInPlayArmed || syncInRecordArmed) {
+                if (syncInPlayArmed) play();
+                if (syncInRecordArmed) record(true);
+                syncInPlayArmed = false;
+                syncInRecordArmed = false;
+            } else if (!playActive) {
+                play();
+            }
+        }
+    }
+
+    if (system.midi.rxTrigStopFlag) {
+        system.midi.rxTrigStopFlag = false;
+        if ((system.syncIn == 0) && playActive) {
+            ignoreNextMidiStopAfterSpecialCmd = true;
+            triggerStop();
+        }
+    }
+
+    if (system.midi.rxTrigResetFlag) {
+        system.midi.rxTrigResetFlag = false;
+        if (system.syncIn == 0) {
+            if (playActive) {
+                ignoreNextMidiStopAfterSpecialCmd = true;
+                triggerReset();
+            } else
+                reset();
+        }
+    }
+
+    if (system.midi.rxTrigRecordFlag) {
+        system.midi.rxTrigRecordFlag = false;
+        if (system.syncIn == 0) {
+            record();
+        }
+    }
+
+    if (system.midi.rxStopFlag) {
+        system.midi.rxStopFlag = false;
+        system.midi.rxClockRunning = false;
+        // MIDI-IN active (rxSync=true): direct stop from master
+        if (system.midi.rxSync && (system.syncIn == 0)) {
+            triggerStop();
+            syncInPlayArmed = false;
+            syncInRecordArmed = false;
+            playIcon.flag = true;
+            playIcon.mode = false;
+            recordIcon.flag = true;
+            recordIcon.mode = false;
+        }
+        // MIDI-IN inactive: armed/TRS logic
+        else if ((system.syncIn == 0) && system.midi.rxSync && ignoreNextMidiStopAfterSpecialCmd) {
+            ignoreNextMidiStopAfterSpecialCmd = false;
+        } else if ((system.syncIn == 0) && playActive) {
+            if (system.midi.rxSync) {
+                constexpr uint16_t kMidiSyncLateStopWindowFrames = 10;
+                if ((barInterval > 0) && ((playInterval % barInterval) == 0)) {
+                    stop();
+                } else if (isWithinLateBarStopWindow(playInterval, barInterval, kMidiSyncLateStopWindowFrames)) {
+                    midiSyncStopRewindPending = true;
+                    stop();
+                } else if (metronome.precountState) {
+                    stop();
+                } else if (barInterval > 0) {
+                    stopFlag = true;
+                    resetFlag = false;
+                    stopInterval = ((playInterval / barInterval + 1) * barInterval) - 1;
+                    resetIcon.flag = true;
+                    resetIcon.mode = false;
+                } else {
+                    triggerStop();
+                }
+            } else if (hasJustCrossedTriggerBoundary()) {
+                stop();
+            } else {
+                triggerStop();
+            }
+        }
+        if (syncInPlayArmed || syncInRecordArmed) {
+            syncInPlayArmed = false;
+            syncInRecordArmed = false;
+            playIcon.flag = true;
+            playIcon.mode = false;
+            recordIcon.flag = true;
+            recordIcon.mode = false;
+        }
+    }
+
+    if (system.midi.rxResetFlag) {
+        system.midi.rxResetFlag = false;
+        system.midi.rxClockRunning = false;
+        // MIDI-IN active (rxSync=true): direct reset from master
+        if (system.midi.rxSync && (system.syncIn == 0)) {
+            reset();
+            syncInPlayArmed = false;
+            syncInRecordArmed = false;
+            playIcon.flag = true;
+            playIcon.mode = false;
+            recordIcon.flag = true;
+            recordIcon.mode = false;
+        }
+        // MIDI-IN inactive: armed/TRS logic
+        else if (system.syncIn == 0) {
+            reset();
+        }
+        if (syncInPlayArmed || syncInRecordArmed) {
+            syncInPlayArmed = false;
+            syncInRecordArmed = false;
+            playIcon.flag = true;
+            playIcon.mode = false;
+            recordIcon.flag = true;
+            recordIcon.mode = false;
+        }
+    }
+
+    if (system.midi.rxClockFlag) {
+        if (system.syncIn == 0) {
+            uint16_t newTempo = system.midi.rxClockBpm;
+            if (newTempo < kMinTempo) {
+                newTempo = kMinTempo;
+            }
+            if (newTempo > kMaxTempo) {
+                newTempo = kMaxTempo;
+            }
+            if ((uint8_t)newTempo != rhythm.tempo) {
+                rhythm_setTempo((uint8_t)newTempo);
+            }
+            if (system.midi.rxSync && system.midi.rxClockRunning && (syncInPlayArmed || syncInRecordArmed)) {
+                bool wasPlayArmed = syncInPlayArmed;
+                bool wasRecordArmed = syncInRecordArmed;
+                syncInPlayArmed = false;
+                syncInRecordArmed = false;
+                playIcon.flag = true;
+                playIcon.mode = false;
+                recordIcon.flag = true;
+                recordIcon.mode = false;
+                if (wasPlayArmed) play();
+                if (wasRecordArmed) record(true);
+            }
+        }
+        system.midi.rxClockFlag = false;
+    }
+
+    if (system.sync.rxPulseFlag) {
+        system.sync.rxPulseFlag = false;
+        uint16_t newTempo = system.sync.rxPulseBpm;
+        if (newTempo < kMinTempo) {
+            newTempo = kMinTempo;
+        }
+        if (newTempo > kMaxTempo) {
+            newTempo = kMaxTempo;
+        }
+        if ((uint8_t)newTempo != rhythm.tempo) {
+            rhythm_setTempo((uint8_t)newTempo);
+        }
+    }
+
+    // EXTI callback only provides the pin number (not the port), so if another input
+    // shares the same EXTI line, SYNC gate can be spuriously triggered. Poll gate reliably here.
+    interruptSyncInGate();
+
+    if (system.sync.rxPlayFlag) {
+        system.sync.rxPlayFlag = false;
+        if ((system.syncIn == 2) && (syncInPlayArmed || syncInRecordArmed)) {
+            bool wasPlayArmed = syncInPlayArmed;
+            bool wasRecordArmed = syncInRecordArmed;
+            syncInPlayArmed = false;
+            syncInRecordArmed = false;
+            playIcon.flag = true;
+            playIcon.mode = false;
+            recordIcon.flag = true;
+            recordIcon.mode = false;
+            textClearFlag = true;
+            if (wasPlayArmed) play();
+            // If gate was already HIGH (master playing), bypass precount and start immediately.
+            if (wasRecordArmed) record(system.sync.rxGateHigh);
+        } else if (syncInPlayArmed || syncInRecordArmed) {
+            if (syncInPlayArmed) play();
+            if (syncInRecordArmed) record(true);
+            syncInPlayArmed = false;
+            syncInRecordArmed = false;
+            textClearFlag = true;
+        } else if ((system.syncIn != 2) && !playActive) {
+            play();
+        }
+    }
+
+    if (system.sync.rxStopFlag) {
+        system.sync.rxStopFlag = false;
+        if (playActive) {
+            stop();
+        }
+    }
+
+    // Mode-A pulse timeout stop (Mode-B uses gate LOW for stop)
+    if ((system.syncIn == 1) && playActive && (system.sync.rxPulseLastTick > 0) && (system.sync.rxPulseInterval > 0)) {
+        uint32_t timeout = system.sync.rxPulseInterval * 5 / 2;
+        if ((HAL_GetTick() - system.sync.rxPulseLastTick) > timeout) {
+            system.sync.rxPulseLastTick = 0;
+            system.sync.rxPulseBeatStart = 0;
+            system.sync.rxPulseCount = 0;
+            stop();
+        }
     }
 }
 
+bool Controller::enqueueMidiTx(const uint8_t* data, uint8_t len) {
+    uint32_t primask = __get_PRIMASK();
+    bool startNow = false;
+    __disable_irq();
+
+    uint8_t nextHead = (system.midi.txRingHead + 1) & (Midi::kTxRingSize - 1);
+    if (nextHead == system.midi.txRingTail) {
+        __set_PRIMASK(primask);
+        return false;
+    }
+
+    MidiTxMsg& slot = system.midi.txRing[system.midi.txRingHead];
+    for (uint8_t i = 0; i < len; i++) {
+        slot.data[i] = data[i];
+    }
+    slot.len = len;
+    system.midi.txRingHead = nextHead;
+
+    if (!system.midi.txBusy) {
+        startNow = true;
+    }
+
+    __set_PRIMASK(primask);
+
+    if (startNow) {
+        startMidiTx();
+    }
+
+    return true;
+}
+
+void Controller::startMidiTx() {
+    if (system.midi.txRingTail == system.midi.txRingHead) {
+        return;
+    }
+
+    MidiTxMsg& msg = system.midi.txRing[system.midi.txRingTail];
+    for (uint8_t i = 0; i < msg.len; i++) {
+        midiTxBuffer[i] = msg.data[i];
+    }
+
+    system.midi.txRingTail = (system.midi.txRingTail + 1) & (Midi::kTxRingSize - 1);
+    system.midi.txBusy = true;
+    midiTxBusy = true;
+
+    if (HAL_UART_Transmit_DMA(&huart6, midiTxBuffer, msg.len) != HAL_OK) {
+        system.midi.txBusy = false;
+        midiTxBusy = false;
+    }
+}
+
+void Controller::serviceMidiTx() {
+    system.midi.txBusy = false;
+    midiTxBusy = false;
+    startMidiTx();
+}
+
+bool Controller::sendMidiCommand(uint8_t command_, uint8_t data0_, uint8_t data1_) {
+    uint8_t msg[3] = {command_, data0_, data1_};
+    return enqueueMidiTx(msg, 3);
+}
+
 void Controller::receiveMidiCommand() {
-    if (system.midi.rxActive) {
-        uint8_t rxData = midiRxData;
-        // note on
-        if ((system.midi.rxNoteOnReadStage == 0) && (rxData == (0x90 + system.midi.rxChannel))) {
-            system.midi.rxNoteOnReadStage = 1;
-        } else if (system.midi.rxNoteOnReadStage == 1) {
-            system.midi.rxNoteOnKey = rxData;
-            system.midi.rxNoteOnReadStage = 2;
-        } else if (system.midi.rxNoteOnReadStage == 2) {
-            system.midi.rxNoteOnVelocity = rxData;
-            system.midi.rxNoteOnReadStage = 0;
-            system.midi.rxNoteOnWriteFlag = 1;
+    if (!system.midi.rxActive) {
+        return;
+    }
+
+    uint8_t rxData = midiRxData;
+
+    if (rxData >= 0xF8) {
+        if (!system.midi.rxSync) {
+            return;
+        }
+        if (system.syncIn > 0) {
+            return;
         }
 
-        // note off
-        if ((system.midi.rxNoteOffReadStage == 0) && (rxData == (0x80 + system.midi.rxChannel))) {
-            system.midi.rxNoteOffReadStage = 1;
-        } else if (system.midi.rxNoteOffReadStage == 1) {
-            system.midi.rxNoteOffKey = rxData;
-            system.midi.rxNoteOffReadStage = 2;
-        } else if (system.midi.rxNoteOffReadStage == 2) {
-            system.midi.rxNoteOffVelocity = rxData;
-            system.midi.rxNoteOffReadStage = 0;
-            system.midi.rxNoteOffWriteFlag = 1;
+        switch (rxData) {
+            case 0xF8: {
+                uint32_t now = HAL_GetTick();
+                if (system.midi.rxClockCount == 0) {
+                    system.midi.rxClockBeatStart = now;
+                    system.midi.rxClockCount = 1;
+                } else if (++system.midi.rxClockCount > 48) {
+                    uint32_t interval = now - system.midi.rxClockBeatStart;
+                    if ((interval > 0) && (interval < 8000)) {
+                        system.midi.rxClockBpm = (uint16_t)((120000UL + interval / 2) / interval);
+                        system.midi.rxClockFlag = true;
+                    }
+                    system.midi.rxClockBeatStart = now;
+                    system.midi.rxClockCount = 1;
+                }
+                break;
+            }
+
+            case 0xFA:
+                system.midi.rxClockCount = 0;
+                system.midi.rxPlayFlag = true;
+                break;
+
+            case 0xFB:
+                system.midi.rxClockCount = 0;
+                system.midi.rxContinueFlag = true;
+                break;
+
+            case 0xFC:
+                system.midi.rxClockCount = 0;
+                system.midi.rxStopFlag = true;
+                break;
+
+            case 0xFF:
+                system.midi.rxClockCount = 0;
+                system.midi.rxResetFlag = true;
+                break;
         }
+
+        return;
+    }
+
+    if (rxData == kMidiSysExStart) {
+        system.midi.rxSysExStage = 1;
+        system.midi.rxSysExCmd = 0;
+        return;
+    }
+
+    if (system.midi.rxSysExStage != 0) {
+        switch (system.midi.rxSysExStage) {
+            case 1:
+                system.midi.rxSysExStage = (rxData == kMidiSysExManufacturerNonCommercial) ? 2 : 0;
+                break;
+
+            case 2:
+                system.midi.rxSysExStage = (rxData == kMidiSysExTransportFamily) ? 3 : 0;
+                break;
+
+            case 3:
+                system.midi.rxSysExCmd = rxData;
+                system.midi.rxSysExStage = 4;
+                break;
+
+            case 4:
+                if ((rxData == kMidiSysExEnd) && system.midi.rxSync) {
+                    if (system.midi.rxSysExCmd == kMidiSysExTrigStop)
+                        system.midi.rxTrigStopFlag = true;
+                    else if (system.midi.rxSysExCmd == kMidiSysExTrigReset)
+                        system.midi.rxTrigResetFlag = true;
+                    else if (system.midi.rxSysExCmd == kMidiSysExTrigRecord)
+                        system.midi.rxTrigRecordFlag = true;
+                }
+                system.midi.rxSysExStage = 0;
+                system.midi.rxSysExCmd = 0;
+                break;
+
+            default:
+                system.midi.rxSysExStage = 0;
+                system.midi.rxSysExCmd = 0;
+                break;
+        }
+        return;
+    }
+
+    if (!system.midi.rxNotes) {
+        return;
+    }
+
+    if ((system.midi.rxNoteOnReadStage == 0) && (rxData == (0x90 + system.midi.rxChannel))) {
+        system.midi.rxNoteOnReadStage = 1;
+    } else if (system.midi.rxNoteOnReadStage == 1) {
+        system.midi.rxNoteOnKey = rxData;
+        system.midi.rxNoteOnReadStage = 2;
+    } else if (system.midi.rxNoteOnReadStage == 2) {
+        system.midi.rxNoteOnVelocity = rxData;
+        system.midi.rxNoteOnReadStage = 0;
+        system.midi.rxNoteOnWriteFlag = 1;
+    }
+
+    if ((system.midi.rxNoteOffReadStage == 0) && (rxData == (0x80 + system.midi.rxChannel))) {
+        system.midi.rxNoteOffReadStage = 1;
+    } else if (system.midi.rxNoteOffReadStage == 1) {
+        system.midi.rxNoteOffKey = rxData;
+        system.midi.rxNoteOffReadStage = 2;
+    } else if (system.midi.rxNoteOffReadStage == 2) {
+        system.midi.rxNoteOffVelocity = rxData;
+        system.midi.rxNoteOffReadStage = 0;
+        system.midi.rxNoteOffWriteFlag = 1;
     }
 }
 
 bool Controller::sendSyncCommand(uint8_t data_) {
-    syncOutData[0] = 100;
-    syncOutData[1] = data_;
-
-    // check(syncOutData[0], 0);
-    // check(syncOutData[1], 1);
-
-    while (HAL_UART_GetState(&huart4) != HAL_UART_STATE_READY) {
-    }
-    if (HAL_UART_Transmit_DMA(&huart4, syncOutData, sizeof(syncOutData)) == HAL_OK) {
-        return true;
-    } else {
+    if (system.syncOut == 0) {
         return false;
     }
-}
 
-void Controller::receiveSyncCommand() {
-    if ((system.syncIn) && (syncInData[0] == 100) && (syncInData[1])) {
-        switch (syncInData[1]) {
-        case SYNC_RESET:
-            reset();
-            break;
+    if ((system.syncOut == 2) && (system.sync.syncOutPlay)) {
+        if ((data_ == SYNC_PLAY) || (data_ == SYNC_RECORD)) {
+            HAL_GPIO_WritePin(SYNC_OUT_GATE_GPIO_Port, SYNC_OUT_GATE_Pin, GPIO_PIN_SET);
+        }
 
-        case SYNC_TRIG_RESET:
-            triggerReset();
-            break;
-
-        case SYNC_STOP:
-            stop();
-            break;
-
-        case SYNC_TRIG_STOP:
-            triggerStop();
-            break;
-
-        case SYNC_PLAY:
-            play();
-            break;
-
-        case SYNC_RECORD:
-            record();
-            break;
-
-        default:
-            if ((syncInData[1] >= kMinTempo) && (syncInData[1] <= kMaxTempo)) {
-                rhythm_setTempo(syncInData[1]);
-            }
-            break;
+        if ((data_ == SYNC_STOP) || (data_ == SYNC_RESET)) {
+            HAL_GPIO_WritePin(SYNC_OUT_GATE_GPIO_Port, SYNC_OUT_GATE_Pin, GPIO_PIN_RESET);
         }
     }
 
-    // check(syncInData[0], 4);
-    // check(syncInData[1], 5);
+    return true;
+}
 
-    syncInData[0] = 0x00;
-    syncInData[1] = 0x00;
+void Controller::receiveSyncCommand() {
+    // Legacy UART sync path intentionally disabled.
 }
 
 void Controller::calculateSongInterval() {
@@ -364,22 +744,59 @@ void Controller::calculateSongInterval() {
 uint16_t Controller::calculateTriggerInterval() {
     uint16_t interval;
     switch (triggerMode) {
-    case TRIG_MEASURE:
-        interval = ((playInterval / measureInterval + 1) * measureInterval) - 1;
-        break;
+        case TRIG_MEASURE:
+            interval = ((playInterval / measureInterval + 1) * measureInterval) - 1;
+            break;
 
-    case TRIG_BAR:
-        interval = ((playInterval / barInterval + 1) * barInterval) - 1;
-        break;
+        case TRIG_BAR:
+            interval = ((playInterval / barInterval + 1) * barInterval) - 1;
+            break;
 
-    case TRIG_SONG:
-        interval = songInterval - 1;
-        break;
+        case TRIG_SONG:
+            interval = songInterval - 1;
+            break;
 
-    default:
-        break;
+        default:
+            break;
     }
     return interval;
+}
+
+bool Controller::hasJustCrossedTriggerBoundary() {
+    switch (triggerMode) {
+        case TRIG_MEASURE:
+            return (measureInterval > 0) && ((playInterval % measureInterval) == 0);
+
+        case TRIG_BAR:
+            return (barInterval > 0) && ((playInterval % barInterval) == 0);
+
+        case TRIG_SONG:
+            return playInterval == 0;
+    }
+
+    return false;
+}
+
+void Controller::applyMidiSyncStopRewind() {
+    if (!midiSyncStopRewindPending) return;
+    midiSyncStopRewindPending = false;
+
+    if ((songInterval == 0) || (barInterval == 0)) return;
+
+    uint16_t rewindTarget = (playInterval / barInterval) * barInterval;
+    if ((rewindTarget == playInterval) && (rewindTarget >= barInterval)) {
+        rewindTarget -= barInterval;
+    }
+
+    constexpr uint16_t kResumeLeadFrames = 4;
+    if (rewindTarget >= kResumeLeadFrames) {
+        rewindTarget -= kResumeLeadFrames;
+    } else {
+        rewindTarget = 0;
+    }
+
+    playInterval = rewindTarget;
+    song_calculateNextBeatNum(activeBankNum, playInterval);
 }
 
 void Controller::adjustMeasureBarTiming() {
@@ -392,6 +809,8 @@ void Controller::adjustMeasureBarTiming() {
 
 void Controller::updatePlayTimerPeriod() {
     playTimerPeriod = 60000000 / (rhythm.tempo * kMeasureInterval);
+    uint32_t midiClockPeriod = 2500000 / rhythm.tempo;
+    __HAL_TIM_SET_AUTORELOAD(&htim4, midiClockPeriod - 1);
     __HAL_TIM_SET_AUTORELOAD(&htim14, playTimerPeriod - 1);
 }
 
@@ -412,22 +831,22 @@ void Controller::keyboard_check_A() {
         // LED0_TOGGLE;
         // check(keyboard.leftButton, 0);
         switch (keyboard.leftButton) {
-        case KEY_POWER:
-            powerButtonFlag = true;
-            powerButtonCounter = 0;
-            startPowerButtonTimer();
-            break;
-
-        case LEFT_RELEASE:
-            if (powerButtonFlag) {
-                stopPowerButtonTimer();
-                powerButtonFlag = false;
+            case KEY_POWER:
+                powerButtonFlag = true;
                 powerButtonCounter = 0;
-            }
-            break;
+                startPowerButtonTimer();
+                break;
 
-        default:
-            break;
+            case LEFT_RELEASE:
+                if (powerButtonFlag) {
+                    stopPowerButtonTimer();
+                    powerButtonFlag = false;
+                    powerButtonCounter = 0;
+                }
+                break;
+
+            default:
+                break;
         }
         keyboard.leftButton = -1;
     }
@@ -438,584 +857,683 @@ void Controller::keyboard_check_B() {
     if (keyboard.leftButton >= 0) {
         // LED0_TOGGLE;
         // check(keyboard.leftButton, 0);
+        if ((upButtonFlag || downButtonFlag) && (keyboard.leftButton != KEY_UP) && (keyboard.leftButton != KEY_DOWN)) {
+            stopUpDownButtonTimer();
+            upButtonFlag = false;
+            downButtonFlag = false;
+            upDownButtonCounter = 0;
+            upDownRepeatCount = 0;
+        }
         switch (keyboard.leftButton) {
-        case KEY_RESET:
-            if ((!alertFlag) && (!system.sync.slaveMode)) {
-                (playActive) ? triggerReset() : reset();
-            }
-            break;
-
-        case KEY_PLAYSTOP:
-            if ((!alertFlag) && (!system.sync.slaveMode)) {
-                ((playActive) && (!stopFlag)) ? triggerStop() : play();
-            }
-            break;
-
-        case KEY_REC:
-            if ((!alertFlag) && (!system.sync.slaveMode)) {
-                record();
-            }
-            break;
-
-        case KEY_UP:
-            if (!alertFlag) {
-                upDownButtonCounter = 0;
-                upButtonFlag = true;
-                startUpDownButtonTimer();
-                switch (menu) {
-                case INIT_MENU:
-                case MAIN_MENU:
-                    break;
-
-                case FILE_MENU:
-                    file_menuUp();
-                    break;
-
-                case SYNTHKIT_MENU:
-                    synthkit_menuUp();
-                    break;
-
-                case SYSTEM_MENU:
-                    system_menuUp();
-                    break;
-
-                case RHYTHM_MENU:
-                    rhythm_menuUp();
-                    break;
-
-                case METRO_MENU:
-                    metro_menuUp();
-                    break;
-
-                case EQ_MENU:
-                    eq_menuUp();
-                    break;
-
-                case OSC_A0_MENU:
-                case OSC_A1_MENU:
-                case OSC_A2_MENU:
-                case OSC_A3_MENU:
-                    osc_menuUp(osc[0]);
-                    break;
-
-                case OSC_B0_MENU:
-                case OSC_B1_MENU:
-                case OSC_B2_MENU:
-                case OSC_B3_MENU:
-                    osc_menuUp(osc[1]);
-                    break;
-
-                case FILTER_0_MENU:
-                case FILTER_1_MENU:
-                    filter_menuUp();
-                    break;
-
-                case ENVELOPE_MENU:
-                    envelope_menuUp();
-                    break;
-
-                case EFFECT_0_MENU:
-                case EFFECT_1_MENU:
-                    effect_menuUp();
-                    break;
-
-                case REVERB_MENU:
-                    reverb_menuUp();
-                    break;
-
-                case KEY_MENU:
-                    key_menuUp();
-                    break;
-
-                case SONG_MENU:
-                    song_menuUp();
-                    break;
+            case KEY_RESET:
+                if (!alertFlag) {
+                    (playActive) ? triggerReset() : reset();
                 }
-            }
-            break;
-
-        case KEY_DOWN:
-            if (!alertFlag) {
-                upDownButtonCounter = 0;
-                downButtonFlag = true;
-                startUpDownButtonTimer();
-                switch (menu) {
-                case INIT_MENU:
-                case MAIN_MENU:
-                    break;
-
-                case FILE_MENU:
-                    file_menuDown();
-                    break;
-
-                case SYNTHKIT_MENU:
-                    synthkit_menuDown();
-                    break;
-
-                case SYSTEM_MENU:
-                    system_menuDown();
-                    break;
-
-                case RHYTHM_MENU:
-                    rhythm_menuDown();
-                    break;
-
-                case METRO_MENU:
-                    metro_menuDown();
-                    break;
-
-                case EQ_MENU:
-                    eq_menuDown();
-                    break;
-
-                case OSC_A0_MENU:
-                case OSC_A1_MENU:
-                case OSC_A2_MENU:
-                case OSC_A3_MENU:
-                    osc_menuDown(osc[0]);
-                    break;
-
-                case OSC_B0_MENU:
-                case OSC_B1_MENU:
-                case OSC_B2_MENU:
-                case OSC_B3_MENU:
-                    osc_menuDown(osc[1]);
-                    break;
-
-                case FILTER_0_MENU:
-                case FILTER_1_MENU:
-                    filter_menuDown();
-                    break;
-
-                case ENVELOPE_MENU:
-                    envelope_menuDown();
-                    break;
-
-                case EFFECT_0_MENU:
-                case EFFECT_1_MENU:
-                    effect_menuDown();
-                    break;
-
-                case REVERB_MENU:
-                    reverb_menuDown();
-                    break;
-
-                case KEY_MENU:
-                    key_menuDown();
-                    break;
-
-                case SONG_MENU:
-                    song_menuDown();
-                    break;
-                }
-            }
-            break;
-
-        case KEY_LEFT:
-            if (!alertFlag) {
-                switch (menu) {
-                case INIT_MENU:
-                case MAIN_MENU:
-                    break;
-
-                case FILE_MENU:
-                    file_menuLeft();
-                    break;
-
-                case SYNTHKIT_MENU:
-                    synthkit_menuLeft();
-                    break;
-
-                case SYSTEM_MENU:
-                    system_menuLeft();
-                    break;
-
-                case RHYTHM_MENU:
-                    rhythm_menuLeft();
-                    break;
-
-                case METRO_MENU:
-                    metro_menuLeft();
-                    break;
-
-                case EQ_MENU:
-                    eq_menuLeft();
-                    break;
-
-                case OSC_A0_MENU:
-                case OSC_A1_MENU:
-                case OSC_A2_MENU:
-                case OSC_A3_MENU:
-                    osc_menuLeft(osc[0]);
-                    break;
-
-                case OSC_B0_MENU:
-                case OSC_B1_MENU:
-                case OSC_B2_MENU:
-                case OSC_B3_MENU:
-                    osc_menuLeft(osc[1]);
-                    break;
-
-                case FILTER_0_MENU:
-                case FILTER_1_MENU:
-                    filter_menuLeft();
-                    break;
-
-                case ENVELOPE_MENU:
-                    envelope_menuLeft();
-                    break;
-
-                case EFFECT_0_MENU:
-                case EFFECT_1_MENU:
-                    effect_menuLeft();
-                    break;
-
-                case REVERB_MENU:
-                    reverb_menuLeft();
-                    break;
-
-                case KEY_MENU:
-                    key_menuLeft();
-                    break;
-
-                case SONG_MENU:
-                    song_menuLeft();
-                    break;
-                }
-            }
-            break;
-
-        case KEY_RIGHT:
-            if (!alertFlag) {
-                switch (menu) {
-                case INIT_MENU:
-                case MAIN_MENU:
-                    break;
-
-                case FILE_MENU:
-                    file_menuRight();
-                    break;
-
-                case SYNTHKIT_MENU:
-                    synthkit_menuRight();
-                    break;
-
-                case SYSTEM_MENU:
-                    system_menuRight();
-                    break;
-
-                case RHYTHM_MENU:
-                    rhythm_menuRight();
-                    break;
-
-                case METRO_MENU:
-                    metro_menuRight();
-                    break;
-
-                case EQ_MENU:
-                    eq_menuRight();
-                    break;
-
-                case OSC_A0_MENU:
-                case OSC_A1_MENU:
-                case OSC_A2_MENU:
-                case OSC_A3_MENU:
-                    osc_menuRight(osc[0]);
-                    break;
-
-                case OSC_B0_MENU:
-                case OSC_B1_MENU:
-                case OSC_B2_MENU:
-                case OSC_B3_MENU:
-                    osc_menuRight(osc[1]);
-                    break;
-
-                case FILTER_0_MENU:
-                case FILTER_1_MENU:
-                    filter_menuRight();
-                    break;
-
-                case ENVELOPE_MENU:
-                    envelope_menuRight();
-                    break;
-
-                case EFFECT_0_MENU:
-                case EFFECT_1_MENU:
-                    effect_menuRight();
-                    break;
-
-                case REVERB_MENU:
-                    reverb_menuRight();
-                    break;
-
-                case KEY_MENU:
-                    key_menuRight();
-                    break;
-
-                case SONG_MENU:
-                    song_menuRight();
-                    break;
-                }
-            }
-            break;
-
-        case KEY_CENTER:
-            mainMenuButtonFlag = true;
-            startLongButtonTimer();
-            break;
-
-        case KEY_ADD:
-            if (alertFlag) {
-                alertFlag = false;
-                switch (alertType) {
-                case ALERT_MEASUREUP:
-                    lcd_clearAlert();
-                    rhythm_setMeasure(rhythm.measure + 1);
-                    break;
-
-                case ALERT_MEASUREDOWN:
-                    lcd_clearAlert();
-                    rhythm_setMeasure(rhythm.measure - 1);
-                    break;
-
-                case ALERT_BARUP:
-                    lcd_clearAlert();
-                    rhythm_setBar(rhythm.bar + 1);
-                    break;
-
-                case ALERT_BARDOWN:
-                    lcd_clearAlert();
-                    rhythm_setBar(rhythm.bar - 1);
-                    break;
-
-                case ALERT_QUANTIZEUP:
-                    lcd_clearAlert();
-                    rhythm_setQuantize(rhythm.quantize + 1);
-                    break;
-
-                case ALERT_QUANTIZEDOWN:
-                    lcd_clearAlert();
-                    rhythm_setQuantize(rhythm.quantize - 1);
-                    break;
-
-                case ALERT_NEWFILE:
-                    file_newAction();
-                    break;
-
-                case ALERT_LOADFILE:
-                    file_loadAction();
-                    break;
-
-                case ALERT_SAVEFILE:
-                case ALERT_OVERWRITEFILE:
-                    file_saveAction();
-                    break;
-
-                case ALERT_CLEARFILE:
-                    file_clearAction();
-                    break;
-
-                case ALERT_NEWSYNTHKIT:
-                    synthkit_newAction();
-                    break;
-
-                case ALERT_LOADSYNTHKIT:
-                    synthkit_loadAction();
-                    break;
-
-                case ALERT_SAVESYNTHKIT:
-                case ALERT_OVERWRITESYNTHKIT:
-                    synthkit_saveAction();
-                    break;
-
-                case ALERT_CLEARSYNTHKIT:
-                    synthkit_clearAction();
-                    break;
-
-                default:
-                    break;
-                }
-            } else if ((menu == SONG_MENU) && (song.bankLibrary[activeBankNum].lastActiveBeatNum == -1)) {
-                songBeatButtonFlag = true;
-                songBeatButtonStage = 0;
-                startLongButtonTimer();
-            } else if (menu == FILE_MENU) {
-                switch (menuTab) {
-                case 0:
-                    file_newSelect();
-                    break;
-
-                case 1:
-                    file_loadSelect();
-                    break;
-
-                case 2:
-                    file_saveSelect();
-                    break;
-
-                case 3:
-                    file_clearSelect();
-                    break;
-                }
-            } else if (menu == SYNTHKIT_MENU) {
-                switch (menuTab) {
-                case 0:
-                    synthkit_newSelect();
-                    break;
-
-                case 1:
-                    synthkit_loadSelect();
-                    break;
-
-                case 2:
-                    synthkit_saveSelect();
-                    break;
-
-                case 3:
-                    synthkit_clearSelect();
-                    break;
-                }
-            } else if (menu == RHYTHM_MENU) {
-                rhythmLockFlag = true;
-                startLongButtonTimer();
-            } else if ((menu == OSC_A0_MENU) || (menu == OSC_A1_MENU)) {
-                osc_setWavetableLoaded(osc[0], true);
-            } else if ((menu == OSC_B0_MENU) || (menu == OSC_B1_MENU)) {
-                osc_setWavetableLoaded(osc[1], true);
-            }
-            break;
-
-        case KEY_ERASE:
-            if (alertFlag) {
-                lcd_clearAlert();
-                alertFlag = false;
-            } else if ((menu == SONG_MENU) && (song.bankLibrary[activeBankNum].lastActiveBeatNum != -1)) {
-                songClearButtonFlag = true;
-                startLongButtonTimer();
-            } else if (menu == RHYTHM_MENU) {
-                rhythmUnlockFlag = true;
-                startLongButtonTimer();
-            }
-            break;
-
-        case KEY_COPY:
-            if ((menu == SONG_MENU) && (song.bankLibrary[activeBankNum].lastActiveBeatNum != -1)) {
-                noteCopyButtonFlag = true;
-                songCopyButtonFlag = true;
-                startLongButtonTimer();
-            }
-            break;
-
-        case KEY_PASTE:
-            if (menu == SONG_MENU) {
-                notePasteButtonFlag = true;
-                songPasteButtonFlag = true;
-                startLongButtonTimer();
-            }
-            break;
-
-        case KEY_POWER:
-            powerButtonFlag = true;
-            powerButtonCounter = 0;
-            startPowerButtonTimer();
-            break;
-
-        case KEY_OCTAVE_DOWN:
-            octaveDown();
-            break;
-
-        case KEY_OCTAVE_UP:
-            octaveUp();
-            break;
-
-        case LEFT_RELEASE:
-            if (powerButtonFlag) {
-                stopPowerButtonTimer();
-                powerButtonFlag = false;
-                powerButtonCounter = 0;
-            } else if (upButtonFlag) {
-                stopUpDownButtonTimer();
-                upButtonFlag = false;
-                upDownButtonCounter = 0;
-            } else if (downButtonFlag) {
-                stopUpDownButtonTimer();
-                downButtonFlag = false;
-                upDownButtonCounter = 0;
-            } else if (songBeatButtonFlag) {
-                stopLongButtonTimer();
-                keyboard.longButtonCounter = 0;
-                songBeatButtonFlag = false;
-                songBeatButtonStage = 0;
-            } else if (songClearButtonFlag) {
-                stopLongButtonTimer();
-                keyboard.longButtonCounter = 0;
-                songClearButtonFlag = false;
-                song_resetSelectedBeat();
-            } else if (noteCopyButtonFlag) {
-                stopLongButtonTimer();
-                keyboard.longButtonCounter = 0;
-                if (songCopyButtonFlag) {
-                    noteCopyButtonFlag = false;
-                    songCopyButtonFlag = false;
-                    if (song.bankLibrary[activeBankNum].lastActiveBeatNum != -1) {
-                        copyBeatNote = song.bankLibrary[activeBankNum].beatLibrary[selectedBeatNum].note;
-                        copyBeatOctave = song.bankLibrary[activeBankNum].beatLibrary[selectedBeatNum].octave;
-                    }
-                } else {
-                    noteCopyButtonFlag = false;
-                }
-            } else if (notePasteButtonFlag) {
-                stopLongButtonTimer();
-                keyboard.longButtonCounter = 0;
-                if (songPasteButtonFlag) {
-                    if ((copyBeatNote != -1) && (copyBeatOctave != -1) && (song.bankLibrary[activeBankNum].lastActiveBeatNum != -1)) {
-                        song_setBeatNoteOctave(copyBeatNote, copyBeatOctave);
-                    }
-                    notePasteButtonFlag = false;
-                    songPasteButtonFlag = false;
-                } else {
-                    notePasteButtonFlag = false;
-                }
-            } else if (mainMenuButtonFlag) {
-                stopLongButtonTimer();
-                keyboard.longButtonCounter = 0;
-                mainMenuButtonFlag = false;
-                if (menu == EQ_MENU) {
-                    switch (subMenuTab) {
-                    case 0:
-                        subMenuTab = 1;
-                        break;
-
-                    case 1:
-                        if ((menuTab == 2) || (menuTab == 7)) {
-                            subMenuTab = 0;
-                        } else {
-                            subMenuTab = 2;
+                break;
+
+            case KEY_PLAYSTOP:
+                if (!alertFlag) {
+                    if ((playActive) && (!stopFlag)) {
+                        triggerStop();
+                    } else if (system.sync.slaveMode && (system.syncIn == 2)) {
+                        syncInPlayArmed = !syncInPlayArmed;
+                        if (syncInPlayArmed) {
+                            syncInRecordArmed = false;
+                            recordIcon.flag = true;
+                            recordIcon.mode = false;
                         }
-                        break;
-
-                    case 2:
-                        subMenuTab = 0;
-                        break;
-
-                    default:
-                        break;
+                        playIcon.flag = true;
+                        playIcon.mode = syncInPlayArmed;
+                        if (!syncInPlayArmed && !syncInRecordArmed) textClearFlag = true;
+                    } else if (system.sync.slaveMode && system.midi.rxSync) {
+                        // MIDI-IN SYNC active: arm play, start on MIDI Start from master.
+                        syncInPlayArmed = !syncInPlayArmed;
+                        if (syncInPlayArmed) {
+                            syncInRecordArmed = false;
+                            recordIcon.flag = true;
+                            recordIcon.mode = false;
+                        }
+                        playIcon.flag = true;
+                        playIcon.mode = syncInPlayArmed;
+                    } else if (system.sync.slaveMode) {
+                        // TRS sync-in: arm play, start on next incoming pulse/play command.
+                        syncInPlayArmed = !syncInPlayArmed;
+                        if (syncInPlayArmed) {
+                            syncInRecordArmed = false;
+                            recordIcon.flag = true;
+                            recordIcon.mode = false;
+                        }
+                        playIcon.flag = true;
+                        playIcon.mode = syncInPlayArmed;
+                    } else {
+                        play();
                     }
-                    lcd_transitionSelect();
                 }
-            } else if (rhythmUnlockFlag) {
-                stopLongButtonTimer();
-                keyboard.longButtonCounter = 0;
-                rhythmUnlockFlag = false;
-            } else if (rhythmLockFlag) {
-                stopLongButtonTimer();
-                keyboard.longButtonCounter = 0;
-                rhythmLockFlag = false;
-            }
-            break;
+                break;
 
-        default:
-            break;
+            case KEY_REC:
+                if (!alertFlag) {
+                    if (system.sync.slaveMode && (system.syncIn == 2)) {
+                        if (playActive) {
+                            record();
+                        } else {
+                            syncInRecordArmed = !syncInRecordArmed;
+                            if (syncInRecordArmed) {
+                                syncInPlayArmed = false;
+                                playIcon.flag = true;
+                                playIcon.mode = false;
+                            }
+                            recordIcon.flag = true;
+                            recordIcon.mode = syncInRecordArmed;
+                            if (!syncInPlayArmed && !syncInRecordArmed) textClearFlag = true;
+                        }
+                    } else if (system.sync.slaveMode && system.midi.rxSync) {
+                        // MIDI-IN SYNC active: arm record if not playing, else direct record.
+                        if (playActive) {
+                            record();
+                        } else {
+                            syncInRecordArmed = !syncInRecordArmed;
+                            if (syncInRecordArmed) {
+                                syncInPlayArmed = false;
+                                playIcon.flag = true;
+                                playIcon.mode = false;
+                            }
+                            recordIcon.flag = true;
+                            recordIcon.mode = syncInRecordArmed;
+                        }
+                    } else if (system.sync.slaveMode) {
+                        // TRS sync-in: arm record, start on next pulse/play command.
+                        if (!playActive) {
+                            syncInRecordArmed = !syncInRecordArmed;
+                            if (syncInRecordArmed) {
+                                syncInPlayArmed = false;
+                                playIcon.flag = true;
+                                playIcon.mode = false;
+                            }
+                            recordIcon.flag = true;
+                            recordIcon.mode = syncInRecordArmed;
+                        } else {
+                            record();
+                        }
+                    } else {
+                        record();
+                    }
+                }
+                break;
+
+            case KEY_UP:
+                if (!alertFlag) {
+                    upDownButtonCounter = 0;
+                    upDownRepeatCount = 0;
+                    upButtonFlag = true;
+                    startUpDownButtonTimer();
+                    switch (menu) {
+                        case INIT_MENU:
+                        case MAIN_MENU:
+                            break;
+
+                        case FILE_MENU:
+                            file_menuUp();
+                            break;
+
+                        case SYNTHKIT_MENU:
+                            synthkit_menuUp();
+                            break;
+
+                        case SYSTEM_MENU:
+                            system_menuUp();
+                            break;
+
+                        case RHYTHM_MENU:
+                            rhythm_menuUp();
+                            break;
+
+                        case METRO_MENU:
+                            metro_menuUp();
+                            break;
+
+                        case EQ_MENU:
+                            eq_menuUp();
+                            break;
+
+                        case OSC_A0_MENU:
+                        case OSC_A1_MENU:
+                        case OSC_A2_MENU:
+                        case OSC_A3_MENU:
+                            osc_menuUp(osc[0]);
+                            break;
+
+                        case OSC_B0_MENU:
+                        case OSC_B1_MENU:
+                        case OSC_B2_MENU:
+                        case OSC_B3_MENU:
+                            osc_menuUp(osc[1]);
+                            break;
+
+                        case FILTER_0_MENU:
+                        case FILTER_1_MENU:
+                            filter_menuUp();
+                            break;
+
+                        case ENVELOPE_MENU:
+                            envelope_menuUp();
+                            break;
+
+                        case EFFECT_0_MENU:
+                        case EFFECT_1_MENU:
+                            effect_menuUp();
+                            break;
+
+                        case REVERB_MENU:
+                            reverb_menuUp();
+                            break;
+
+                        case KEY_MENU:
+                            key_menuUp();
+                            break;
+
+                        case SONG_MENU:
+                            song_menuUp();
+                            break;
+                    }
+                }
+                break;
+
+            case KEY_DOWN:
+                if (!alertFlag) {
+                    upDownButtonCounter = 0;
+                    upDownRepeatCount = 0;
+                    downButtonFlag = true;
+                    startUpDownButtonTimer();
+                    switch (menu) {
+                        case INIT_MENU:
+                        case MAIN_MENU:
+                            break;
+
+                        case FILE_MENU:
+                            file_menuDown();
+                            break;
+
+                        case SYNTHKIT_MENU:
+                            synthkit_menuDown();
+                            break;
+
+                        case SYSTEM_MENU:
+                            system_menuDown();
+                            break;
+
+                        case RHYTHM_MENU:
+                            rhythm_menuDown();
+                            break;
+
+                        case METRO_MENU:
+                            metro_menuDown();
+                            break;
+
+                        case EQ_MENU:
+                            eq_menuDown();
+                            break;
+
+                        case OSC_A0_MENU:
+                        case OSC_A1_MENU:
+                        case OSC_A2_MENU:
+                        case OSC_A3_MENU:
+                            osc_menuDown(osc[0]);
+                            break;
+
+                        case OSC_B0_MENU:
+                        case OSC_B1_MENU:
+                        case OSC_B2_MENU:
+                        case OSC_B3_MENU:
+                            osc_menuDown(osc[1]);
+                            break;
+
+                        case FILTER_0_MENU:
+                        case FILTER_1_MENU:
+                            filter_menuDown();
+                            break;
+
+                        case ENVELOPE_MENU:
+                            envelope_menuDown();
+                            break;
+
+                        case EFFECT_0_MENU:
+                        case EFFECT_1_MENU:
+                            effect_menuDown();
+                            break;
+
+                        case REVERB_MENU:
+                            reverb_menuDown();
+                            break;
+
+                        case KEY_MENU:
+                            key_menuDown();
+                            break;
+
+                        case SONG_MENU:
+                            song_menuDown();
+                            break;
+                    }
+                }
+                break;
+
+            case KEY_LEFT:
+                if (!alertFlag) {
+                    switch (menu) {
+                        case INIT_MENU:
+                        case MAIN_MENU:
+                            break;
+
+                        case FILE_MENU:
+                            file_menuLeft();
+                            break;
+
+                        case SYNTHKIT_MENU:
+                            synthkit_menuLeft();
+                            break;
+
+                        case SYSTEM_MENU:
+                            system_menuLeft();
+                            break;
+
+                        case RHYTHM_MENU:
+                            rhythm_menuLeft();
+                            break;
+
+                        case METRO_MENU:
+                            metro_menuLeft();
+                            break;
+
+                        case EQ_MENU:
+                            eq_menuLeft();
+                            break;
+
+                        case OSC_A0_MENU:
+                        case OSC_A1_MENU:
+                        case OSC_A2_MENU:
+                        case OSC_A3_MENU:
+                            osc_menuLeft(osc[0]);
+                            break;
+
+                        case OSC_B0_MENU:
+                        case OSC_B1_MENU:
+                        case OSC_B2_MENU:
+                        case OSC_B3_MENU:
+                            osc_menuLeft(osc[1]);
+                            break;
+
+                        case FILTER_0_MENU:
+                        case FILTER_1_MENU:
+                            filter_menuLeft();
+                            break;
+
+                        case ENVELOPE_MENU:
+                            envelope_menuLeft();
+                            break;
+
+                        case EFFECT_0_MENU:
+                        case EFFECT_1_MENU:
+                            effect_menuLeft();
+                            break;
+
+                        case REVERB_MENU:
+                            reverb_menuLeft();
+                            break;
+
+                        case KEY_MENU:
+                            key_menuLeft();
+                            break;
+
+                        case SONG_MENU:
+                            (keyboard.songButtonPress || songShiftButtonFlag) ? song_shiftSelectedBeat(false) : song_menuLeft();
+                            break;
+                    }
+                }
+                break;
+
+            case KEY_RIGHT:
+                if (!alertFlag) {
+                    switch (menu) {
+                        case INIT_MENU:
+                        case MAIN_MENU:
+                            break;
+
+                        case FILE_MENU:
+                            file_menuRight();
+                            break;
+
+                        case SYNTHKIT_MENU:
+                            synthkit_menuRight();
+                            break;
+
+                        case SYSTEM_MENU:
+                            system_menuRight();
+                            break;
+
+                        case RHYTHM_MENU:
+                            rhythm_menuRight();
+                            break;
+
+                        case METRO_MENU:
+                            metro_menuRight();
+                            break;
+
+                        case EQ_MENU:
+                            eq_menuRight();
+                            break;
+
+                        case OSC_A0_MENU:
+                        case OSC_A1_MENU:
+                        case OSC_A2_MENU:
+                        case OSC_A3_MENU:
+                            osc_menuRight(osc[0]);
+                            break;
+
+                        case OSC_B0_MENU:
+                        case OSC_B1_MENU:
+                        case OSC_B2_MENU:
+                        case OSC_B3_MENU:
+                            osc_menuRight(osc[1]);
+                            break;
+
+                        case FILTER_0_MENU:
+                        case FILTER_1_MENU:
+                            filter_menuRight();
+                            break;
+
+                        case ENVELOPE_MENU:
+                            envelope_menuRight();
+                            break;
+
+                        case EFFECT_0_MENU:
+                        case EFFECT_1_MENU:
+                            effect_menuRight();
+                            break;
+
+                        case REVERB_MENU:
+                            reverb_menuRight();
+                            break;
+
+                        case KEY_MENU:
+                            key_menuRight();
+                            break;
+
+                        case SONG_MENU:
+                            (keyboard.songButtonPress || songShiftButtonFlag) ? song_shiftSelectedBeat(true) : song_menuRight();
+                            break;
+                    }
+                }
+                break;
+
+            case KEY_CENTER:
+                mainMenuButtonFlag = true;
+                startLongButtonTimer();
+                break;
+
+            case KEY_ADD:
+                if ((menu == SYSTEM_MENU) && (menuTab >= 4) && (menuTab <= 7) && (!alertFlag)) {
+                    subMenuTab = (subMenuTab == 1) ? 0 : 1;
+                    lcd_transitionSelect();
+                    lcd_drawSystem_MidiInData();
+                    lcd_drawSystem_MidiOutData();
+                    lcd_drawSystem_SyncInData();
+                    lcd_drawSystem_SyncOutData();
+                } else if ((menu == EQ_MENU) && (!alertFlag)) {
+                    subMenuTab = (subMenuTab == 1) ? 0 : 1;
+                    lcd_transitionSelect();
+                } else {
+                    keyboard.shiftButtonPress = true;
+                    if ((menu == SYSTEM_MENU) && (!alertFlag)) {
+                        lcd_drawSystem_MidiInData();
+                        lcd_drawSystem_MidiOutData();
+                        lcd_drawSystem_SyncInData();
+                        lcd_drawSystem_SyncOutData();
+                    }
+                }
+                if (alertFlag) {
+                    alertFlag = false;
+                    switch (alertType) {
+                        case ALERT_MEASUREUP:
+                            lcd_clearAlert();
+                            rhythm_setMeasure(rhythm.measure + 1);
+                            break;
+
+                        case ALERT_MEASUREDOWN:
+                            lcd_clearAlert();
+                            rhythm_setMeasure(rhythm.measure - 1);
+                            break;
+
+                        case ALERT_BARUP:
+                            lcd_clearAlert();
+                            rhythm_setBar(rhythm.bar + 1);
+                            break;
+
+                        case ALERT_BARDOWN:
+                            lcd_clearAlert();
+                            rhythm_setBar(rhythm.bar - 1);
+                            break;
+
+                        case ALERT_QUANTIZEUP:
+                            lcd_clearAlert();
+                            rhythm_setQuantize(rhythm.quantize + 1);
+                            break;
+
+                        case ALERT_QUANTIZEDOWN:
+                            lcd_clearAlert();
+                            rhythm_setQuantize(rhythm.quantize - 1);
+                            break;
+
+                        case ALERT_NEWFILE:
+                            file_newAction();
+                            break;
+
+                        case ALERT_LOADFILE:
+                            file_loadAction();
+                            break;
+
+                        case ALERT_SAVEFILE:
+                        case ALERT_OVERWRITEFILE:
+                            file_saveAction();
+                            break;
+
+                        case ALERT_CLEARFILE:
+                            file_clearAction();
+                            break;
+
+                        case ALERT_NEWSYNTHKIT:
+                            synthkit_newAction();
+                            break;
+
+                        case ALERT_LOADSYNTHKIT:
+                            synthkit_loadAction();
+                            break;
+
+                        case ALERT_SAVESYNTHKIT:
+                        case ALERT_OVERWRITESYNTHKIT:
+                            synthkit_saveAction();
+                            break;
+
+                        case ALERT_CLEARSYNTHKIT:
+                            synthkit_clearAction();
+                            break;
+
+                        default:
+                            break;
+                    }
+                } else if ((menu == SONG_MENU) && (song.bankLibrary[activeBankNum].lastActiveBeatNum == -1)) {
+                    songBeatButtonFlag = true;
+                    songBeatButtonStage = 0;
+                    startLongButtonTimer();
+                } else if ((menu == SONG_MENU) && (song.bankLibrary[activeBankNum].lastActiveBeatNum != -1)) {
+                    songShiftButtonFlag = true;
+                } else if (menu == FILE_MENU) {
+                    switch (menuTab) {
+                        case 0:
+                            file_newSelect();
+                            break;
+
+                        case 1:
+                            file_loadSelect();
+                            break;
+
+                        case 2:
+                            file_saveSelect();
+                            break;
+
+                        case 3:
+                            file_clearSelect();
+                            break;
+                    }
+                } else if (menu == SYNTHKIT_MENU) {
+                    switch (menuTab) {
+                        case 0:
+                            synthkit_newSelect();
+                            break;
+
+                        case 1:
+                            synthkit_loadSelect();
+                            break;
+
+                        case 2:
+                            synthkit_saveSelect();
+                            break;
+
+                        case 3:
+                            synthkit_clearSelect();
+                            break;
+                    }
+                } else if (menu == RHYTHM_MENU) {
+                    rhythmLockFlag = true;
+                    startLongButtonTimer();
+                } else if ((menu == OSC_A0_MENU) || (menu == OSC_A1_MENU)) {
+                    osc_setWavetableLoaded(osc[0], true);
+                } else if ((menu == OSC_B0_MENU) || (menu == OSC_B1_MENU)) {
+                    osc_setWavetableLoaded(osc[1], true);
+                }
+                break;
+
+            case KEY_ERASE:
+                if (alertFlag) {
+                    lcd_clearAlert();
+                    alertFlag = false;
+                } else if ((menu == SONG_MENU) && (song.bankLibrary[activeBankNum].lastActiveBeatNum != -1)) {
+                    songClearButtonFlag = true;
+                    startLongButtonTimer();
+                } else if (menu == RHYTHM_MENU) {
+                    rhythmUnlockFlag = true;
+                    startLongButtonTimer();
+                }
+                break;
+
+            case KEY_COPY:
+                if ((menu == SONG_MENU) && (song.bankLibrary[activeBankNum].lastActiveBeatNum != -1)) {
+                    noteCopyButtonFlag = true;
+                    songCopyButtonFlag = true;
+                    startLongButtonTimer();
+                }
+                break;
+
+            case KEY_PASTE:
+                if (menu == SONG_MENU) {
+                    notePasteButtonFlag = true;
+                    songPasteButtonFlag = true;
+                    startLongButtonTimer();
+                }
+                break;
+
+            case KEY_POWER:
+                powerButtonFlag = true;
+                powerButtonCounter = 0;
+                startPowerButtonTimer();
+                break;
+
+            case KEY_OCTAVE_DOWN:
+                octaveDown();
+                break;
+
+            case KEY_OCTAVE_UP:
+                octaveUp();
+                break;
+
+            case LEFT_RELEASE:
+                if (powerButtonFlag) {
+                    stopPowerButtonTimer();
+                    powerButtonFlag = false;
+                    powerButtonCounter = 0;
+                } else if (keyboard.shiftButtonPress) {
+                    keyboard.shiftButtonPress = false;
+                    if ((menu == SYSTEM_MENU) && (!alertFlag)) {
+                        lcd_drawSystem_MidiInData();
+                        lcd_drawSystem_MidiOutData();
+                        lcd_drawSystem_SyncInData();
+                        lcd_drawSystem_SyncOutData();
+                    } else if ((menu == EQ_MENU) && (!alertFlag)) {
+                        lcd_transitionSelect();
+                    }
+                } else if (upButtonFlag) {
+                    stopUpDownButtonTimer();
+                    upButtonFlag = false;
+                    upDownButtonCounter = 0;
+                } else if (downButtonFlag) {
+                    stopUpDownButtonTimer();
+                    downButtonFlag = false;
+                    upDownButtonCounter = 0;
+                } else if (songBeatButtonFlag) {
+                    stopLongButtonTimer();
+                    keyboard.longButtonCounter = 0;
+                    songBeatButtonFlag = false;
+                    songBeatButtonStage = 0;
+                } else if (songShiftButtonFlag) {
+                    if (!keyboard.songButtonPress) {
+                        songShiftButtonFlag = false;
+                    }
+                } else if (songClearButtonFlag) {
+                    stopLongButtonTimer();
+                    keyboard.longButtonCounter = 0;
+                    songClearButtonFlag = false;
+                    song_resetSelectedBeat();
+                } else if (noteCopyButtonFlag) {
+                    stopLongButtonTimer();
+                    keyboard.longButtonCounter = 0;
+                    if (songCopyButtonFlag) {
+                        noteCopyButtonFlag = false;
+                        songCopyButtonFlag = false;
+                        if (song.bankLibrary[activeBankNum].lastActiveBeatNum != -1) {
+                            copyBeatNote = song.bankLibrary[activeBankNum].beatLibrary[selectedBeatNum].note;
+                            copyBeatOctave = song.bankLibrary[activeBankNum].beatLibrary[selectedBeatNum].octave;
+                        }
+                    } else {
+                        noteCopyButtonFlag = false;
+                    }
+                } else if (notePasteButtonFlag) {
+                    stopLongButtonTimer();
+                    keyboard.longButtonCounter = 0;
+                    if (songPasteButtonFlag) {
+                        if ((copyBeatNote != -1) && (copyBeatOctave != -1) && (song.bankLibrary[activeBankNum].lastActiveBeatNum != -1)) {
+                            song_setBeatNoteOctave(copyBeatNote, copyBeatOctave);
+                        }
+                        notePasteButtonFlag = false;
+                        songPasteButtonFlag = false;
+                    } else {
+                        notePasteButtonFlag = false;
+                    }
+                } else if (mainMenuButtonFlag) {
+                    stopLongButtonTimer();
+                    keyboard.longButtonCounter = 0;
+                    mainMenuButtonFlag = false;
+                } else if (rhythmUnlockFlag) {
+                    stopLongButtonTimer();
+                    keyboard.longButtonCounter = 0;
+                    rhythmUnlockFlag = false;
+                } else if (rhythmLockFlag) {
+                    stopLongButtonTimer();
+                    keyboard.longButtonCounter = 0;
+                    rhythmLockFlag = false;
+                }
+                break;
+
+            default:
+                break;
         }
         keyboard.leftButton = -1;
     }
@@ -1025,180 +1543,195 @@ void Controller::keyboard_check_B() {
         // LED1_TOGGLE;
         // check(keyboard.rightButton, 0);
         switch (keyboard.rightButton) {
-        case KEY_FILE:
-            if (!alertFlag)
-                file_select();
-            break;
+            case KEY_FILE:
+                if (!alertFlag)
+                    file_select();
+                break;
 
-        case KEY_SYNTHKIT:
-            if (!alertFlag)
-                synthkit_select();
-            break;
+            case KEY_SYNTHKIT:
+                if (!alertFlag)
+                    synthkit_select();
+                break;
 
-        case KEY_SYSTEM:
-            if (!alertFlag)
-                system_select();
-            break;
+            case KEY_SYSTEM:
+                if (!alertFlag)
+                    system_select();
+                break;
 
-        case KEY_RHYTHM:
-            if (!alertFlag)
-                rhythm_select();
-            break;
+            case KEY_RHYTHM:
+                if (!alertFlag)
+                    rhythm_select();
+                break;
 
-        case KEY_METRONOME:
-            if (!alertFlag)
-                metro_select();
-            break;
+            case KEY_METRONOME:
+                if (!alertFlag)
+                    metro_select();
+                break;
 
-        case KEY_EQ:
-            if (!alertFlag)
-                eq_select();
-            break;
+            case KEY_EQ:
+                if (!alertFlag)
+                    eq_select();
+                break;
 
-        case KEY_OSC_A:
-            if (!alertFlag)
-                osc_select(osc[0]);
-            break;
+            case KEY_OSC_A:
+                if (!alertFlag)
+                    osc_select(osc[0]);
+                break;
 
-        case KEY_OSC_B:
-            if (!alertFlag)
-                osc_select(osc[1]);
-            break;
+            case KEY_OSC_B:
+                if (!alertFlag)
+                    osc_select(osc[1]);
+                break;
 
-        case KEY_FILTER:
-            if (!alertFlag)
-                filter_select();
-            break;
+            case KEY_FILTER:
+                if (!alertFlag)
+                    filter_select();
+                break;
 
-        case KEY_ENVELOPE:
-            if (!alertFlag)
-                envelope_select();
-            break;
+            case KEY_ENVELOPE:
+                if (!alertFlag)
+                    envelope_select();
+                break;
 
-        case KEY_EFFECT:
-            if (!alertFlag)
-                effect_select();
-            break;
+            case KEY_EFFECT:
+                if (!alertFlag)
+                    effect_select();
+                break;
 
-        case KEY_REVERB:
-            if (!alertFlag)
-                reverb_select();
-            break;
+            case KEY_REVERB:
+                if (!alertFlag)
+                    reverb_select();
+                break;
 
-        case KEY_MODE_KEY:
-            if (!alertFlag)
-                key_select();
-            break;
+            case KEY_MODE_KEY:
+                if (!alertFlag)
+                    key_select();
+                break;
 
-        case KEY_MODE_SONG:
-            if (!alertFlag)
-                song_select();
-            break;
+            case KEY_MODE_SONG:
+                keyboard.songButtonPress = true;
+                if (!alertFlag)
+                    song_select();
+                break;
 
-        case KEY_BANK:
-            keyboard.bankButtonPress = true;
-            break;
+            case KEY_BANK:
+                keyboard.bankButtonPress = true;
+                break;
 
-        case RIGHT_RELEASE:
-            keyboard.bankButtonPress = false;
-            break;
+            case RIGHT_RELEASE:
+                keyboard.bankButtonPress = false;
+                keyboard.songButtonPress = false;
+                break;
 
-        default:
-            break;
+            default:
+                break;
         }
         keyboard.rightButton = -1;
     }
 
+    keyboard_check_B_notes();
+}
+
+void Controller::keyboard_check_B_notes() {
     // beat button
     if (keyboard.beatButton >= 0) {
         // LED2_TOGGLE;
         // check(keyboard.beatButton, 0);
         switch (keyboard.beatButton) {
-        case KEY_00:
-            if (keyboard.bankButtonPress) {
-                (playActive) ? bank_trigger(0) : bank_select(0);
-            } else {
-                pressNote(activeOctaveNum, 0);
-            }
-            break;
+            case KEY_00:
+                if (keyboard.bankButtonPress) {
+                    (playActive) ? bank_trigger(0) : bank_select(0);
+                } else {
+                    pressNote(activeOctaveNum, 0);
+                }
+                break;
 
-        case KEY_01:
-            pressNote(activeOctaveNum, 1);
-            break;
+            case KEY_01:
+                pressNote(activeOctaveNum, 1);
+                break;
 
-        case KEY_02:
-            if (keyboard.bankButtonPress) {
-                (playActive) ? bank_trigger(1) : bank_select(1);
-            } else {
-                pressNote(activeOctaveNum, 2);
-            }
-            break;
+            case KEY_02:
+                if (keyboard.bankButtonPress) {
+                    (playActive) ? bank_trigger(1) : bank_select(1);
+                } else {
+                    pressNote(activeOctaveNum, 2);
+                }
+                break;
 
-        case KEY_03:
-            pressNote(activeOctaveNum, 3);
-            break;
+            case KEY_03:
+                pressNote(activeOctaveNum, 3);
+                break;
 
-        case KEY_04:
-            if (keyboard.bankButtonPress) {
-                (playActive) ? bank_trigger(2) : bank_select(2);
-            } else {
-                pressNote(activeOctaveNum, 4);
-            }
-            break;
+            case KEY_04:
+                if (keyboard.bankButtonPress) {
+                    (playActive) ? bank_trigger(2) : bank_select(2);
+                } else {
+                    pressNote(activeOctaveNum, 4);
+                }
+                break;
 
-        case KEY_05:
-            if (keyboard.bankButtonPress) {
-                (playActive) ? bank_trigger(3) : bank_select(3);
-            } else {
-                pressNote(activeOctaveNum, 5);
-            }
-            break;
+            case KEY_05:
+                if (keyboard.bankButtonPress) {
+                    (playActive) ? bank_trigger(3) : bank_select(3);
+                } else {
+                    pressNote(activeOctaveNum, 5);
+                }
+                break;
 
-        case KEY_06:
-            pressNote(activeOctaveNum, 6);
-            break;
+            case KEY_06:
+                pressNote(activeOctaveNum, 6);
+                break;
 
-        case KEY_07:
-            if (keyboard.bankButtonPress) {
-                (playActive) ? bank_trigger(4) : bank_select(4);
-            } else {
-                pressNote(activeOctaveNum, 7);
-            }
-            break;
+            case KEY_07:
+                if (keyboard.bankButtonPress) {
+                    (playActive) ? bank_trigger(4) : bank_select(4);
+                } else {
+                    pressNote(activeOctaveNum, 7);
+                }
+                break;
 
-        case KEY_08:
-            pressNote(activeOctaveNum, 8);
-            break;
+            case KEY_08:
+                pressNote(activeOctaveNum, 8);
+                break;
 
-        case KEY_09:
-            if (keyboard.bankButtonPress) {
-                (playActive) ? bank_trigger(5) : bank_select(5);
-            } else {
-                pressNote(activeOctaveNum, 9);
-            }
-            break;
+            case KEY_09:
+                if (keyboard.bankButtonPress) {
+                    (playActive) ? bank_trigger(5) : bank_select(5);
+                } else {
+                    pressNote(activeOctaveNum, 9);
+                }
+                break;
 
-        case KEY_10:
-            pressNote(activeOctaveNum, 10);
-            break;
+            case KEY_10:
+                pressNote(activeOctaveNum, 10);
+                break;
 
-        case KEY_11:
-            if (keyboard.bankButtonPress) {
-                (playActive) ? bank_trigger(6) : bank_select(6);
-            } else {
-                pressNote(activeOctaveNum, 11);
-            }
-            break;
+            case KEY_11:
+                if (keyboard.bankButtonPress) {
+                    (playActive) ? bank_trigger(6) : bank_select(6);
+                } else {
+                    pressNote(activeOctaveNum, 11);
+                }
+                break;
 
-        case BEAT_RELEASE:
-            if (keyboard.bankButtonPress) {
-            } else {
-                releaseNote();
-            }
-            break;
+            case BEAT_RELEASE:
+                if (keyboard.bankButtonPress) {
+                } else {
+                    releaseNote();
+                }
+                break;
 
-        default:
-            break;
+            default:
+                break;
+        }
+        keyboard.beatButton = -1;
+    }
+}
+
+void Controller::keyboard_check_B_noteOff() {
+    if (keyboard.beatButton == BEAT_RELEASE) {
+        if (!keyboard.bankButtonPress) {
+            releaseNote();
         }
         keyboard.beatButton = -1;
     }
@@ -1209,22 +1742,22 @@ void Controller::keyboard_check_C() {
         // LED0_TOGGLE;
         // check(keyboard.leftButton, 0);
         switch (keyboard.leftButton) {
-        case KEY_POWER:
-            powerButtonFlag = true;
-            powerButtonCounter = 0;
-            startPowerButtonTimer();
-            break;
-
-        case LEFT_RELEASE:
-            if (powerButtonFlag) {
-                stopPowerButtonTimer();
-                powerButtonFlag = false;
+            case KEY_POWER:
+                powerButtonFlag = true;
                 powerButtonCounter = 0;
-            }
-            break;
+                startPowerButtonTimer();
+                break;
 
-        default:
-            break;
+            case LEFT_RELEASE:
+                if (powerButtonFlag) {
+                    stopPowerButtonTimer();
+                    powerButtonFlag = false;
+                    powerButtonCounter = 0;
+                }
+                break;
+
+            default:
+                break;
         }
         keyboard.leftButton = -1;
     }
@@ -1253,13 +1786,14 @@ SdResult Controller::sd_initialize() {
 
     while (sdResult != SD_OK) {
         if (sd_detect() == SD_OK) {
+            MX_SDMMC2_SD_Init();
             sd.detect = true;
             if (sdInsertCheck) {
                 lcd.drawInitSdReadAlert();
                 sdInsertCheck = false;
             }
-            FATFS_UnLinkDriver(SDPath);
-            FATFS_LinkDriver(&SD_Driver, SDPath);
+            // FATFS_UnLinkDriver(SDPath);
+            // FATFS_LinkDriver(&SD_Driver, SDPath);
             if ((sd_mount() == SD_OK) && (sd_getLabel() == SD_OK) &&
                 (sd_getSpace() == SD_OK)) {
                 sd.serialTemp = sd.serial;
@@ -1267,48 +1801,44 @@ SdResult Controller::sd_initialize() {
                     if (sd_checkFolderExist("Wavetable") == SD_OK) {
                         if (sd_checkFolderExist("System/File") == SD_OK) {
                             if (sd_checkFolderExist("System/Synthkit") == SD_OK) {
-                                if (sd_checkFolderExist("System/Sound") == SD_OK) {
-                                    if (sd_checkFolderExist("System/Image") == SD_OK) {
-                                        if (sd_checkFolderExist("System/Firmware") == SD_OK) {
-                                            if ((sd_checkMetronome() == SD_OK) && (sd_loadMetronome() == SD_OK) &&
-                                                (sd_loadImage("System/Image/Image_Logo.rwi", RAM_IMAGE_LOGO_PALETTE_ADDRESS, RAM_IMAGE_LOGO_DATA_ADDRESS, kImageLogoPalette, kImageLogoWidth, kImageLogoHeight, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Image_Menu.rwi", RAM_IMAGE_MENU_PALETTE_ADDRESS, RAM_IMAGE_MENU_DATA_ADDRESS, kImageMenuPalette, kImageMenuWidth, kImageMenuHeight, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Image_Key.rwi", RAM_IMAGE_KEY_PALETTE_ADDRESS, RAM_IMAGE_KEY_DATA_ADDRESS, kImageKeyPalette, kImageKeyWidth, kImageKeyHeight, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Image_Osc_A.rwi", RAM_IMAGE_OSC_A_PALETTE_ADDRESS, RAM_IMAGE_OSC_A_DATA_ADDRESS, kImageOscAPalette, kImageOscAWidth, kImageOscAHeight, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Image_Osc_B.rwi", RAM_IMAGE_OSC_B_PALETTE_ADDRESS, RAM_IMAGE_OSC_B_DATA_ADDRESS, kImageOscBPalette, kImageOscBWidth, kImageOscBHeight, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Image_Filter.rwi", RAM_IMAGE_FILTER_PALETTE_ADDRESS, RAM_IMAGE_FILTER_DATA_ADDRESS, kImageFilterPalette, kImageFilterWidth, kImageFilterHeight, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Image_Envelope.rwi", RAM_IMAGE_ENV_PALETTE_ADDRESS, RAM_IMAGE_ENV_DATA_ADDRESS, kImageEnvPalette, kImageEnvWidth, kImageEnvHeight, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Icon_Select.rwi", RAM_ICON_SELECT_PALETTE_ADDRESS, RAM_ICON_SELECT_DATA_ADDRESS, kIconPalette, kIconSelectWidth, kIconSelectHeight * 2, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Icon_Alert.rwi", RAM_ICON_ALERT_PALETTE_ADDRESS, RAM_ICON_ALERT_DATA_ADDRESS, kIconPalette, kIconAlertWidth, kIconAlertHeight * 2, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Icon_Play.rwi", RAM_ICON_PLAY_PALETTE_ADDRESS, RAM_ICON_PLAY_DATA_ADDRESS, kIconPalette, kIconPlayWidth, kIconPlayHeight * 8, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Graph_Key.rwi", RAM_GRAPH_KEY_PALETTE_ADDRESS, RAM_GRAPH_KEY_DATA_ADDRESS, kInfoGraphPalette, kInfoGraphWidth, kInfoGraphHeight * 13, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Graph_Arpeg.rwi", RAM_GRAPH_ARPEG_PALETTE_ADDRESS, RAM_GRAPH_ARPEG_DATA_ADDRESS, kInfoGraphPalette, kInfoGraphWidth, kInfoGraphHeight * 10, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Graph_Lfo_A.rwi", RAM_GRAPH_LFO_A_PALETTE_ADDRESS, RAM_GRAPH_LFO_A_DATA_ADDRESS, kInfoGraphPalette, kInfoGraphWidth, kInfoGraphHeight * 26, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Graph_Lfo_B.rwi", RAM_GRAPH_LFO_B_PALETTE_ADDRESS, RAM_GRAPH_LFO_B_DATA_ADDRESS, kInfoGraphPalette, kInfoGraphWidth, kInfoGraphHeight * 26, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Graph_Envelope.rwi", RAM_GRAPH_ENVELOPE_PALETTE_ADDRESS, RAM_GRAPH_ENVELOPE_DATA_ADDRESS, kInfoGraphPalette, kInfoGraphWidth, kInfoGraphHeight * 4, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Graph_Filter.rwi", RAM_GRAPH_FILTER_PALETTE_ADDRESS, RAM_GRAPH_FILTER_DATA_ADDRESS, kInfoGraphPalette, kInfoGraphWidth, kInfoGraphHeight * 5, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Button_Key.rwi", RAM_BUTTON_KEY_PALETTE_ADDRESS, RAM_BUTTON_KEY_DATA_ADDRESS, kButtonKeyPalette, kButtonKeyWidth, kButtonKeyHeight * 2, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Button_Osc_A.rwi", RAM_BUTTON_OSC_A_PALETTE_ADDRESS, RAM_BUTTON_OSC_A_DATA_ADDRESS, kButtonOscAPalette, kButtonOscAWidth, kButtonOscAHeight * 3, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Button_Osc_B.rwi", RAM_BUTTON_OSC_B_PALETTE_ADDRESS, RAM_BUTTON_OSC_B_DATA_ADDRESS, kButtonOscBPalette, kButtonOscBWidth, kButtonOscBHeight * 3, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Button_Filter.rwi", RAM_BUTTON_FILTER_PALETTE_ADDRESS, RAM_BUTTON_FILTER_DATA_ADDRESS, kButtonFilterPalette, kButtonFilterWidth, kButtonFilterHeight * 2, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Button_Envelope.rwi", RAM_BUTTON_ENVELOPE_PALETTE_ADDRESS, RAM_BUTTON_ENVELOPE_DATA_ADDRESS, kButtonEnvelopePalette, kButtonEnvelopeWidth, kButtonEnvelopeHeight * 2, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Button_Osc_A_Lfo.rwi", RAM_BUTTON_OSC_A_LFO_PALETTE_ADDRESS, RAM_BUTTON_OSC_A_LFO_DATA_ADDRESS, kButtonLfoPalette, kButtonLfoWidth, kButtonLfoHeight * 2, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Button_Osc_B_Lfo.rwi", RAM_BUTTON_OSC_B_LFO_PALETTE_ADDRESS, RAM_BUTTON_OSC_B_LFO_DATA_ADDRESS, kButtonLfoPalette, kButtonLfoWidth, kButtonLfoHeight * 2, RGB16) == SD_OK) &&
-                                                (sd_loadImage("System/Image/Button_Song.rwi", RAM_BUTTON_SONG_PALETTE_ADDRESS, RAM_BUTTON_SONG_DATA_ADDRESS, kButtonSongPalette, kButtonSongWidth, kButtonSongHeight * 2, RGB16) == SD_OK)) {
-                                                sd.ready = true;
-                                                sd.getLibrary = true;
-                                                sdResult = SD_OK;
-                                            } else {
-                                                sdResult = SD_ERROR_SYSTEMFILE;
-                                            }
+                                if (sd_checkFolderExist("System/Image") == SD_OK) {
+                                    if (sd_checkFolderExist("System/Firmware") == SD_OK) {
+                                        if (
+                                            (sd_loadImage("System/Image/Image_Logo.rwi", RAM_IMAGE_LOGO_PALETTE_ADDRESS, RAM_IMAGE_LOGO_DATA_ADDRESS, kImageLogoPalette, kImageLogoWidth, kImageLogoHeight, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Image_Menu.rwi", RAM_IMAGE_MENU_PALETTE_ADDRESS, RAM_IMAGE_MENU_DATA_ADDRESS, kImageMenuPalette, kImageMenuWidth, kImageMenuHeight, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Image_Key.rwi", RAM_IMAGE_KEY_PALETTE_ADDRESS, RAM_IMAGE_KEY_DATA_ADDRESS, kImageKeyPalette, kImageKeyWidth, kImageKeyHeight, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Image_Osc_A.rwi", RAM_IMAGE_OSC_A_PALETTE_ADDRESS, RAM_IMAGE_OSC_A_DATA_ADDRESS, kImageOscAPalette, kImageOscAWidth, kImageOscAHeight, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Image_Osc_B.rwi", RAM_IMAGE_OSC_B_PALETTE_ADDRESS, RAM_IMAGE_OSC_B_DATA_ADDRESS, kImageOscBPalette, kImageOscBWidth, kImageOscBHeight, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Image_Filter.rwi", RAM_IMAGE_FILTER_PALETTE_ADDRESS, RAM_IMAGE_FILTER_DATA_ADDRESS, kImageFilterPalette, kImageFilterWidth, kImageFilterHeight, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Image_Envelope.rwi", RAM_IMAGE_ENV_PALETTE_ADDRESS, RAM_IMAGE_ENV_DATA_ADDRESS, kImageEnvPalette, kImageEnvWidth, kImageEnvHeight, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Icon_Select.rwi", RAM_ICON_SELECT_PALETTE_ADDRESS, RAM_ICON_SELECT_DATA_ADDRESS, kIconPalette, kIconSelectWidth, kIconSelectHeight * 2, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Icon_Alert.rwi", RAM_ICON_ALERT_PALETTE_ADDRESS, RAM_ICON_ALERT_DATA_ADDRESS, kIconPalette, kIconAlertWidth, kIconAlertHeight * 2, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Icon_Play.rwi", RAM_ICON_PLAY_PALETTE_ADDRESS, RAM_ICON_PLAY_DATA_ADDRESS, kIconPalette, kIconPlayWidth, kIconPlayHeight * 8, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Graph_Key.rwi", RAM_GRAPH_KEY_PALETTE_ADDRESS, RAM_GRAPH_KEY_DATA_ADDRESS, kInfoGraphPalette, kInfoGraphWidth, kInfoGraphHeight * 13, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Graph_Arpeg.rwi", RAM_GRAPH_ARPEG_PALETTE_ADDRESS, RAM_GRAPH_ARPEG_DATA_ADDRESS, kInfoGraphPalette, kInfoGraphWidth, kInfoGraphHeight * 10, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Graph_Lfo_A.rwi", RAM_GRAPH_LFO_A_PALETTE_ADDRESS, RAM_GRAPH_LFO_A_DATA_ADDRESS, kInfoGraphPalette, kInfoGraphWidth, kInfoGraphHeight * 26, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Graph_Lfo_B.rwi", RAM_GRAPH_LFO_B_PALETTE_ADDRESS, RAM_GRAPH_LFO_B_DATA_ADDRESS, kInfoGraphPalette, kInfoGraphWidth, kInfoGraphHeight * 26, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Graph_Envelope.rwi", RAM_GRAPH_ENVELOPE_PALETTE_ADDRESS, RAM_GRAPH_ENVELOPE_DATA_ADDRESS, kInfoGraphPalette, kInfoGraphWidth, kInfoGraphHeight * 4, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Graph_Filter.rwi", RAM_GRAPH_FILTER_PALETTE_ADDRESS, RAM_GRAPH_FILTER_DATA_ADDRESS, kInfoGraphPalette, kInfoGraphWidth, kInfoGraphHeight * 5, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Button_Key.rwi", RAM_BUTTON_KEY_PALETTE_ADDRESS, RAM_BUTTON_KEY_DATA_ADDRESS, kButtonKeyPalette, kButtonKeyWidth, kButtonKeyHeight * 2, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Button_Osc_A.rwi", RAM_BUTTON_OSC_A_PALETTE_ADDRESS, RAM_BUTTON_OSC_A_DATA_ADDRESS, kButtonOscAPalette, kButtonOscAWidth, kButtonOscAHeight * 3, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Button_Osc_B.rwi", RAM_BUTTON_OSC_B_PALETTE_ADDRESS, RAM_BUTTON_OSC_B_DATA_ADDRESS, kButtonOscBPalette, kButtonOscBWidth, kButtonOscBHeight * 3, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Button_Filter.rwi", RAM_BUTTON_FILTER_PALETTE_ADDRESS, RAM_BUTTON_FILTER_DATA_ADDRESS, kButtonFilterPalette, kButtonFilterWidth, kButtonFilterHeight * 2, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Button_Envelope.rwi", RAM_BUTTON_ENVELOPE_PALETTE_ADDRESS, RAM_BUTTON_ENVELOPE_DATA_ADDRESS, kButtonEnvelopePalette, kButtonEnvelopeWidth, kButtonEnvelopeHeight * 2, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Button_Osc_A_Lfo.rwi", RAM_BUTTON_OSC_A_LFO_PALETTE_ADDRESS, RAM_BUTTON_OSC_A_LFO_DATA_ADDRESS, kButtonLfoPalette, kButtonLfoWidth, kButtonLfoHeight * 2, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Button_Osc_B_Lfo.rwi", RAM_BUTTON_OSC_B_LFO_PALETTE_ADDRESS, RAM_BUTTON_OSC_B_LFO_DATA_ADDRESS, kButtonLfoPalette, kButtonLfoWidth, kButtonLfoHeight * 2, RGB16) == SD_OK) &&
+                                            (sd_loadImage("System/Image/Button_Song.rwi", RAM_BUTTON_SONG_PALETTE_ADDRESS, RAM_BUTTON_SONG_DATA_ADDRESS, kButtonSongPalette, kButtonSongWidth, kButtonSongHeight * 2, RGB16) == SD_OK)) {
+                                            sd.ready = true;
+                                            sd.getLibrary = true;
+                                            sdResult = SD_OK;
                                         } else {
-                                            sdResult = SD_ERROR_FIRMWAREFOLDER;
+                                            sdResult = SD_ERROR_SYSTEMFILE;
                                         }
                                     } else {
-                                        sdResult = SD_ERROR_IMAGEFOLDER;
+                                        sdResult = SD_ERROR_FIRMWAREFOLDER;
                                     }
                                 } else {
-                                    sdResult = SD_ERROR_SOUNDFOLDER;
+                                    sdResult = SD_ERROR_IMAGEFOLDER;
                                 }
                             } else {
                                 sdResult = SD_ERROR_SYNTHKITFOLDER;
@@ -1360,6 +1890,7 @@ SdResult Controller::sd_reinitialize() {
 
     while (sdResult != SD_OK) {
         if (sd_detect() == SD_OK) {
+            MX_SDMMC2_SD_Init();
             sd.detect = true;
             FATFS_UnLinkDriver(SDPath);
             FATFS_LinkDriver(&SD_Driver, SDPath);
@@ -1369,20 +1900,16 @@ SdResult Controller::sd_reinitialize() {
                         if (sd_checkFolderExist("Wavetable") == SD_OK) {
                             if (sd_checkFolderExist("System/File") == SD_OK) {
                                 if (sd_checkFolderExist("System/Synthkit") == SD_OK) {
-                                    if (sd_checkFolderExist("System/Sound") == SD_OK) {
-                                        if (sd_checkFolderExist("System/Image") == SD_OK) {
-                                            if (sd_checkFolderExist("System/Firmware") == SD_OK) {
-                                                sd.ready = true;
-                                                sd.getLibrary = true;
-                                                sdResult = SD_OK;
-                                            } else {
-                                                sdResult = SD_ERROR_FIRMWAREFOLDER;
-                                            }
+                                    if (sd_checkFolderExist("System/Image") == SD_OK) {
+                                        if (sd_checkFolderExist("System/Firmware") == SD_OK) {
+                                            sd.ready = true;
+                                            sd.getLibrary = true;
+                                            sdResult = SD_OK;
                                         } else {
-                                            sdResult = SD_ERROR_IMAGEFOLDER;
+                                            sdResult = SD_ERROR_FIRMWAREFOLDER;
                                         }
                                     } else {
-                                        sdResult = SD_ERROR_SOUNDFOLDER;
+                                        sdResult = SD_ERROR_IMAGEFOLDER;
                                     }
                                 } else {
                                     sdResult = SD_ERROR_SYNTHKITFOLDER;
@@ -1428,11 +1955,10 @@ SdResult Controller::sd_reinitialize() {
             HAL_Delay(500);
         }
     }
+
     lcd_clearSdAlert();
-    // clear pre-alert
     alertFlag = false;
     alertType = ALERT_OFF;
-    // go to main menu
     main_select();
 
     return sdResult;
@@ -1470,9 +1996,9 @@ SdResult Controller::sd_setLabel() {
 
 SdResult Controller::sd_getSpace() {
     SdResult sdResult;
-    FATFS *fs_ptr = &sd.fs;
+    FATFS* fs_ptr = &sd.fs;
     uint32_t freeCluster;
-    if (f_getfree(SDPath, (DWORD *)&freeCluster, &fs_ptr) == FR_OK) {
+    if (f_getfree(SDPath, (DWORD*)&freeCluster, &fs_ptr) == FR_OK) {
         uint32_t totalBlocks = (sd.fs.n_fatent - 2) * sd.fs.csize;
         uint32_t freeBlocks = freeCluster * sd.fs.csize;
         sd.totalSpace = totalBlocks / 2000;
@@ -1488,7 +2014,7 @@ SdResult Controller::sd_getSpace() {
     return sdResult;
 }
 
-SdResult Controller::sd_checkFileExist(char *fileAddress) {
+SdResult Controller::sd_checkFileExist(char* fileAddress) {
     SdResult sdResult;
     if ((f_stat(fileAddress, &sd.fileInfo) == FR_OK) && ((sd.fileInfo.fattrib & AM_DIR) == false)) {
         sdResult = SD_OK;
@@ -1498,7 +2024,7 @@ SdResult Controller::sd_checkFileExist(char *fileAddress) {
     return sdResult;
 }
 
-SdResult Controller::sd_checkFolderExist(char *folderAddress) {
+SdResult Controller::sd_checkFolderExist(char* folderAddress) {
     SdResult sdResult;
     if ((f_stat(folderAddress, &sd.fileInfo) == FR_OK) && (sd.fileInfo.fattrib & AM_DIR)) {
         sdResult = SD_OK;
@@ -1508,7 +2034,7 @@ SdResult Controller::sd_checkFolderExist(char *folderAddress) {
     return sdResult;
 }
 
-SdResult Controller::sd_loadImage(char *fileAddress, uint32_t paletteAddress, uint32_t dataAddress, uint16_t paletteSize, uint16_t width, uint16_t height, RGBMode mode) {
+SdResult Controller::sd_loadImage(char* fileAddress, uint32_t paletteAddress, uint32_t dataAddress, uint16_t paletteSize, uint16_t width, uint16_t height, RGBMode mode) {
     SdResult sdResult = SD_ERROR;
     char data[20] = "";
     char headerTitle[] = "RW_IMAGE  ";
@@ -1523,18 +2049,17 @@ SdResult Controller::sd_loadImage(char *fileAddress, uint32_t paletteAddress, ui
     keyboard_disable();
 
     if (f_open(&sd.file, fileAddress, FA_READ) == FR_OK) {
-        if (f_read(&sd.file, data, 10, &sd.bytesread) == FR_OK) {
+        if ((f_read(&sd.file, data, 10, &sd.bytesread) == FR_OK) && (sd.bytesread == 10)) {
             if (strcmp(data, headerTitle) == 0) {
                 memset(data, 0x00, sizeof(data));
-                if (f_read(&sd.file, data, 8, &sd.bytesread) == FR_OK) {
-                    uint16_t *paletteSize_ = (uint16_t *)&(data[0]);
-                    uint16_t *rgb_ = (uint16_t *)&(data[2]);
-                    uint16_t *width_ = (uint16_t *)&(data[4]);
-                    uint16_t *height_ = (uint16_t *)&(data[6]);
+                if ((f_read(&sd.file, data, 8, &sd.bytesread) == FR_OK) && (sd.bytesread == 8)) {
+                    uint16_t* paletteSize_ = (uint16_t*)&(data[0]);
+                    uint16_t* rgb_ = (uint16_t*)&(data[2]);
+                    uint16_t* width_ = (uint16_t*)&(data[4]);
+                    uint16_t* height_ = (uint16_t*)&(data[6]);
                     if ((paletteSize == *paletteSize_) && (rgb == *rgb_) && (width == *width_) && (height == *height_)) {
                         memset(data, 0, sizeof(data));
-                        f_read(&sd.file, data, 3, &sd.bytesread);
-                        if (strcmp(data, headerIndex) == 0) {
+                        if ((f_read(&sd.file, data, 3, &sd.bytesread) == FR_OK) && (sd.bytesread == 3) && (strcmp(data, headerIndex) == 0)) {
                             memset(data, 0, sizeof(data));
                             if (mode == RGB16) {
                                 const uint16_t readByteSize = 512;
@@ -1545,20 +2070,20 @@ SdResult Controller::sd_loadImage(char *fileAddress, uint32_t paletteAddress, ui
                                 uint32_t pointerOffset = 0;
 
                                 for (uint16_t i = 0; i < readCountTotal; i++) {
-                                    if (f_read(&sd.file, &dataRead, readByteSize, &sd.bytesread) != FR_OK)
+                                    if ((f_read(&sd.file, &dataRead, readByteSize, &sd.bytesread) != FR_OK) || (sd.bytesread != readByteSize))
                                         errorCount += 1;
                                     for (uint16_t j = 0; j < readByteSize; j++) {
-                                        volatile uint8_t *writePtr = (volatile uint8_t *)(paletteAddress + pointerOffset);
+                                        volatile uint8_t* writePtr = (volatile uint8_t*)(paletteAddress + pointerOffset);
                                         *writePtr = dataRead[j];
                                         pointerOffset += 1;
                                     }
                                     memset(dataRead, 0x00, readByteSize);
                                 }
                                 if (remainderByteSize) {
-                                    if (f_read(&sd.file, &dataRead, remainderByteSize, &sd.bytesread) != FR_OK)
+                                    if ((f_read(&sd.file, &dataRead, remainderByteSize, &sd.bytesread) != FR_OK) || (sd.bytesread != remainderByteSize))
                                         errorCount += 1;
                                     for (uint16_t k = 0; k < remainderByteSize; k++) {
-                                        volatile uint8_t *writePtr = (volatile uint8_t *)(paletteAddress + pointerOffset);
+                                        volatile uint8_t* writePtr = (volatile uint8_t*)(paletteAddress + pointerOffset);
                                         *writePtr = dataRead[k];
                                         pointerOffset += 1;
                                     }
@@ -1572,28 +2097,27 @@ SdResult Controller::sd_loadImage(char *fileAddress, uint32_t paletteAddress, ui
                                 uint32_t pointerOffset = 0;
 
                                 for (uint16_t i = 0; i < readCountTotal; i++) {
-                                    if (f_read(&sd.file, &dataRead, readByteSize, &sd.bytesread) != FR_OK)
+                                    if ((f_read(&sd.file, &dataRead, readByteSize, &sd.bytesread) != FR_OK) || (sd.bytesread != readByteSize))
                                         errorCount += 1;
                                     for (uint16_t j = 0; j < readByteSize; j++) {
-                                        volatile uint8_t *writePtr = (volatile uint8_t *)(paletteAddress + pointerOffset);
+                                        volatile uint8_t* writePtr = (volatile uint8_t*)(paletteAddress + pointerOffset);
                                         *writePtr = dataRead[j];
                                         pointerOffset += 1;
                                     }
                                     memset(dataRead, 0x00, readByteSize);
                                 }
                                 if (remainderByteSize) {
-                                    if (f_read(&sd.file, &dataRead, remainderByteSize, &sd.bytesread) != FR_OK)
+                                    if ((f_read(&sd.file, &dataRead, remainderByteSize, &sd.bytesread) != FR_OK) || (sd.bytesread != remainderByteSize))
                                         errorCount += 1;
                                     for (uint16_t k = 0; k < remainderByteSize; k++) {
-                                        volatile uint8_t *writePtr = (volatile uint8_t *)(paletteAddress + pointerOffset);
+                                        volatile uint8_t* writePtr = (volatile uint8_t*)(paletteAddress + pointerOffset);
                                         *writePtr = dataRead[k];
                                         pointerOffset += 1;
                                     }
                                 }
                             }
 
-                            f_read(&sd.file, data, 3, &sd.bytesread);
-                            if (strcmp(data, headerData) == 0) {
+                            if ((f_read(&sd.file, data, 3, &sd.bytesread) == FR_OK) && (sd.bytesread == 3) && (strcmp(data, headerData) == 0)) {
                                 memset(data, 0, sizeof(data));
                                 const uint16_t readByteSize = 512;
                                 uint32_t pixelByteSize = width * height;
@@ -1604,19 +2128,19 @@ SdResult Controller::sd_loadImage(char *fileAddress, uint32_t paletteAddress, ui
                                 uint32_t errorCount = 0;
 
                                 for (uint32_t i = 0; i < readCountTotal; i++) {
-                                    if (f_read(&sd.file, &dataRead, readByteSize, &sd.bytesread) != FR_OK)
+                                    if ((f_read(&sd.file, &dataRead, readByteSize, &sd.bytesread) != FR_OK) || (sd.bytesread != readByteSize))
                                         errorCount += 1;
                                     for (uint16_t j = 0; j < readByteSize; j++) {
-                                        volatile uint8_t *writePtr = (volatile uint8_t *)(dataAddress + pointerOffset);
+                                        volatile uint8_t* writePtr = (volatile uint8_t*)(dataAddress + pointerOffset);
                                         *writePtr = dataRead[j];
                                         pointerOffset += 1;
                                     }
                                 }
                                 if (remainderByteSize) {
-                                    if (f_read(&sd.file, &dataRead, remainderByteSize, &sd.bytesread) != FR_OK)
+                                    if ((f_read(&sd.file, &dataRead, remainderByteSize, &sd.bytesread) != FR_OK) || (sd.bytesread != remainderByteSize))
                                         errorCount += 1;
                                     for (uint16_t k = 0; k < remainderByteSize; k++) {
-                                        volatile uint8_t *writePtr = (volatile uint8_t *)(dataAddress + pointerOffset);
+                                        volatile uint8_t* writePtr = (volatile uint8_t*)(dataAddress + pointerOffset);
                                         *writePtr = dataRead[k];
                                         pointerOffset += 1;
                                     }
@@ -1636,7 +2160,7 @@ SdResult Controller::sd_loadImage(char *fileAddress, uint32_t paletteAddress, ui
     return sdResult;
 }
 
-SdResult Controller::load16BitAudio(char *fileAddress, uint32_t ramAddress, uint32_t sampleSize) {
+SdResult Controller::load16BitAudio(char* fileAddress, uint32_t ramAddress, uint32_t sampleSize) {
     SdResult sdResult = SD_ERROR;
     struct WavData wavData;
 
@@ -1644,15 +2168,14 @@ SdResult Controller::load16BitAudio(char *fileAddress, uint32_t ramAddress, uint
     keyboard_disable();
     // read wav file
     if (f_open(&sd.file, fileAddress, FA_READ) == FR_OK) {
-        if (f_read(&sd.file, &wavData.riff_chunk, 12, &sd.bytesread) == FR_OK) {
+        if ((f_read(&sd.file, &wavData.riff_chunk, 12, &sd.bytesread) == FR_OK) && (sd.bytesread == 12)) {
             // read riff_chunk
             if ((wavData.riff_chunk.chunkId == 0x46464952) && (wavData.riff_chunk.fileFormat == 0x45564157)) {
                 uint32_t chunkSize = wavData.riff_chunk.chunkSize + 8;
                 // read fmt_chunk
                 for (uint32_t i = 0; i < (chunkSize - 24); i++) {
-                    f_lseek(&sd.file, i);
-                    f_read(&sd.file, &wavData.fmt_chunk, 24, &sd.bytesread);
-                    if (wavData.fmt_chunk.chunkId == 0x20746D66) {
+                    if ((f_lseek(&sd.file, i) == FR_OK) && (f_read(&sd.file, &wavData.fmt_chunk, 24, &sd.bytesread) == FR_OK) && (sd.bytesread == 24) &&
+                        (wavData.fmt_chunk.chunkId == 0x20746D66)) {
                         wavData.fmt_chunk.chunkStartByte = i;
                         break;
                     }
@@ -1663,9 +2186,8 @@ SdResult Controller::load16BitAudio(char *fileAddress, uint32_t ramAddress, uint
                     (wavData.fmt_chunk.sampleRate == 48000) && (wavData.fmt_chunk.bitPerSample == 16)) {
                     // read data_chunk
                     for (uint32_t j = 12; j < (chunkSize - 8); j++) {
-                        f_lseek(&sd.file, j);
-                        f_read(&sd.file, &wavData.data_chunk, 8, &sd.bytesread);
-                        if ((wavData.data_chunk.chunkId == 0x61746164)) {
+                        if ((f_lseek(&sd.file, j) == FR_OK) && (f_read(&sd.file, &wavData.data_chunk, 8, &sd.bytesread) == FR_OK) && (sd.bytesread == 8) &&
+                            (wavData.data_chunk.chunkId == 0x61746164)) {
                             wavData.data_chunk.chunkStartByte = j;
                             break;
                         }
@@ -1673,7 +2195,7 @@ SdResult Controller::load16BitAudio(char *fileAddress, uint32_t ramAddress, uint
                     // check data chunk
                     uint32_t byteSize = sampleSize * 2;
                     if ((wavData.data_chunk.chunkId == 0x61746164) && (wavData.data_chunk.chunkSize == byteSize)) {
-                        if (f_read(&sd.file, (uint8_t *)ramAddress, byteSize, &sd.bytesread) == FR_OK) {
+                        if ((f_read(&sd.file, (uint8_t*)ramAddress, byteSize, &sd.bytesread) == FR_OK) && (sd.bytesread == byteSize)) {
                             sdResult = SD_OK;
                         }
                     }
@@ -1687,7 +2209,7 @@ SdResult Controller::load16BitAudio(char *fileAddress, uint32_t ramAddress, uint
     return sdResult;
 }
 
-SdResult Controller::load24BitAudio(char *fileAddress, uint32_t ramAddress, uint32_t sampleSize) {
+SdResult Controller::load24BitAudio(char* fileAddress, uint32_t ramAddress, uint32_t sampleSize) {
     SdResult sdResult = SD_ERROR;
     struct WavData wavData;
 
@@ -1695,15 +2217,14 @@ SdResult Controller::load24BitAudio(char *fileAddress, uint32_t ramAddress, uint
     keyboard_disable();
     // read wav file
     if (f_open(&sd.file, fileAddress, FA_READ) == FR_OK) {
-        if (f_read(&sd.file, &wavData.riff_chunk, 12, &sd.bytesread) == FR_OK) {
+        if ((f_read(&sd.file, &wavData.riff_chunk, 12, &sd.bytesread) == FR_OK) && (sd.bytesread == 12)) {
             // read riff_chunk
             if ((wavData.riff_chunk.chunkId == 0x46464952) && (wavData.riff_chunk.fileFormat == 0x45564157)) {
                 uint32_t chunkSize = wavData.riff_chunk.chunkSize + 8;
                 // read fmt_chunk
                 for (uint32_t i = 0; i < (chunkSize - 24); i++) {
-                    f_lseek(&sd.file, i);
-                    f_read(&sd.file, &wavData.fmt_chunk, 24, &sd.bytesread);
-                    if (wavData.fmt_chunk.chunkId == 0x20746D66) {
+                    if ((f_lseek(&sd.file, i) == FR_OK) && (f_read(&sd.file, &wavData.fmt_chunk, 24, &sd.bytesread) == FR_OK) && (sd.bytesread == 24) &&
+                        (wavData.fmt_chunk.chunkId == 0x20746D66)) {
                         wavData.fmt_chunk.chunkStartByte = i;
                         break;
                     }
@@ -1714,9 +2235,8 @@ SdResult Controller::load24BitAudio(char *fileAddress, uint32_t ramAddress, uint
                     (wavData.fmt_chunk.sampleRate == 48000) && (wavData.fmt_chunk.bitPerSample == 24)) {
                     // read data_chunk
                     for (uint32_t j = 12; j < (chunkSize - 8); j++) {
-                        f_lseek(&sd.file, j);
-                        f_read(&sd.file, &wavData.data_chunk, 8, &sd.bytesread);
-                        if ((wavData.data_chunk.chunkId == 0x61746164)) {
+                        if ((f_lseek(&sd.file, j) == FR_OK) && (f_read(&sd.file, &wavData.data_chunk, 8, &sd.bytesread) == FR_OK) && (sd.bytesread == 8) &&
+                            (wavData.data_chunk.chunkId == 0x61746164)) {
                             wavData.data_chunk.chunkStartByte = j;
                             break;
                         }
@@ -1724,7 +2244,7 @@ SdResult Controller::load24BitAudio(char *fileAddress, uint32_t ramAddress, uint
                     // check data chunk
                     uint32_t byteSize = sampleSize * 3;
                     if ((wavData.data_chunk.chunkId == 0x61746164) && (wavData.data_chunk.chunkSize == byteSize)) {
-                        if (f_read(&sd.file, (uint8_t *)ramAddress, byteSize, &sd.bytesread) == FR_OK) {
+                        if ((f_read(&sd.file, (uint8_t*)ramAddress, byteSize, &sd.bytesread) == FR_OK) && (sd.bytesread == byteSize)) {
                             sdResult = SD_OK;
                         }
                     }
@@ -1739,12 +2259,11 @@ SdResult Controller::load24BitAudio(char *fileAddress, uint32_t ramAddress, uint
 }
 
 SdResult Controller::sd_checkMetronome() {
-    return sd_checkFileExist("System/Sound/Metronome.wav");
+    return SD_OK;
 }
 
 SdResult Controller::sd_loadMetronome() {
-    SdResult sdResult = load24BitAudio("System/Sound/Metronome.wav", RAM_METRO_ADDRESS, kMetroSize * 10);
-    return sdResult;
+    return SD_OK;
 }
 
 void Controller::sd_getLibraries() {
@@ -1851,7 +2370,7 @@ void Controller::sd_getWavetableLibrary() {
             listFile = true;
             while ((sd.fresult == FR_OK) && (sd.fileInfo.fname[0]) && (wavetableLibrarySize <= kWavetableLibraryMaxSize)) {
                 if (!(sd.fileInfo.fattrib & AM_HID) && (!(sd.fileInfo.fattrib & AM_DIR)) && (!(sd.fileInfo.fname[0] == '.'))) {
-                    char *ptr = (char *)(RAM_WAVETABLE_ADDRESS + (wavetableLibrarySize * kFileNameSize));
+                    char* ptr = (char*)(RAM_WAVETABLE_LIBRARY_ADDRESS + (wavetableLibrarySize * kFileNameSize));
                     memset(ptr, 0x00, kFileNameSize);
                     strncpy(ptr, sd.fileInfo.fname, kFileNameSize);
                     wavetableLibrarySize += 1;
@@ -1862,16 +2381,18 @@ void Controller::sd_getWavetableLibrary() {
     }
     f_closedir(&sd.dir);
 
-    char *nameArray[wavetableLibrarySize];
+    char** nameArray = (char**)(RAM_WAVETABLE_LIBRARY_ADDRESS + (kWavetableLibraryMaxSize * kFileNameSize));
+    static char safeBuffer[kFileNameSize] __attribute__((aligned(32)));
     for (uint16_t i = 0; i < wavetableLibrarySize; i++) {
-        nameArray[i] = (char *)(RAM_WAVETABLE_ADDRESS + (i * kFileNameSize));
+        nameArray[i] = (char*)(RAM_WAVETABLE_LIBRARY_ADDRESS + (i * kFileNameSize));
     }
     sortWords(nameArray, wavetableLibrarySize);
 
     if ((f_mkdir("System/Data") == FR_OK) && (f_open(&sd.file, "System/Data/Wavetable.lib", FA_WRITE | FA_CREATE_ALWAYS) == FR_OK)) {
         f_write(&sd.file, "RW_SYNTHGIRL_WAVETABLE   ", 25, &sd.byteswritten);
         for (uint16_t i = 0; i < wavetableLibrarySize; i++) {
-            f_write(&sd.file, nameArray[i], kFileNameSize, &sd.byteswritten);
+            memcpy(safeBuffer, nameArray[i], kFileNameSize);
+            f_write(&sd.file, safeBuffer, kFileNameSize, &sd.byteswritten);
         }
         f_write(&sd.file, "EOF", 3, &sd.byteswritten);
     }
@@ -1932,7 +2453,7 @@ SdResult Controller::sd_loadFile(uint8_t fileNum_) {
     keyboard_disable();
     // load file
     if ((sd_checkFile(fileNum_) == SD_OK) && (fileStatus == FILE_ACTIVE)) {
-        char data[kFileByteSize];
+        char data[kFileByteSize] = {};
         if (f_open(&sd.file, fileName, FA_READ) == FR_OK) {
             if (f_lseek(&sd.file, strlen(kFileRef)) == FR_OK) {
                 const uint16_t readByteSize = 512;
@@ -1944,10 +2465,10 @@ SdResult Controller::sd_loadFile(uint8_t fileNum_) {
                 uint32_t errorCount = 0;
 
                 for (uint16_t i = 0; i < readCountTotal; i++) {
-                    if (f_read(&sd.file, &dataRead, readByteSize, &sd.bytesread) != FR_OK)
+                    if ((f_read(&sd.file, &dataRead, readByteSize, &sd.bytesread) != FR_OK) || (sd.bytesread != readByteSize))
                         errorCount += 1;
                     for (uint16_t j = 0; j < readByteSize; j++) {
-                        volatile uint8_t *writePtr = (volatile uint8_t *)(data + pointerOffset);
+                        volatile uint8_t* writePtr = (volatile uint8_t*)(data + pointerOffset);
                         *writePtr = dataRead[j];
                         pointerOffset += 1;
                     }
@@ -1955,10 +2476,10 @@ SdResult Controller::sd_loadFile(uint8_t fileNum_) {
                 }
 
                 if (remainderByteSize) {
-                    if (f_read(&sd.file, &dataRead, remainderByteSize, &sd.bytesread) != FR_OK)
+                    if ((f_read(&sd.file, &dataRead, remainderByteSize, &sd.bytesread) != FR_OK) || (sd.bytesread != remainderByteSize))
                         errorCount += 1;
                     for (uint16_t k = 0; k < remainderByteSize; k++) {
-                        volatile uint8_t *writePtr = (volatile uint8_t *)(data + pointerOffset);
+                        volatile uint8_t* writePtr = (volatile uint8_t*)(data + pointerOffset);
                         *writePtr = dataRead[k];
                         pointerOffset += 1;
                     }
@@ -2083,10 +2604,8 @@ SdResult Controller::sd_loadFile(uint8_t fileNum_) {
                     eq_setGainLowShelf(data[60]);
                     eq_setFreqHighShelf(data[61]);
                     eq_setGainHighShelf(data[62]);
-                    eq_setQPeak(0, data[63]);
-                    eq_setQPeak(1, data[64]);
-                    eq_setQPeak(2, data[65]);
-                    eq_setQPeak(3, data[66]);
+                    // Q is fixed; ignore stored per-preset Q and keep the compile-time default.
+                    eq.q = kInitialEqQ;
                     eq_setFreqPeak(0, data[67]);
                     eq_setFreqPeak(1, data[68]);
                     eq_setFreqPeak(2, data[69]);
@@ -2149,10 +2668,8 @@ SdResult Controller::sd_loadFile(uint8_t fileNum_) {
                     // write songData
                     uint16_t offsetSong = 300;
 
-
-                    
                     for (uint8_t i = 0; i < kBankLibrarySize; i++) {
-                        Bank &bank_ = song.bankLibrary[i];
+                        Bank& bank_ = song.bankLibrary[i];
                         uint16_t offsetBank = offsetSong + 1 + (i * 641);
                         for (uint8_t j = 0; j < kBeatLibrarySize; j++) {
                             uint16_t offsetBeat = offsetBank + (8 * j);
@@ -2278,10 +2795,10 @@ SdResult Controller::sd_saveFile(uint8_t fileNum_) {
     data[60] = eq.gainLowShelf;
     data[61] = eq.freqHighShelf;
     data[62] = eq.gainHighShelf;
-    data[63] = eq.qPeak[0];
-    data[64] = eq.qPeak[1];
-    data[65] = eq.qPeak[2];
-    data[66] = eq.qPeak[3];
+    data[63] = eq.q;
+    data[64] = eq.q;
+    data[65] = eq.q;
+    data[66] = eq.q;
     data[67] = eq.freqPeak[0];
     data[68] = eq.freqPeak[1];
     data[69] = eq.freqPeak[2];
@@ -2352,11 +2869,11 @@ SdResult Controller::sd_saveFile(uint8_t fileNum_) {
     uint16_t offsetSong = 300;
     data[offsetSong] = 's';
     for (uint8_t i = 0; i < kBankLibrarySize; i++) {
-        Bank &bank_ = song.bankLibrary[i];
+        Bank& bank_ = song.bankLibrary[i];
         uint16_t offsetBank = offsetSong + 1 + (i * 641);
         data[offsetBank] = 'b';
         for (uint8_t j = 0; j < kBeatLibrarySize; j++) {
-            Beat &beat_ = bank_.beatLibrary[j];
+            Beat& beat_ = bank_.beatLibrary[j];
             uint16_t offsetBeat = offsetBank + (8 * j);
             data[offsetBeat + 0] = beat_.active;
             data[offsetBeat + 1] = false;
@@ -2373,7 +2890,7 @@ SdResult Controller::sd_saveFile(uint8_t fileNum_) {
     // write data to sdcard
     if (sd_checkFile(fileNum_) == SD_OK) {
         if (f_open(&sd.file, fileName, FA_WRITE | FA_CREATE_ALWAYS) == FR_OK) {
-            if (f_write(&sd.file, kFileRef, strlen(kFileRef), &sd.byteswritten) == FR_OK) {
+            if ((f_write(&sd.file, kFileRef, strlen(kFileRef), &sd.byteswritten) == FR_OK) && (sd.byteswritten == strlen(kFileRef))) {
                 const uint16_t writeByteSize = 512;
                 const uint16_t fileByteSize = kFileByteSize;
                 uint16_t writeCountTotal = (fileByteSize / writeByteSize);
@@ -2382,18 +2899,18 @@ SdResult Controller::sd_saveFile(uint8_t fileNum_) {
                 uint32_t errorCount = 0;
 
                 for (uint16_t i = 0; i < writeCountTotal; i++) {
-                    if (f_write(&sd.file, (data + pointerOffset), writeByteSize, &sd.byteswritten) != FR_OK)
+                    if ((f_write(&sd.file, (data + pointerOffset), writeByteSize, &sd.byteswritten) != FR_OK) || (sd.byteswritten != writeByteSize))
                         errorCount += 1;
                     pointerOffset += 512;
                 }
 
                 if (remainderByteSize) {
-                    if (f_write(&sd.file, (data + pointerOffset), remainderByteSize, &sd.byteswritten) != FR_OK)
+                    if ((f_write(&sd.file, (data + pointerOffset), remainderByteSize, &sd.byteswritten) != FR_OK) || (sd.byteswritten != remainderByteSize))
                         errorCount += 1;
                 }
 
                 if (errorCount == 0) {
-                    if (f_write(&sd.file, eof, strlen(eof), &sd.byteswritten) == FR_OK) {
+                    if ((f_write(&sd.file, eof, strlen(eof), &sd.byteswritten) == FR_OK) && (sd.byteswritten == strlen(eof))) {
                         result = SD_OK;
                     }
                 }
@@ -2592,10 +3109,10 @@ SdResult Controller::sd_loadSynthkit(bool mode_, uint8_t kitNum_) {
                 uint32_t errorCount = 0;
 
                 for (uint16_t i = 0; i < readCountTotal; i++) {
-                    if (f_read(&sd.file, &dataRead, readByteSize, &sd.bytesread) != FR_OK)
+                    if ((f_read(&sd.file, &dataRead, readByteSize, &sd.bytesread) != FR_OK) || (sd.bytesread != readByteSize))
                         errorCount += 1;
                     for (uint16_t j = 0; j < readByteSize; j++) {
-                        volatile uint8_t *writePtr = (volatile uint8_t *)(data + pointerOffset);
+                        volatile uint8_t* writePtr = (volatile uint8_t*)(data + pointerOffset);
                         *writePtr = dataRead[j];
                         pointerOffset += 1;
                     }
@@ -2603,10 +3120,10 @@ SdResult Controller::sd_loadSynthkit(bool mode_, uint8_t kitNum_) {
                 }
 
                 if (remainderByteSize) {
-                    if (f_read(&sd.file, &dataRead, remainderByteSize, &sd.bytesread) != FR_OK)
+                    if ((f_read(&sd.file, &dataRead, remainderByteSize, &sd.bytesread) != FR_OK) || (sd.bytesread != remainderByteSize))
                         errorCount += 1;
                     for (uint16_t k = 0; k < remainderByteSize; k++) {
-                        volatile uint8_t *writePtr = (volatile uint8_t *)(data + pointerOffset);
+                        volatile uint8_t* writePtr = (volatile uint8_t*)(data + pointerOffset);
                         *writePtr = dataRead[k];
                         pointerOffset += 1;
                     }
@@ -2632,7 +3149,12 @@ SdResult Controller::sd_loadSynthkit(bool mode_, uint8_t kitNum_) {
 
                                 while (searchActive) {
                                     memset(searchName, 0x00, kFileNameSize);
-                                    f_read(&sd.file, searchName, kFileNameSize, &sd.bytesread);
+                                    if ((f_read(&sd.file, searchName, kFileNameSize, &sd.bytesread) != FR_OK) || (sd.bytesread != kFileNameSize)) {
+                                        wavetableNum[i] = -1;
+                                        wavetableMissing[i] = true;
+                                        searchActive = false;
+                                        continue;
+                                    }
 
                                     if (strcmp(searchName, wavetableName[i]) == 0) {
                                         wavetableNum[i] = searchCounter;
@@ -2721,10 +3243,8 @@ SdResult Controller::sd_loadSynthkit(bool mode_, uint8_t kitNum_) {
                     eq_setGainLowShelf(data[52]);
                     eq_setFreqHighShelf(data[53]);
                     eq_setGainHighShelf(data[54]);
-                    eq_setQPeak(0, data[55]);
-                    eq_setQPeak(1, data[56]);
-                    eq_setQPeak(2, data[57]);
-                    eq_setQPeak(3, data[58]);
+                    // Q is fixed; ignore stored per-preset Q and keep the compile-time default.
+                    eq.q = kInitialEqQ;
                     eq_setFreqPeak(0, data[59]);
                     eq_setFreqPeak(1, data[60]);
                     eq_setFreqPeak(2, data[61]);
@@ -2885,10 +3405,10 @@ SdResult Controller::sd_saveSynthkit(bool mode_, uint8_t kitNum_) {
     data[52] = eq.gainLowShelf;
     data[53] = eq.freqHighShelf;
     data[54] = eq.gainHighShelf;
-    data[55] = eq.qPeak[0];
-    data[56] = eq.qPeak[1];
-    data[57] = eq.qPeak[2];
-    data[58] = eq.qPeak[3];
+    data[55] = eq.q;
+    data[56] = eq.q;
+    data[57] = eq.q;
+    data[58] = eq.q;
     data[59] = eq.freqPeak[0];
     data[60] = eq.freqPeak[1];
     data[61] = eq.freqPeak[2];
@@ -2961,7 +3481,7 @@ SdResult Controller::sd_saveSynthkit(bool mode_, uint8_t kitNum_) {
     // write data to sdcard
     if (sd_checkSynthkit(kitNum_) == SD_OK) {
         if (f_open(&sd.file, synthkitName, FA_WRITE | FA_CREATE_ALWAYS) == FR_OK) {
-            if (f_write(&sd.file, kSynthkitRef, strlen(kSynthkitRef), &sd.byteswritten) == FR_OK) {
+            if ((f_write(&sd.file, kSynthkitRef, strlen(kSynthkitRef), &sd.byteswritten) == FR_OK) && (sd.byteswritten == strlen(kSynthkitRef))) {
                 const uint16_t writeByteSize = 512;
                 const uint16_t synthkitByteSize = kSynthkitByteSize;
                 uint16_t writeCountTotal = (synthkitByteSize / writeByteSize);
@@ -2970,18 +3490,18 @@ SdResult Controller::sd_saveSynthkit(bool mode_, uint8_t kitNum_) {
                 uint32_t errorCount = 0;
 
                 for (uint16_t i = 0; i < writeCountTotal; i++) {
-                    if (f_write(&sd.file, (data + pointerOffset), writeByteSize, &sd.byteswritten) != FR_OK)
+                    if ((f_write(&sd.file, (data + pointerOffset), writeByteSize, &sd.byteswritten) != FR_OK) || (sd.byteswritten != writeByteSize))
                         errorCount += 1;
                     pointerOffset += 512;
                 }
 
                 if (remainderByteSize) {
-                    if (f_write(&sd.file, (data + pointerOffset), remainderByteSize, &sd.byteswritten) != FR_OK)
+                    if ((f_write(&sd.file, (data + pointerOffset), remainderByteSize, &sd.byteswritten) != FR_OK) || (sd.byteswritten != remainderByteSize))
                         errorCount += 1;
                 }
 
                 if (errorCount == 0) {
-                    if (f_write(&sd.file, eof, 3, &sd.byteswritten) == FR_OK) {
+                    if ((f_write(&sd.file, eof, 3, &sd.byteswritten) == FR_OK) && (sd.byteswritten == 3)) {
                         result = SD_OK;
                     }
                 }
@@ -3118,47 +3638,57 @@ SdResult Controller::sd_checkWavetablesInUse() {
     return result;
 }
 
-FRESULT Controller::sd_createDirectory(const char *path) {
+FRESULT Controller::sd_createDirectory(const char* path) {
     FRESULT res;
     res = f_mkdir(path);
     return res;
 }
 
-FRESULT Controller::sd_deleteDirectory(const char *path) {
+FRESULT Controller::sd_deleteDirectory(const char* path) {
     FRESULT result;
     DIR dir;
     FILINFO fileInfo;
-    char file[64] = "";
-    bool listFile = true;
+    char pathBuffer[256];
 
     result = f_opendir(&dir, path);
-    if (result)
-        return result;
+    if (result != FR_OK) return result;
 
-    while (listFile) {
+    while (true) {
         result = f_readdir(&dir, &fileInfo);
-        if ((result == FR_OK) && (fileInfo.fname[0] != 0)) {
-            memset(file, 0x00, strlen(file));
-            sprintf((char *)file, "%s/%s", path, fileInfo.fname);
-            (fileInfo.fattrib & AM_DIR) ? sd_deleteDirectory(file) : f_unlink(file);
+        if (result != FR_OK || fileInfo.fname[0] == 0) {
+            break;
+        }
+        if ((strcmp(fileInfo.fname, ".") == 0) || (strcmp(fileInfo.fname, "..") == 0)) continue;
+
+        int pathLen = strlen(path);
+        strcpy(pathBuffer, path);
+        pathBuffer[pathLen] = '/';
+        strcpy(&pathBuffer[pathLen + 1], fileInfo.fname);
+
+        if (fileInfo.fattrib & AM_DIR) {
+            result = sd_deleteDirectory(pathBuffer);
         } else {
-            listFile = false;
+            result = f_unlink(pathBuffer);
+        }
+
+        if (result != FR_OK) {
+            f_closedir(&dir);
+            return result;
         }
     }
 
     f_closedir(&dir);
-    f_unlink(path);
-    return result;
+    return f_unlink(path);
 }
 
 /* Sdram functions -----------------------------------------------------------*/
 
 void Controller::sdram_write16BitAudio(uint32_t ramAddress_, int16_t data_) {
-    *(__IO int16_t *)(ramAddress_) = data_;
+    *(__IO int16_t*)(ramAddress_) = data_;
 }
 
 int16_t Controller::sdram_read16BitAudio(uint32_t ramAddress_) {
-    return (int16_t)(*(__IO int16_t *)(ramAddress_));
+    return (int16_t)(*(__IO int16_t*)(ramAddress_));
 }
 
 void Controller::sdram_write24BitAudio(uint32_t ramAddress_, int32_t data_) {
@@ -3166,20 +3696,27 @@ void Controller::sdram_write24BitAudio(uint32_t ramAddress_, int32_t data_) {
     uint8_t b = (uint8_t)((data_ >> 8) & 0xFF);
     uint8_t c = (uint8_t)((data_ >> 16) & 0xFF);
 
-    *(__IO uint8_t *)(ramAddress_) = a;
-    *(__IO uint8_t *)(ramAddress_ + 1) = b;
-    *(__IO uint8_t *)(ramAddress_ + 2) = c;
+    *(__IO uint8_t*)(ramAddress_) = a;
+    *(__IO uint8_t*)(ramAddress_ + 1) = b;
+    *(__IO uint8_t*)(ramAddress_ + 2) = c;
 }
 
 int32_t Controller::sdram_read24BitAudio(uint32_t ramAddress_) {
-    volatile uint8_t *ptrA = (volatile uint8_t *)(ramAddress_);
-    volatile uint8_t *ptrB = (volatile uint8_t *)(ramAddress_ + 1);
-    volatile uint8_t *ptrC = (volatile uint8_t *)(ramAddress_ + 2);
-    uint8_t d;
-    (*ptrC >> 7) ? d = 0xFF : d = 0x00;
+    uint32_t alignedAddress = ramAddress_ & ~0x3U;
+    uint32_t byteOffset = ramAddress_ & 0x3U;
 
-    int32_t audioData = (int32_t)((d << 24) | ((*ptrC) << 16) | ((*ptrB) << 8) | (*ptrA));
-    return audioData;
+    volatile uint32_t* wordPtr = (volatile uint32_t*)(alignedAddress);
+    uint32_t word0 = *wordPtr;
+    uint32_t raw;
+
+    if (byteOffset <= 1U) {
+        raw = (word0 >> (byteOffset * 8U)) & 0x00FFFFFFU;
+    } else {
+        uint32_t word1 = *(wordPtr + 1);
+        raw = ((word0 >> (byteOffset * 8U)) | (word1 << ((4U - byteOffset) * 8U))) & 0x00FFFFFFU;
+    }
+
+    return (int32_t)(raw << 8) >> 8;
 }
 
 void Controller::sdram_fadeOut24BitAudio(uint32_t ramAddress_, uint32_t sampleSize_, uint16_t fadeOutSize_) {
@@ -3324,6 +3861,7 @@ void Controller::lcd_update() {
     lcd_drawIcon();
     lcd_drawText();
     lcd_drawLimitAlert();
+    lcd_drawArmedAlert();
     lcd_drawBankShift();
     lcd_drawCountDown();
     lcd_drawTransition();
@@ -3331,11 +3869,11 @@ void Controller::lcd_update() {
 
 void Controller::lcd_drawLogo() {
     if (animation) {
-        const RGB16Color *indexPtr = (const RGB16Color *)(RAM_IMAGE_LOGO_PALETTE_ADDRESS);
-        const uint8_t *dataPtr = (const uint8_t *)(RAM_IMAGE_LOGO_DATA_ADDRESS);
-        lcd.fadeRGB16Image(indexPtr, dataPtr, kImageLogoPalette, kImageLogoX, kImageLogoY, kImageLogoWidth, kImageLogoHeight, true, 40, 25);
+        const RGB16Color* indexPtr = (const RGB16Color*)(RAM_IMAGE_LOGO_PALETTE_ADDRESS);
+        const uint8_t* dataPtr = (const uint8_t*)(RAM_IMAGE_LOGO_DATA_ADDRESS);
+        lcd.fadeRGB16Image(indexPtr, dataPtr, kImageLogoPalette, kImageLogoX, kImageLogoY, kImageLogoWidth, kImageLogoHeight, true, 50, 5);
         HAL_Delay(1000);
-        lcd.fadeRGB16Image(indexPtr, dataPtr, kImageLogoPalette, kImageLogoX, kImageLogoY, kImageLogoWidth, kImageLogoHeight, false, 40, 25);
+        lcd.fadeRGB16Image(indexPtr, dataPtr, kImageLogoPalette, kImageLogoX, kImageLogoY, kImageLogoWidth, kImageLogoHeight, false, 50, 5);
         HAL_Delay(500);
         lcd.setForeColor(WHITE);
         lcd.setBackColor(BLACK);
@@ -3344,48 +3882,48 @@ void Controller::lcd_drawLogo() {
 }
 
 void Controller::lcd_drawPage() {
-    const RGB16Color *palettePtr;
-    const uint8_t *dataPtr;
+    const RGB16Color* palettePtr;
+    const uint8_t* dataPtr;
 
     uint8_t step = 20;
-    uint8_t delay = 15;
+    uint8_t delay = 10;
 
-    palettePtr = (const RGB16Color *)(RAM_IMAGE_MENU_PALETTE_ADDRESS);
-    dataPtr = (const uint8_t *)(RAM_IMAGE_MENU_DATA_ADDRESS);
+    palettePtr = (const RGB16Color*)(RAM_IMAGE_MENU_PALETTE_ADDRESS);
+    dataPtr = (const uint8_t*)(RAM_IMAGE_MENU_DATA_ADDRESS);
 
     (animation)
         ? lcd.fadeRGB16Image(palettePtr, dataPtr, 64, kImageMenuX, kImageMenuY, kImageMenuWidth, kImageMenuHeight, true, step, delay)
         : lcd.drawRGB16Image(palettePtr, dataPtr, 64, kImageMenuX, kImageMenuY, kImageMenuWidth, kImageMenuHeight);
 
-    palettePtr = (const RGB16Color *)(RAM_IMAGE_KEY_PALETTE_ADDRESS);
-    dataPtr = (const uint8_t *)(RAM_IMAGE_KEY_DATA_ADDRESS);
+    palettePtr = (const RGB16Color*)(RAM_IMAGE_KEY_PALETTE_ADDRESS);
+    dataPtr = (const uint8_t*)(RAM_IMAGE_KEY_DATA_ADDRESS);
 
     (animation)
         ? lcd.fadeRGB16Image(palettePtr, dataPtr, 64, kImageKeyX, kImageKeyY, kImageKeyWidth, kImageKeyHeight, true, step, delay)
         : lcd.drawRGB16Image(palettePtr, dataPtr, 64, kImageKeyX, kImageKeyY, kImageKeyWidth, kImageKeyHeight);
 
-    palettePtr = (const RGB16Color *)(RAM_IMAGE_OSC_A_PALETTE_ADDRESS);
-    dataPtr = (const uint8_t *)(RAM_IMAGE_OSC_A_DATA_ADDRESS);
+    palettePtr = (const RGB16Color*)(RAM_IMAGE_OSC_A_PALETTE_ADDRESS);
+    dataPtr = (const uint8_t*)(RAM_IMAGE_OSC_A_DATA_ADDRESS);
 
     (animation)
         ? lcd.fadeRGB16Image(palettePtr, dataPtr, 64, kImageOscAX, kImageOscAY, kImageOscAWidth, kImageOscAHeight, true, step, delay)
         : lcd.drawRGB16Image(palettePtr, dataPtr, 64, kImageOscAX, kImageOscAY, kImageOscAWidth, kImageOscAHeight);
 
-    palettePtr = (const RGB16Color *)(RAM_IMAGE_OSC_B_PALETTE_ADDRESS);
-    dataPtr = (const uint8_t *)(RAM_IMAGE_OSC_B_DATA_ADDRESS);
+    palettePtr = (const RGB16Color*)(RAM_IMAGE_OSC_B_PALETTE_ADDRESS);
+    dataPtr = (const uint8_t*)(RAM_IMAGE_OSC_B_DATA_ADDRESS);
 
     (animation)
         ? lcd.fadeRGB16Image(palettePtr, dataPtr, 64, kImageOscBX, kImageOscBY, kImageOscBWidth, kImageOscBHeight, true, step, delay)
         : lcd.drawRGB16Image(palettePtr, dataPtr, 64, kImageOscBX, kImageOscBY, kImageOscBWidth, kImageOscBHeight);
 
-    palettePtr = (const RGB16Color *)(RAM_IMAGE_FILTER_PALETTE_ADDRESS);
-    dataPtr = (const uint8_t *)(RAM_IMAGE_FILTER_DATA_ADDRESS);
+    palettePtr = (const RGB16Color*)(RAM_IMAGE_FILTER_PALETTE_ADDRESS);
+    dataPtr = (const uint8_t*)(RAM_IMAGE_FILTER_DATA_ADDRESS);
 
     (animation) ? lcd.fadeRGB16Image(palettePtr, dataPtr, 64, kImageFilterX, kImageFilterY, kImageFilterWidth, kImageFilterHeight, true, step, delay)
                 : lcd.drawRGB16Image(palettePtr, dataPtr, 64, kImageFilterX, kImageFilterY, kImageFilterWidth, kImageFilterHeight);
 
-    palettePtr = (const RGB16Color *)(RAM_IMAGE_ENV_PALETTE_ADDRESS);
-    dataPtr = (const uint8_t *)(RAM_IMAGE_ENV_DATA_ADDRESS);
+    palettePtr = (const RGB16Color*)(RAM_IMAGE_ENV_PALETTE_ADDRESS);
+    dataPtr = (const uint8_t*)(RAM_IMAGE_ENV_DATA_ADDRESS);
 
     (animation)
         ? lcd.fadeRGB16Image(palettePtr, dataPtr, 64, kImageEnvX, kImageEnvY, kImageEnvWidth, kImageEnvHeight, true, step, delay)
@@ -3395,15 +3933,15 @@ void Controller::lcd_drawPage() {
 // alert functions
 
 void Controller::lcd_drawAlert() {
-    const RGB16Color *indexPtr;
-    const uint8_t *dataPtr;
+    const RGB16Color* indexPtr;
+    const uint8_t* dataPtr;
 
-    indexPtr = (const RGB16Color *)(RAM_ICON_ALERT_PALETTE_ADDRESS);
+    indexPtr = (const RGB16Color*)(RAM_ICON_ALERT_PALETTE_ADDRESS);
 
-    dataPtr = (const uint8_t *)(RAM_ICON_ALERT_L_DATA_ADDRESS);
+    dataPtr = (const uint8_t*)(RAM_ICON_ALERT_L_DATA_ADDRESS);
     lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconAlertX[0], kIconAlertY, kIconAlertWidth, kIconAlertHeight);
 
-    dataPtr = (const uint8_t *)(RAM_ICON_ALERT_R_DATA_ADDRESS);
+    dataPtr = (const uint8_t*)(RAM_ICON_ALERT_R_DATA_ADDRESS);
     lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconAlertX[1], kIconAlertY, kIconAlertWidth, kIconAlertHeight);
 
     lcd.setBackColor(BLACK);
@@ -3415,88 +3953,88 @@ void Controller::lcd_drawAlert() {
     lcd.setAlignment(CENTER);
     lcd.setFont(FONT_07x09);
 
-    const char *alertText;
+    const char* alertText;
 
     switch (alertType) {
-    case ALERT_MEASUREUP:
-    case ALERT_MEASUREDOWN:
-    case ALERT_BARUP:
-    case ALERT_BARDOWN:
-    case ALERT_QUANTIZEUP:
-    case ALERT_QUANTIZEDOWN:
-        alertText = kAlertTextResetPlay;
-        break;
+        case ALERT_MEASUREUP:
+        case ALERT_MEASUREDOWN:
+        case ALERT_BARUP:
+        case ALERT_BARDOWN:
+        case ALERT_QUANTIZEUP:
+        case ALERT_QUANTIZEDOWN:
+            alertText = kAlertTextResetPlay;
+            break;
 
-    case ALERT_NEWFILE:
-        alertText = kAlertTextNewFile;
-        break;
+        case ALERT_NEWFILE:
+            alertText = kAlertTextNewFile;
+            break;
 
-    case ALERT_LOADFILE:
-        alertText = kAlertTextLoadFile;
-        break;
+        case ALERT_LOADFILE:
+            alertText = kAlertTextLoadFile;
+            break;
 
-    case ALERT_SAVEFILE:
-        alertText = kAlertTextSaveFile;
-        break;
+        case ALERT_SAVEFILE:
+            alertText = kAlertTextSaveFile;
+            break;
 
-    case ALERT_CLEARFILE:
-        alertText = kAlertTextClearFile;
-        break;
+        case ALERT_CLEARFILE:
+            alertText = kAlertTextClearFile;
+            break;
 
-    case ALERT_OVERWRITEFILE:
-        alertText = kAlertTextOverwriteFile;
-        break;
+        case ALERT_OVERWRITEFILE:
+            alertText = kAlertTextOverwriteFile;
+            break;
 
-    case ALERT_NEWSYNTHKIT:
-        alertText = kAlertTextNewSynthkit;
-        break;
+        case ALERT_NEWSYNTHKIT:
+            alertText = kAlertTextNewSynthkit;
+            break;
 
-    case ALERT_LOADSYNTHKIT:
-        alertText = kAlertTextLoadSynthkit;
-        break;
+        case ALERT_LOADSYNTHKIT:
+            alertText = kAlertTextLoadSynthkit;
+            break;
 
-    case ALERT_SAVESYNTHKIT:
-        alertText = kAlertTextSaveSynthkit;
-        break;
+        case ALERT_SAVESYNTHKIT:
+            alertText = kAlertTextSaveSynthkit;
+            break;
 
-    case ALERT_CLEARSYNTHKIT:
-        alertText = kAlertTextClearSynthkit;
-        break;
+        case ALERT_CLEARSYNTHKIT:
+            alertText = kAlertTextClearSynthkit;
+            break;
 
-    case ALERT_OVERWRITESYNTHKIT:
-        alertText = kAlertTextOverwriteSynthkit;
-        break;
+        case ALERT_OVERWRITESYNTHKIT:
+            alertText = kAlertTextOverwriteSynthkit;
+            break;
 
-    case ALERT_LOADSUCCESS:
-        alertText = kAlertTextLoadSuccess;
-        break;
+        case ALERT_LOADSUCCESS:
+            alertText = kAlertTextLoadSuccess;
+            break;
 
-    case ALERT_LOADERROR:
-        alertText = kAlertTextLoadError;
-        break;
+        case ALERT_LOADERROR:
+            alertText = kAlertTextLoadError;
+            break;
 
-    case ALERT_SAVESUCCESS:
-        alertText = kAlertTextSaveSuccess;
-        break;
+        case ALERT_SAVESUCCESS:
+            alertText = kAlertTextSaveSuccess;
+            break;
 
-    case ALERT_SAVEERROR:
-        alertText = kAlertTextSaveError;
-        break;
+        case ALERT_SAVEERROR:
+            alertText = kAlertTextSaveError;
+            break;
 
-    case ALERT_CLEARSUCCESS:
-        alertText = kAlertTextClearSuccess;
-        break;
+        case ALERT_CLEARSUCCESS:
+            alertText = kAlertTextClearSuccess;
+            break;
 
-    case ALERT_CLEARERROR:
-        alertText = kAlertTextClearError;
-        break;
+        case ALERT_CLEARERROR:
+            alertText = kAlertTextClearError;
+            break;
 
-    case ALERT_MISSINGWAVETABLE:
-        alertText = kAlertTextMissingWavetable;
-        break;
+        case ALERT_MISSINGWAVETABLE:
+            alertText = kAlertTextMissingWavetable;
+            break;
 
-    default:
-        break;
+        default:
+            break;
     }
 
     lcd.drawText(alertText, strlen(alertText), 427, 144);
@@ -3530,6 +4068,23 @@ void Controller::lcd_drawLimitAlert() {
         lcd.setAlignment(CENTER);
         lcd.setForeColor(kLayerColorPalette[9]);
         lcd.setBackColor(BLACK);
+        lcd.drawText(" ", 1, kLimitAlertX, kLimitAlertY);
+    }
+}
+
+void Controller::lcd_drawArmedAlert() {
+    if (limitAlertActive) return;
+    bool armed = syncInPlayArmed || syncInRecordArmed;
+    if (armed == lastArmedAlertState) return;
+    lastArmedAlertState = armed;
+    lcd.setFont(FONT_07x09);
+    lcd.setAlignment(CENTER);
+    lcd.setBackColor(BLACK);
+    if (armed) {
+        lcd.setForeColor(YELLOW);
+        lcd.drawText("A", 1, kLimitAlertX, kLimitAlertY);
+    } else {
+        lcd.setForeColor(kLayerColorPalette[9]);
         lcd.drawText(" ", 1, kLimitAlertX, kLimitAlertY);
     }
 }
@@ -3634,15 +4189,15 @@ void Controller::lcd_clearSdData() {
 }
 
 void Controller::lcd_drawSdAlert(SdResult result_) {
-    const RGB16Color *indexPtr;
-    const uint8_t *dataPtr;
+    const RGB16Color* indexPtr;
+    const uint8_t* dataPtr;
 
-    indexPtr = (const RGB16Color *)(RAM_ICON_ALERT_PALETTE_ADDRESS);
+    indexPtr = (const RGB16Color*)(RAM_ICON_ALERT_PALETTE_ADDRESS);
 
-    dataPtr = (const uint8_t *)(RAM_ICON_ALERT_L_DATA_ADDRESS);
+    dataPtr = (const uint8_t*)(RAM_ICON_ALERT_L_DATA_ADDRESS);
     lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconAlertX[0], kIconAlertY, kIconAlertWidth, kIconAlertHeight);
 
-    dataPtr = (const uint8_t *)(RAM_ICON_ALERT_R_DATA_ADDRESS);
+    dataPtr = (const uint8_t*)(RAM_ICON_ALERT_R_DATA_ADDRESS);
     lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconAlertX[1], kIconAlertY, kIconAlertWidth, kIconAlertHeight);
 
     lcd.setBackColor(BLACK);
@@ -3654,32 +4209,32 @@ void Controller::lcd_drawSdAlert(SdResult result_) {
     lcd.setAlignment(CENTER);
     lcd.setFont(FONT_07x09);
 
-    const char *alertPtr;
+    const char* alertPtr;
 
     switch (result_) {
-    case SD_ERROR_DETECT:
-        alertPtr = kSdAlertTextInsert;
-        break;
+        case SD_ERROR_DETECT:
+            alertPtr = kSdAlertTextInsert;
+            break;
 
-    case SD_ERROR_MOUNT:
-        alertPtr = kSdAlertTextFormat;
-        break;
+        case SD_ERROR_MOUNT:
+            alertPtr = kSdAlertTextFormat;
+            break;
 
-    case SD_ERROR_SERIAL:
-        alertPtr = kSdAlertTextSerial;
-        break;
+        case SD_ERROR_SERIAL:
+            alertPtr = kSdAlertTextSerial;
+            break;
 
-    case SD_ERROR_SYSTEMFOLDER:
-        alertPtr = kSdAlertTextSystemFolder;
-        break;
+        case SD_ERROR_SYSTEMFOLDER:
+            alertPtr = kSdAlertTextSystemFolder;
+            break;
 
-    case SD_ERROR_WAVETABLEFOLDER:
-        alertPtr = kSdAlertTextWavetableFolder;
-        break;
+        case SD_ERROR_WAVETABLEFOLDER:
+            alertPtr = kSdAlertTextWavetableFolder;
+            break;
 
-    case SD_ERROR_SYSTEMFILE:
-        alertPtr = kSdAlertTextSystemFile;
-        break;
+        case SD_ERROR_SYSTEMFILE:
+            alertPtr = kSdAlertTextSystemFile;
+            break;
     }
 
     lcd.drawText(alertPtr, strlen(alertPtr), 427, 144);
@@ -3709,78 +4264,78 @@ void Controller::lcd_drawMenuIcon(Menu menu_) {
     lcd.setSpacing(4);
 
     switch (menu_) {
-    case MAIN_MENU:
-        lcd.clearRect(kMenuIconX, kMenuIconY, 38, 15);
-        for (uint8_t i = 0; i < 5; i++) {
-            for (uint8_t j = 0; j < 2; j++) {
-                lcd.fillRect(kMenuIconX + 1 + (i * 8), kMenuIconY + 1 + (j * 8), 4, 4);
+        case MAIN_MENU:
+            lcd.clearRect(kMenuIconX, kMenuIconY, 38, 15);
+            for (uint8_t i = 0; i < 5; i++) {
+                for (uint8_t j = 0; j < 2; j++) {
+                    lcd.fillRect(kMenuIconX + 1 + (i * 8), kMenuIconY + 1 + (j * 8), 4, 4);
+                }
             }
-        }
-        break;
+            break;
 
-    case FILE_MENU:
-        lcd.drawText("FIL", 3, kMenuIconX, kMenuIconY);
-        break;
+        case FILE_MENU:
+            lcd.drawText("FIL", 3, kMenuIconX, kMenuIconY);
+            break;
 
-    case SYNTHKIT_MENU:
-        lcd.drawText("SYN", 3, kMenuIconX, kMenuIconY);
-        break;
+        case SYNTHKIT_MENU:
+            lcd.drawText("SYN", 3, kMenuIconX, kMenuIconY);
+            break;
 
-    case SYSTEM_MENU:
-        lcd.drawText("MAS", 3, kMenuIconX, kMenuIconY);
-        break;
+        case SYSTEM_MENU:
+            lcd.drawText("MAS", 3, kMenuIconX, kMenuIconY);
+            break;
 
-    case RHYTHM_MENU:
-        lcd.drawText("RHY", 3, kMenuIconX, kMenuIconY);
-        break;
+        case RHYTHM_MENU:
+            lcd.drawText("RHY", 3, kMenuIconX, kMenuIconY);
+            break;
 
-    case METRO_MENU:
-        lcd.drawText("MET", 3, kMenuIconX, kMenuIconY);
-        break;
+        case METRO_MENU:
+            lcd.drawText("MET", 3, kMenuIconX, kMenuIconY);
+            break;
 
-    case OSC_A0_MENU:
-    case OSC_A1_MENU:
-    case OSC_B0_MENU:
-    case OSC_B1_MENU:
-        lcd.drawText("OSC", 3, kMenuIconX, kMenuIconY);
-        break;
+        case OSC_A0_MENU:
+        case OSC_A1_MENU:
+        case OSC_B0_MENU:
+        case OSC_B1_MENU:
+            lcd.drawText("OSC", 3, kMenuIconX, kMenuIconY);
+            break;
 
-    case OSC_A2_MENU:
-    case OSC_A3_MENU:
-    case OSC_B2_MENU:
-    case OSC_B3_MENU:
-        lcd.drawText("LFO", 3, kMenuIconX, kMenuIconY);
-        break;
+        case OSC_A2_MENU:
+        case OSC_A3_MENU:
+        case OSC_B2_MENU:
+        case OSC_B3_MENU:
+            lcd.drawText("LFO", 3, kMenuIconX, kMenuIconY);
+            break;
 
-    case EQ_MENU:
-        lcd.drawText("PEQ", 3, kMenuIconX, kMenuIconY);
-        break;
+        case EQ_MENU:
+            lcd.drawText("PEQ", 3, kMenuIconX, kMenuIconY);
+            break;
 
-    case FILTER_0_MENU:
-    case FILTER_1_MENU:
-        lcd.drawText("FIL", 3, kMenuIconX, kMenuIconY);
-        break;
+        case FILTER_0_MENU:
+        case FILTER_1_MENU:
+            lcd.drawText("FIL", 3, kMenuIconX, kMenuIconY);
+            break;
 
-    case ENVELOPE_MENU:
-        lcd.drawText("ENV", 3, kMenuIconX, kMenuIconY);
-        break;
+        case ENVELOPE_MENU:
+            lcd.drawText("ENV", 3, kMenuIconX, kMenuIconY);
+            break;
 
-    case EFFECT_0_MENU:
-    case EFFECT_1_MENU:
-        lcd.drawText("EFF", 3, kMenuIconX, kMenuIconY);
-        break;
+        case EFFECT_0_MENU:
+        case EFFECT_1_MENU:
+            lcd.drawText("EFF", 3, kMenuIconX, kMenuIconY);
+            break;
 
-    case REVERB_MENU:
-        lcd.drawText("REV", 3, kMenuIconX, kMenuIconY);
-        break;
+        case REVERB_MENU:
+            lcd.drawText("REV", 3, kMenuIconX, kMenuIconY);
+            break;
 
-    case KEY_MENU:
-        lcd.drawText("KEY", 3, kMenuIconX, kMenuIconY);
-        break;
+        case KEY_MENU:
+            lcd.drawText("KEY", 3, kMenuIconX, kMenuIconY);
+            break;
 
-    case SONG_MENU:
-        lcd.drawText("SON", 3, kMenuIconX, kMenuIconY);
-        break;
+        case SONG_MENU:
+            lcd.drawText("SON", 3, kMenuIconX, kMenuIconY);
+            break;
     }
 }
 
@@ -3789,39 +4344,39 @@ void Controller::lcd_drawFileBox(uint8_t menuTab_, FileStatus status_) {
     uint16_t yPos = kMenuBoxY;
 
     switch (status_) {
-    case FILE_NONE:
-        lcd.setForeColor(MAGENTA);
-        lcd.setBackColor(BLACK);
-        lcd.clearRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
-        lcd.drawRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
-        break;
+        case FILE_NONE:
+            lcd.setForeColor(MAGENTA);
+            lcd.setBackColor(BLACK);
+            lcd.clearRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
+            lcd.drawRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
+            break;
 
-    case FILE_MISSING:
-        lcd.setForeColor(MAGENTA);
-        lcd.setBackColor(BLACK);
-        lcd.clearRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
-        lcd.drawRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
-        break;
+        case FILE_MISSING:
+            lcd.setForeColor(MAGENTA);
+            lcd.setBackColor(BLACK);
+            lcd.clearRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
+            lcd.drawRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
+            break;
 
-    case FILE_INCOMPATIBLE:
-        lcd.setForeColor(MAGENTA);
-        lcd.setBackColor(BLACK);
-        lcd.clearRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
-        lcd.fillRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
-        break;
+        case FILE_INCOMPATIBLE:
+            lcd.setForeColor(MAGENTA);
+            lcd.setBackColor(BLACK);
+            lcd.clearRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
+            lcd.fillRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
+            break;
 
-    case FILE_INACTIVE:
-        lcd.setForeColor(WHITE);
-        lcd.setBackColor(BLACK);
-        lcd.clearRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
-        lcd.drawRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
-        break;
+        case FILE_INACTIVE:
+            lcd.setForeColor(WHITE);
+            lcd.setBackColor(BLACK);
+            lcd.clearRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
+            lcd.drawRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
+            break;
 
-    case FILE_ACTIVE:
-        lcd.setForeColor(WHITE);
-        lcd.setBackColor(BLACK);
-        lcd.fillRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
-        break;
+        case FILE_ACTIVE:
+            lcd.setForeColor(WHITE);
+            lcd.setBackColor(BLACK);
+            lcd.fillRect(xPos, yPos, kMenuBoxWidth, kMenuBoxHeight);
+            break;
     }
 }
 
@@ -3838,319 +4393,319 @@ void Controller::lcd_transitionMenu() {
     uint8_t menuType;
 
     switch (preMenu) {
-    case MAIN_MENU:
-        preMenuType = 0;
-        break;
+        case MAIN_MENU:
+            preMenuType = 0;
+            break;
 
-    case FILE_MENU:
-    case SYNTHKIT_MENU:
-    case RHYTHM_MENU:
-    case METRO_MENU:
-        preMenuType = 1;
-        break;
+        case FILE_MENU:
+        case SYNTHKIT_MENU:
+        case RHYTHM_MENU:
+        case METRO_MENU:
+            preMenuType = 1;
+            break;
 
-    case OSC_A0_MENU:
-    case OSC_A1_MENU:
-    case OSC_A2_MENU:
-    case OSC_A3_MENU:
-    case OSC_B0_MENU:
-    case OSC_B1_MENU:
-    case OSC_B2_MENU:
-    case OSC_B3_MENU:
-        preMenuType = 2;
-        break;
+        case OSC_A0_MENU:
+        case OSC_A1_MENU:
+        case OSC_A2_MENU:
+        case OSC_A3_MENU:
+        case OSC_B0_MENU:
+        case OSC_B1_MENU:
+        case OSC_B2_MENU:
+        case OSC_B3_MENU:
+            preMenuType = 2;
+            break;
 
-    case SYSTEM_MENU:
-    case EQ_MENU:
-    case ENVELOPE_MENU:
-    case FILTER_0_MENU:
-    case FILTER_1_MENU:
-    case EFFECT_0_MENU:
-    case EFFECT_1_MENU:
-    case REVERB_MENU:
-    case KEY_MENU:
-        preMenuType = 3;
-        break;
+        case SYSTEM_MENU:
+        case EQ_MENU:
+        case ENVELOPE_MENU:
+        case FILTER_0_MENU:
+        case FILTER_1_MENU:
+        case EFFECT_0_MENU:
+        case EFFECT_1_MENU:
+        case REVERB_MENU:
+        case KEY_MENU:
+            preMenuType = 3;
+            break;
 
-    case SONG_MENU:
-        preMenuType = 4;
-        break;
+        case SONG_MENU:
+            preMenuType = 4;
+            break;
     }
 
     switch (menu) {
-    case MAIN_MENU:
-        menuType = 0;
-        break;
+        case MAIN_MENU:
+            menuType = 0;
+            break;
 
-    case FILE_MENU:
-    case SYNTHKIT_MENU:
-    case RHYTHM_MENU:
-    case METRO_MENU:
-        menuType = 1;
-        break;
+        case FILE_MENU:
+        case SYNTHKIT_MENU:
+        case RHYTHM_MENU:
+        case METRO_MENU:
+            menuType = 1;
+            break;
 
-    case OSC_A0_MENU:
-    case OSC_A1_MENU:
-    case OSC_A2_MENU:
-    case OSC_A3_MENU:
-    case OSC_B0_MENU:
-    case OSC_B1_MENU:
-    case OSC_B2_MENU:
-    case OSC_B3_MENU:
-        menuType = 2;
-        break;
+        case OSC_A0_MENU:
+        case OSC_A1_MENU:
+        case OSC_A2_MENU:
+        case OSC_A3_MENU:
+        case OSC_B0_MENU:
+        case OSC_B1_MENU:
+        case OSC_B2_MENU:
+        case OSC_B3_MENU:
+            menuType = 2;
+            break;
 
-    case SYSTEM_MENU:
-    case EQ_MENU:
-    case ENVELOPE_MENU:
-    case FILTER_0_MENU:
-    case FILTER_1_MENU:
-    case EFFECT_0_MENU:
-    case EFFECT_1_MENU:
-    case REVERB_MENU:
-    case KEY_MENU:
-        menuType = 3;
-        break;
+        case SYSTEM_MENU:
+        case EQ_MENU:
+        case ENVELOPE_MENU:
+        case FILTER_0_MENU:
+        case FILTER_1_MENU:
+        case EFFECT_0_MENU:
+        case EFFECT_1_MENU:
+        case REVERB_MENU:
+        case KEY_MENU:
+            menuType = 3;
+            break;
 
-    case SONG_MENU:
-        menuType = 4;
-        break;
+        case SONG_MENU:
+            menuType = 4;
+            break;
     }
 
     lcd.setForeColor(WHITE);
     lcd.setBackColor(BLACK);
 
     switch (preMenuType) {
-    case 0: // main
-        lcd.clearRect(kMenuLine4X[0] + 1, 29, 161, 61);
-        lcd.clearRect(kMenuLine4X[1] + 1, 29, 161, 61);
-        lcd.clearRect(kMenuLine4X[2] + 1, 29, 161, 61);
-        lcd.clearRect(kMenuLine4X[3] + 1, 29, 161, 61);
-        break;
-
-    case 1: // file / synthkit / rhythm / metro
-        if (menuType != preMenuType) {
-        }
-
-        switch (preMenu) {
-        case FILE_MENU:
-            fileStatus = FILE_NONE;
-            for (uint8_t i = 1; i < 4; i++) {
-                lcd_clearFileBox(i);
-            }
-            break;
-
-        case SYNTHKIT_MENU:
-            synthkitStatus = FILE_NONE;
-            for (uint8_t i = 1; i < 4; i++) {
-                lcd_clearFileBox(i);
-            }
-            break;
-
-        case RHYTHM_MENU:
-            lcd.setBackColor(BLACK);
-            lcd.clearRect(kMenuData4X[0] - 42, kMenuHeaderY + 1, 42, 7);
-            lcd.clearRect(kMenuData4X[1] - 10, kMenuHeaderY, 10, 10);
-            lcd.clearRect(kMenuData4X[2] - 10, kMenuHeaderY, 10, 10);
-            lcd.clearRect(kMenuData4X[3] - 10, kMenuHeaderY, 10, 10);
-
-            rhythm.measureLock = true;
-            rhythm.barLock = true;
-            rhythm.quantizeLock = true;
-            break;
-
-        default:
-            break;
-        }
-
-        break;
-
-    case 2: // oscA / oscB
-        if (menuType != preMenuType) {
-            lcd.setBackColor(BLACK);
-            lcd.clearRect(kMenuLine4X[2], kMenuLineY, 162, 60);
-            lcd.clearRect(kMenuLine4X[3], kMenuLineY, 162, 60);
-        }
-
-        if (((preMenu == OSC_A0_MENU) || (preMenu == OSC_A1_MENU) || (preMenu == OSC_B0_MENU) || (preMenu == OSC_B1_MENU)) &&
-            ((menu != OSC_A0_MENU) && (menu != OSC_A1_MENU) && (menu != OSC_B0_MENU) && (menu != OSC_B1_MENU))) {
-            lcd.clearRect(kMenuData4X[1] - 60, kMenuHeaderY, 60, 30);
-        }
-
-        switch (preMenu) {
-        case OSC_A0_MENU:
-            if (menu != OSC_A1_MENU)
-                lcd_drawInfo_Osc_Select(osc[0], false);
-            break;
-
-        case OSC_A1_MENU:
-            lcd_drawInfo_Osc_Select(osc[0], false);
-            break;
-
-        case OSC_A2_MENU:
-            lcd_drawInfo_OscLfo_Select(osc[0], osc[0].lfo[0], false);
-            break;
-
-        case OSC_A3_MENU:
-            lcd_drawInfo_OscLfo_Select(osc[0], osc[0].lfo[1], false);
-            break;
-
-        case OSC_B0_MENU:
-            if (menu != OSC_B1_MENU)
-                lcd_drawInfo_Osc_Select(osc[1], false);
-            break;
-
-        case OSC_B1_MENU:
-            lcd_drawInfo_Osc_Select(osc[1], false);
-            break;
-
-        case OSC_B2_MENU:
-            lcd_drawInfo_OscLfo_Select(osc[1], osc[1].lfo[0], false);
-            break;
-
-        case OSC_B3_MENU:
-            lcd_drawInfo_OscLfo_Select(osc[1], osc[1].lfo[1], false);
-            break;
-        }
-        break;
-
-    case 3: // system / eq / envelope / filter / effect / reverb / key
-        if (menuType != preMenuType) {
+        case 0:  // main
+            lcd.clearRect(kMenuLine4X[0] + 1, 29, 161, 61);
             lcd.clearRect(kMenuLine4X[1] + 1, 29, 161, 61);
             lcd.clearRect(kMenuLine4X[2] + 1, 29, 161, 61);
             lcd.clearRect(kMenuLine4X[3] + 1, 29, 161, 61);
-        }
-
-        switch (preMenu) {
-        case ENVELOPE_MENU:
-            lcd_drawInfo_Envelope_Select(false);
             break;
 
-        case FILTER_0_MENU:
-            lcd_drawInfo_Filter_Select(0, false);
+        case 1:  // file / synthkit / rhythm / metro
+            if (menuType != preMenuType) {
+            }
+
+            switch (preMenu) {
+                case FILE_MENU:
+                    fileStatus = FILE_NONE;
+                    for (uint8_t i = 1; i < 4; i++) {
+                        lcd_clearFileBox(i);
+                    }
+                    break;
+
+                case SYNTHKIT_MENU:
+                    synthkitStatus = FILE_NONE;
+                    for (uint8_t i = 1; i < 4; i++) {
+                        lcd_clearFileBox(i);
+                    }
+                    break;
+
+                case RHYTHM_MENU:
+                    lcd.setBackColor(BLACK);
+                    lcd.clearRect(kMenuData4X[0] - 42, kMenuHeaderY + 1, 42, 7);
+                    lcd.clearRect(kMenuData4X[1] - 10, kMenuHeaderY, 10, 10);
+                    lcd.clearRect(kMenuData4X[2] - 10, kMenuHeaderY, 10, 10);
+                    lcd.clearRect(kMenuData4X[3] - 10, kMenuHeaderY, 10, 10);
+
+                    rhythm.measureLock = true;
+                    rhythm.barLock = true;
+                    rhythm.quantizeLock = true;
+                    break;
+
+                default:
+                    break;
+            }
+
             break;
 
-        case FILTER_1_MENU:
-            lcd_drawInfo_Filter_Select(1, false);
+        case 2:  // oscA / oscB
+            if (menuType != preMenuType) {
+                lcd.setBackColor(BLACK);
+                lcd.clearRect(kMenuLine4X[2], kMenuLineY, 162, 60);
+                lcd.clearRect(kMenuLine4X[3], kMenuLineY, 162, 60);
+            }
+
+            if (((preMenu == OSC_A0_MENU) || (preMenu == OSC_A1_MENU) || (preMenu == OSC_B0_MENU) || (preMenu == OSC_B1_MENU)) &&
+                ((menu != OSC_A0_MENU) && (menu != OSC_A1_MENU) && (menu != OSC_B0_MENU) && (menu != OSC_B1_MENU))) {
+                lcd.clearRect(kMenuData4X[1] - 60, kMenuHeaderY, 60, 30);
+            }
+
+            switch (preMenu) {
+                case OSC_A0_MENU:
+                    if (menu != OSC_A1_MENU)
+                        lcd_drawInfo_Osc_Select(osc[0], false);
+                    break;
+
+                case OSC_A1_MENU:
+                    lcd_drawInfo_Osc_Select(osc[0], false);
+                    break;
+
+                case OSC_A2_MENU:
+                    lcd_drawInfo_OscLfo_Select(osc[0], osc[0].lfo[0], false);
+                    break;
+
+                case OSC_A3_MENU:
+                    lcd_drawInfo_OscLfo_Select(osc[0], osc[0].lfo[1], false);
+                    break;
+
+                case OSC_B0_MENU:
+                    if (menu != OSC_B1_MENU)
+                        lcd_drawInfo_Osc_Select(osc[1], false);
+                    break;
+
+                case OSC_B1_MENU:
+                    lcd_drawInfo_Osc_Select(osc[1], false);
+                    break;
+
+                case OSC_B2_MENU:
+                    lcd_drawInfo_OscLfo_Select(osc[1], osc[1].lfo[0], false);
+                    break;
+
+                case OSC_B3_MENU:
+                    lcd_drawInfo_OscLfo_Select(osc[1], osc[1].lfo[1], false);
+                    break;
+            }
             break;
 
-        case KEY_MENU:
-            lcd_drawInfo_Key_Select(false);
-            break;
-        }
-        break;
+        case 3:  // system / eq / envelope / filter / effect / reverb / key
+            if (menuType != preMenuType) {
+                lcd.clearRect(kMenuLine4X[1] + 1, 29, 161, 61);
+                lcd.clearRect(kMenuLine4X[2] + 1, 29, 161, 61);
+                lcd.clearRect(kMenuLine4X[3] + 1, 29, 161, 61);
+            }
 
-    case 4: // song
-        lcd_drawInfo_Song_Select(false);
-        lcd.setBackColor(BLACK);
-        lcd.clearRect(kMenuLine4X[1] + 1, 29, 487, 61);
-        lcd.clearRect(kMenuData4X[0] - 35, kMenuHeaderY, 35, 9);
-        break;
+            switch (preMenu) {
+                case ENVELOPE_MENU:
+                    lcd_drawInfo_Envelope_Select(false);
+                    break;
+
+                case FILTER_0_MENU:
+                    lcd_drawInfo_Filter_Select(0, false);
+                    break;
+
+                case FILTER_1_MENU:
+                    lcd_drawInfo_Filter_Select(1, false);
+                    break;
+
+                case KEY_MENU:
+                    lcd_drawInfo_Key_Select(false);
+                    break;
+            }
+            break;
+
+        case 4:  // song
+            lcd_drawInfo_Song_Select(false);
+            lcd.setBackColor(BLACK);
+            lcd.clearRect(kMenuLine4X[1] + 1, 29, 487, 61);
+            lcd.clearRect(kMenuData4X[0] - 35, kMenuHeaderY, 35, 9);
+            break;
     }
 
     switch (menuType) {
-    case 0: // main
-        lcd.clearRect(182 + 1, 29, 650, 61);
-        for (uint8_t i = 1; i < 8; i++) {
-            lcd.drawVLine(kMenuLine8X[i], kMenuLineY, kMenuLineHeight);
-        }
-        break;
-
-    case 1: // file / synthkit / rhythm / metro
-        for (uint8_t i = 1; i < 4; i++) {
-            lcd.drawVLine(kMenuLine4X[i], kMenuLineY, kMenuLineHeight);
-        }
-        break;
-
-    case 2: // oscA / oscB
-        if (menuType != preMenuType) {
-            lcd.clearRect(kMenuLine4X[2], kMenuHeaderY, 324, 54);
-            lcd.drawVLine(kMenuLine4X[1], kMenuLineY, kMenuLineHeight);
-            for (int i = 3; i < 7; i++) {
-                lcd.drawVLine(kMenuLine8X[i + 1], kMenuLineY, kMenuLineHeight);
+        case 0:  // main
+            lcd.clearRect(182 + 1, 29, 650, 61);
+            for (uint8_t i = 1; i < 8; i++) {
+                lcd.drawVLine(kMenuLine8X[i], kMenuLineY, kMenuLineHeight);
             }
-        }
-
-        switch (menu) {
-        case OSC_A0_MENU:
-            lcd_drawInfo_Osc_Select(osc[0], 1);
             break;
 
-        case OSC_A1_MENU:
-            lcd_drawInfo_Osc_Select(osc[0], 2);
+        case 1:  // file / synthkit / rhythm / metro
+            for (uint8_t i = 1; i < 4; i++) {
+                lcd.drawVLine(kMenuLine4X[i], kMenuLineY, kMenuLineHeight);
+            }
             break;
 
-        case OSC_A2_MENU:
-            lcd_drawInfo_OscLfo_Select(osc[0], osc[0].lfo[0], true);
+        case 2:  // oscA / oscB
+            if (menuType != preMenuType) {
+                lcd.clearRect(kMenuLine4X[2], kMenuHeaderY, 324, 54);
+                lcd.drawVLine(kMenuLine4X[1], kMenuLineY, kMenuLineHeight);
+                for (int i = 3; i < 7; i++) {
+                    lcd.drawVLine(kMenuLine8X[i + 1], kMenuLineY, kMenuLineHeight);
+                }
+            }
+
+            switch (menu) {
+                case OSC_A0_MENU:
+                    lcd_drawInfo_Osc_Select(osc[0], 1);
+                    break;
+
+                case OSC_A1_MENU:
+                    lcd_drawInfo_Osc_Select(osc[0], 2);
+                    break;
+
+                case OSC_A2_MENU:
+                    lcd_drawInfo_OscLfo_Select(osc[0], osc[0].lfo[0], true);
+                    break;
+
+                case OSC_A3_MENU:
+                    lcd_drawInfo_OscLfo_Select(osc[0], osc[0].lfo[1], true);
+                    break;
+
+                case OSC_B0_MENU:
+                    lcd_drawInfo_Osc_Select(osc[1], 1);
+                    break;
+
+                case OSC_B1_MENU:
+                    lcd_drawInfo_Osc_Select(osc[1], 2);
+                    break;
+
+                case OSC_B2_MENU:
+                    lcd_drawInfo_OscLfo_Select(osc[1], osc[1].lfo[0], true);
+                    break;
+
+                case OSC_B3_MENU:
+                    lcd_drawInfo_OscLfo_Select(osc[1], osc[1].lfo[1], true);
+                    break;
+            }
             break;
 
-        case OSC_A3_MENU:
-            lcd_drawInfo_OscLfo_Select(osc[0], osc[0].lfo[1], true);
+        case 3:  // system / eq / envelope / filter / effect / reverb / key
+            if ((menuType != preMenuType) || (preMenu == EQ_MENU) || (menu == EQ_MENU)) {
+                lcd.clearRect(kMenuLine4X[1] + 1, 29, 161, 61);
+                lcd.clearRect(kMenuLine4X[2] + 1, 29, 161, 61);
+                lcd.clearRect(kMenuLine4X[3] + 1, 29, 161, 61);
+            }
+
+            for (int i = 2; i < 8; i++) {
+                lcd.drawVLine(kMenuLine8X[i], kMenuLineY, kMenuLineHeight);
+            }
+
+            switch (menu) {
+                case EQ_MENU:
+                    break;
+
+                case ENVELOPE_MENU:
+                    lcd_drawInfo_Envelope_Select(true);
+                    break;
+
+                case FILTER_0_MENU:
+                    lcd_drawInfo_Filter_Select(0, true);
+                    break;
+
+                case FILTER_1_MENU:
+                    lcd_drawInfo_Filter_Select(1, true);
+                    break;
+
+                case KEY_MENU:
+                    lcd_drawInfo_Key_Select(true);
+                    break;
+            }
             break;
 
-        case OSC_B0_MENU:
-            lcd_drawInfo_Osc_Select(osc[1], 1);
+        case 4:  // song
+            lcd.clearRect(kMenuLine4X[1] + 1, 29, 487, 61);
+            lcd_drawInfo_Song_Select(true);
             break;
-
-        case OSC_B1_MENU:
-            lcd_drawInfo_Osc_Select(osc[1], 2);
-            break;
-
-        case OSC_B2_MENU:
-            lcd_drawInfo_OscLfo_Select(osc[1], osc[1].lfo[0], true);
-            break;
-
-        case OSC_B3_MENU:
-            lcd_drawInfo_OscLfo_Select(osc[1], osc[1].lfo[1], true);
-            break;
-        }
-        break;
-
-    case 3: // system / eq / envelope / filter / effect / reverb / key
-        if ((menuType != preMenuType) || (preMenu == EQ_MENU) || (menu == EQ_MENU)) {
-            lcd.clearRect(kMenuLine4X[1] + 1, 29, 161, 61);
-            lcd.clearRect(kMenuLine4X[2] + 1, 29, 161, 61);
-            lcd.clearRect(kMenuLine4X[3] + 1, 29, 161, 61);
-        }
-
-        for (int i = 2; i < 8; i++) {
-            lcd.drawVLine(kMenuLine8X[i], kMenuLineY, kMenuLineHeight);
-        }
-
-        switch (menu) {
-        case EQ_MENU:
-            break;
-
-        case ENVELOPE_MENU:
-            lcd_drawInfo_Envelope_Select(true);
-            break;
-
-        case FILTER_0_MENU:
-            lcd_drawInfo_Filter_Select(0, true);
-            break;
-
-        case FILTER_1_MENU:
-            lcd_drawInfo_Filter_Select(1, true);
-            break;
-
-        case KEY_MENU:
-            lcd_drawInfo_Key_Select(true);
-            break;
-        }
-        break;
-
-    case 4: // song
-        lcd.clearRect(kMenuLine4X[1] + 1, 29, 487, 61);
-        lcd_drawInfo_Song_Select(true);
-        break;
     }
 }
 
 void Controller::lcd_transitionSelect() {
-    const RGB16Color *indexPtr;
-    const uint8_t *dataPtr;
+    const RGB16Color* indexPtr;
+    const uint8_t* dataPtr;
 
-    indexPtr = (const RGB16Color *)(RAM_ICON_SELECT_PALETTE_ADDRESS);
+    indexPtr = (const RGB16Color*)(RAM_ICON_SELECT_PALETTE_ADDRESS);
 
     // clear premenutab selection
     if (preMenuTab != -1) {
@@ -4161,87 +4716,127 @@ void Controller::lcd_transitionSelect() {
             refMenu = preMenu;
             preMenu = menu;
         }
-        dataPtr = (const uint8_t *)(RAM_ICON_SELECT_OFF_DATA_ADDRESS);
+        dataPtr = (const uint8_t*)(RAM_ICON_SELECT_OFF_DATA_ADDRESS);
         switch (refMenu) {
-        case EQ_MENU:
-            if (preMenuTab == 0) {
+            case EQ_MENU:
+                if (preMenuTab == 0) {
+                    lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconSelect8X[preMenuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
+                } else {
+                    lcd.setForeColor(WHITE);
+                    lcd.setBackColor(BLACK);
+                    lcd.setAlignment(LEFT);
+                    lcd.setFont(FONT_05x07);
+                    lcd.drawText(" ", 1, kMenuHeader8X[preMenuTab], 60);
+                    lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconSelect8X[preMenuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
+                }
+                break;
+
+            case SYSTEM_MENU:
+                if ((preMenuTab >= 4) && (preMenuTab <= 7)) {
+                    lcd.setForeColor(WHITE);
+                    lcd.setBackColor(BLACK);
+                    lcd.setAlignment(LEFT);
+                    lcd.setFont(FONT_05x07);
+                    lcd.drawText(" ", 1, kMenuHeader8X[preMenuTab] - 2, 60);
+                    lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconSelect8X[preMenuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
+                } else {
+                    lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconSelect8X[preMenuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
+                }
+                break;
+
+            case OSC_A0_MENU:
+            case OSC_A1_MENU:
+            case OSC_A2_MENU:
+            case OSC_A3_MENU:
+            case OSC_B0_MENU:
+            case OSC_B1_MENU:
+            case OSC_B2_MENU:
+            case OSC_B3_MENU:
+            case FILTER_0_MENU:
+            case FILTER_1_MENU:
+            case ENVELOPE_MENU:
+            case EFFECT_0_MENU:
+            case EFFECT_1_MENU:
+            case REVERB_MENU:
+            case KEY_MENU:
                 lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconSelect8X[preMenuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
-            } else {
-                lcd.setForeColor(WHITE);
-                lcd.setBackColor(BLACK);
-                lcd.setAlignment(LEFT);
-                lcd.setFont(FONT_05x07);
-                lcd.drawText(" ", 1, kMenuHeader8X[preMenuTab] + 24, 52);
-                lcd.drawText(" ", 1, kMenuHeader8X[preMenuTab] + 24, 66);
-                lcd.drawText(" ", 1, kMenuHeader8X[preMenuTab] + 24, 80);
-            }
-            break;
+                break;
 
-        case SYSTEM_MENU:
-        case OSC_A0_MENU:
-        case OSC_A1_MENU:
-        case OSC_A2_MENU:
-        case OSC_A3_MENU:
-        case OSC_B0_MENU:
-        case OSC_B1_MENU:
-        case OSC_B2_MENU:
-        case OSC_B3_MENU:
-        case FILTER_0_MENU:
-        case FILTER_1_MENU:
-        case ENVELOPE_MENU:
-        case EFFECT_0_MENU:
-        case EFFECT_1_MENU:
-        case REVERB_MENU:
-        case KEY_MENU:
-            lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconSelect8X[preMenuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
-            break;
-
-        default:
-            lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconSelect4X[preMenuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
-            break;
+            default:
+                lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconSelect4X[preMenuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
+                break;
         }
     }
 
     // draw menutab selection
     if (menuTab != -1) {
-        dataPtr = (const uint8_t *)(RAM_ICON_SELECT_ON_DATA_ADDRESS);
+        dataPtr = (const uint8_t*)(RAM_ICON_SELECT_ON_DATA_ADDRESS);
         switch (menu) {
-        case EQ_MENU:
-            if (menuTab == 0) {
+            case EQ_MENU:
+                if ((menuTab == 0) || (subMenuTab == 0)) {
+                    if (menuTab != 0) {
+                        lcd.setForeColor(WHITE);
+                        lcd.setBackColor(BLACK);
+                        lcd.setAlignment(LEFT);
+                        lcd.setFont(FONT_05x07);
+                        lcd.drawText(" ", 1, kMenuHeader8X[menuTab], 60);
+                    }
+                    lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconSelect8X[menuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
+                } else {
+                    const uint8_t* clearDataPtr = (const uint8_t*)(RAM_ICON_SELECT_OFF_DATA_ADDRESS);
+                    lcd.drawRGB16Image(indexPtr, clearDataPtr, 64, kIconSelect8X[menuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
+                    lcd.setForeColor(WHITE);
+                    lcd.setBackColor(BLACK);
+                    lcd.setAlignment(LEFT);
+                    lcd.setFont(FONT_05x07);
+                    lcd.drawText(">", 1, kMenuHeader8X[menuTab], 60);
+                }
+                break;
+
+            case SYSTEM_MENU:
+                if ((menuTab >= 4) && (menuTab <= 7)) {
+                    if (subMenuTab == 0) {
+                        lcd.setForeColor(WHITE);
+                        lcd.setBackColor(BLACK);
+                        lcd.setAlignment(LEFT);
+                        lcd.setFont(FONT_05x07);
+                        lcd.drawText(" ", 1, kMenuHeader8X[menuTab] - 2, 60);
+                        lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconSelect8X[menuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
+                    } else {
+                        const uint8_t* clearDataPtr = (const uint8_t*)(RAM_ICON_SELECT_OFF_DATA_ADDRESS);
+                        lcd.drawRGB16Image(indexPtr, clearDataPtr, 64, kIconSelect8X[menuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
+                        lcd.setForeColor(WHITE);
+                        lcd.setBackColor(BLACK);
+                        lcd.setAlignment(LEFT);
+                        lcd.setFont(FONT_05x07);
+                        lcd.drawText(">", 1, kMenuHeader8X[menuTab] - 2, 60);
+                    }
+                } else {
+                    lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconSelect8X[menuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
+                }
+                break;
+
+            case OSC_A0_MENU:
+            case OSC_A1_MENU:
+            case OSC_A2_MENU:
+            case OSC_A3_MENU:
+            case OSC_B0_MENU:
+            case OSC_B1_MENU:
+            case OSC_B2_MENU:
+            case OSC_B3_MENU:
+            case FILTER_0_MENU:
+            case FILTER_1_MENU:
+            case ENVELOPE_MENU:
+            case EFFECT_0_MENU:
+            case EFFECT_1_MENU:
+            case REVERB_MENU:
+            case KEY_MENU:
                 lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconSelect8X[menuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
-            } else {
-                lcd.setForeColor(WHITE);
-                lcd.setBackColor(BLACK);
-                lcd.setAlignment(LEFT);
-                lcd.setFont(FONT_05x07);
-                (subMenuTab == 0) ? lcd.drawText(">", 1, kMenuHeader8X[menuTab] + 24, 80) : lcd.drawText(" ", 1, kMenuHeader8X[menuTab] + 24, 80);
-                (subMenuTab == 1) ? lcd.drawText(">", 1, kMenuHeader8X[menuTab] + 24, 66) : lcd.drawText(" ", 1, kMenuHeader8X[menuTab] + 24, 66);
-                (subMenuTab == 2) ? lcd.drawText(">", 1, kMenuHeader8X[menuTab] + 24, 52) : lcd.drawText(" ", 1, kMenuHeader8X[menuTab] + 24, 52);
-            }
-            break;
+                break;
 
-        case SYSTEM_MENU:
-        case OSC_A0_MENU:
-        case OSC_A1_MENU:
-        case OSC_A2_MENU:
-        case OSC_A3_MENU:
-        case OSC_B0_MENU:
-        case OSC_B1_MENU:
-        case OSC_B2_MENU:
-        case OSC_B3_MENU:
-        case FILTER_0_MENU:
-        case FILTER_1_MENU:
-        case ENVELOPE_MENU:
-        case EFFECT_0_MENU:
-        case EFFECT_1_MENU:
-        case REVERB_MENU:
-        case KEY_MENU:
-            lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconSelect8X[menuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
-            break;
-
-        default:
-            lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconSelect4X[menuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
-            break;
+            default:
+                lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconSelect4X[menuTab], kIconSelectY, kIconSelectWidth, kIconSelectHeight);
+                break;
         }
     }
 }
@@ -4401,41 +4996,41 @@ void Controller::lcd_drawFileMenu() {
 
 void Controller::lcd_drawFile_NewData() {
     lcd_setMenuDataState(WHITE);
-    const char *text;
+    const char* text;
     (menuTab == 0) ? text = kDataSelect : text = kDataDashR;
     lcd.drawText(text, kMenuDataTextSize, kMenuData4X[0], kMenuDataY);
 }
 
 void Controller::lcd_drawFile_LoadData() {
     lcd_setMenuDataState(WHITE);
-    char *text;
+    char* text;
     char file[11] = "  FILE_";
     char num[4];
     sprintf(num, "%03d", fileMenuCounter + 1);
     strncat(file, num, 3);
-    (menuTab == 1) ? text = file : text = (char *)kDataDashR;
+    (menuTab == 1) ? text = file : text = (char*)kDataDashR;
     lcd.drawText(text, kMenuDataTextSize, kMenuData4X[1], kMenuDataY);
 }
 
 void Controller::lcd_drawFile_SaveData() {
     lcd_setMenuDataState(WHITE);
-    char *text;
+    char* text;
     char file[11] = "  FILE_";
     char num[4];
     sprintf(num, "%03d", fileMenuCounter + 1);
     strncat(file, num, 3);
-    (menuTab == 2) ? text = file : text = (char *)kDataDashR;
+    (menuTab == 2) ? text = file : text = (char*)kDataDashR;
     lcd.drawText(text, kMenuDataTextSize, kMenuData4X[2], kMenuDataY);
 }
 
 void Controller::lcd_drawFile_ClearData() {
     lcd_setMenuDataState(WHITE);
-    char *text;
+    char* text;
     char file[11] = "  FILE_";
     char num[4];
     sprintf(num, "%03d", fileMenuCounter + 1);
     strncat(file, num, 3);
-    (menuTab == 3) ? text = file : text = (char *)kDataDashR;
+    (menuTab == 3) ? text = file : text = (char*)kDataDashR;
     lcd.drawText(text, kMenuDataTextSize, kMenuData4X[3], kMenuDataY);
 }
 
@@ -4461,41 +5056,41 @@ void Controller::lcd_drawSynthkitMenu() {
 
 void Controller::lcd_drawSynthkit_NewData() {
     lcd_setMenuDataState(WHITE);
-    const char *text;
+    const char* text;
     (menuTab == 0) ? text = kDataSelect : text = kDataDashR;
     lcd.drawText(text, kMenuDataTextSize, kMenuData4X[0], kMenuDataY);
 }
 
 void Controller::lcd_drawSynthkit_LoadData() {
     lcd_setMenuDataState(WHITE);
-    char *text;
+    char* text;
     char drum[11] = " SYNTH_";
     char num[4];
     sprintf(num, "%03d", synthkitMenuCounter + 1);
     strncat(drum, num, 3);
-    (menuTab == 1) ? text = drum : text = (char *)kDataDashR;
+    (menuTab == 1) ? text = drum : text = (char*)kDataDashR;
     lcd.drawText(text, kMenuDataTextSize, kMenuData4X[1], kMenuDataY);
 }
 
 void Controller::lcd_drawSynthkit_SaveData() {
     lcd_setMenuDataState(WHITE);
-    char *text;
+    char* text;
     char drum[11] = " SYNTH_";
     char num[4];
     sprintf(num, "%03d", synthkitMenuCounter + 1);
     strncat(drum, num, 3);
-    (menuTab == 2) ? text = drum : text = (char *)kDataDashR;
+    (menuTab == 2) ? text = drum : text = (char*)kDataDashR;
     lcd.drawText(text, kMenuDataTextSize, kMenuData4X[2], kMenuDataY);
 }
 
 void Controller::lcd_drawSynthkit_ClearData() {
     lcd_setMenuDataState(WHITE);
-    char *text;
+    char* text;
     char drum[11] = " SYNTH_";
     char num[4];
     sprintf(num, "%03d", synthkitMenuCounter + 1);
     strncat(drum, num, 3);
-    (menuTab == 3) ? text = drum : text = (char *)kDataDashR;
+    (menuTab == 3) ? text = drum : text = (char*)kDataDashR;
     lcd.drawText(text, kMenuDataTextSize, kMenuData4X[3], kMenuDataY);
 }
 
@@ -4512,21 +5107,25 @@ void Controller::lcd_drawSystemMenu() {
 
     lcd_setMenuHeaderState(CYAN);
     lcd.drawText("PAN ", kMenuHeaderShortTextSize, kMenuHeader8X[2] - 2, kMenuHeaderY);
-    lcd.drawText("LIM ", kMenuHeaderShortTextSize, kMenuHeader8X[3] - 2, kMenuHeaderY);
-    lcd.drawText("MIDI", kMenuHeaderShortTextSize, kMenuHeader8X[4] - 2, kMenuHeaderY);
-    lcd.drawText("MIDI", kMenuHeaderShortTextSize, kMenuHeader8X[5] - 2, kMenuHeaderY);
-    lcd.drawText("SYNC", kMenuHeaderShortTextSize, kMenuHeader8X[6] - 2, kMenuHeaderY);
-    lcd.drawText("SYNC", kMenuHeaderShortTextSize, kMenuHeader8X[7] - 2, kMenuHeaderY);
+    lcd.drawText("NORM", kMenuHeaderShortTextSize, kMenuHeader8X[3] - 2, kMenuHeaderY);
+    lcd.drawText("MI-I", kMenuHeaderShortTextSize, kMenuHeader8X[4] - 2, kMenuHeaderY);
+    lcd.drawText("MI-O", kMenuHeaderShortTextSize, kMenuHeader8X[5] - 2, kMenuHeaderY);
+    lcd.drawText("SY-I", kMenuHeaderShortTextSize, kMenuHeader8X[6] - 2, kMenuHeaderY);
+    lcd.drawText("SY-O", kMenuHeaderShortTextSize, kMenuHeader8X[7] - 2, kMenuHeaderY);
 
     lcd_setMenuSignState(CYAN, FONT_05x07);
-    lcd.drawText(" IN", kMenuSignTextSize, kMenuData8X[4] + 2, 60);
-    lcd.drawText("OUT", kMenuSignTextSize, kMenuData8X[5] + 2, 60);
-    lcd.drawText(" IN", kMenuSignTextSize, kMenuData8X[6] + 2, 60);
-    lcd.drawText("OUT", kMenuSignTextSize, kMenuData8X[7] + 2, 60);
+    lcd.drawText("   ", kMenuSignTextSize, kMenuData8X[0] + 2, 60);
+    lcd.drawText("   ", kMenuSignTextSize, kMenuData8X[1] + 2, 60);
+    lcd.drawText("   ", kMenuSignTextSize, kMenuData8X[2] + 2, 60);
+    lcd.drawText("   ", kMenuSignTextSize, kMenuData8X[3] + 2, 60);
+    lcd.drawText("   ", kMenuSignTextSize, kMenuData8X[4] + 2, 60);
+    lcd.drawText("   ", kMenuSignTextSize, kMenuData8X[5] + 2, 60);
+    lcd.drawText("   ", kMenuSignTextSize, kMenuData8X[6] + 2, 60);
+    lcd.drawText("   ", kMenuSignTextSize, kMenuData8X[7] + 2, 60);
 
     lcd_drawSystem_VolumeData();
     lcd_drawSystem_PanData();
-    lcd_drawSystem_LimiterData();
+    lcd_drawSystem_NormalizeData();
     lcd_drawSystem_MidiInData();
     lcd_drawSystem_MidiOutData();
     lcd_drawSystem_SyncInData();
@@ -4543,30 +5142,50 @@ void Controller::lcd_drawSystem_PanData() {
     lcd.drawText(kSystemPanDataLibrary[system.pan].nameShortR, kMenuDataShortTextSize, kMenuData8X[2] + 2, kMenuDataY);
 }
 
-void Controller::lcd_drawSystem_LimiterData() {
+void Controller::lcd_drawSystem_NormalizeData() {
     lcd_setMenuDataState(WHITE);
-    const char *textPtr;
-    (system.limiter) ? textPtr = kDataShortROn : textPtr = kDataShortROff;
+    const char* textPtr;
+    (system.normalize) ? textPtr = kDataShortROn : textPtr = kDataShortROff;
     lcd.drawText(textPtr, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
 }
 
 void Controller::lcd_drawSystem_MidiInData() {
     lcd_setMenuDataState(WHITE);
+    char channelText[5];
+    sprintf(channelText, "  %02d", system.midi.rxChannel + 1);
+    lcd.setFont(FONT_05x07);
+    lcd.drawText(channelText, kMenuDataShortTextSize, kMenuData8X[4] + 2, 60);
+    lcd.setFont(FONT_07x09);
     lcd.drawText(kSystemMidiDataLibrary[system.midiIn].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
 }
 
 void Controller::lcd_drawSystem_MidiOutData() {
     lcd_setMenuDataState(WHITE);
+    char channelText[5];
+    sprintf(channelText, "  %02d", system.midi.txChannel + 1);
+    lcd.setFont(FONT_05x07);
+    lcd.drawText(channelText, kMenuDataShortTextSize, kMenuData8X[5] + 2, 60);
+    lcd.setFont(FONT_07x09);
     lcd.drawText(kSystemMidiDataLibrary[system.midiOut].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
 }
 
 void Controller::lcd_drawSystem_SyncInData() {
     lcd_setMenuDataState(WHITE);
+    char ppqnText[5];
+    sprintf(ppqnText, "  %02d", kSystemSyncPpqnDataLibrary[systemSyncInPpqn].ppqn);
+    lcd.setFont(FONT_05x07);
+    lcd.drawText(ppqnText, kMenuDataShortTextSize, kMenuData8X[6] + 2, 60);
+    lcd.setFont(FONT_07x09);
     lcd.drawText(kSystemSyncInDataLibrary[system.syncIn].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
 }
 
 void Controller::lcd_drawSystem_SyncOutData() {
     lcd_setMenuDataState(WHITE);
+    char ppqnText[5];
+    sprintf(ppqnText, "  %02d", kSystemSyncPpqnDataLibrary[systemSyncOutPpqn].ppqn);
+    lcd.setFont(FONT_05x07);
+    lcd.drawText(ppqnText, kMenuDataShortTextSize, kMenuData8X[7] + 2, 60);
+    lcd.setFont(FONT_07x09);
     lcd.drawText(kSystemSyncOutDataLibrary[system.syncOut].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
 }
 
@@ -4597,7 +5216,7 @@ void Controller::lcd_drawRhythm_TempoData() {
     lcd.drawText(kData, kMenuDataTextSize, kMenuData4X[0], kMenuDataY);
 
     if (system.sync.slaveMode) {
-        lcd_setMenuNumState(MAGENTA);
+        lcd_setMenuNumState(YELLOW);
         lcd.drawText(" SLAVE", 6, kMenuData4X[0], kMenuHeaderY + 1);
     } else if (system.sync.masterMode) {
         lcd_setMenuNumState(YELLOW);
@@ -4654,14 +5273,14 @@ void Controller::lcd_drawMetroMenu() {
 
 void Controller::lcd_drawMetro_ActiveData() {
     lcd_setMenuDataState(WHITE);
-    const char *textPtr;
+    const char* textPtr;
     (metronome.active) ? textPtr = kDataOn : textPtr = kDataOff;
     lcd.drawText(textPtr, kMenuDataTextSize, kMenuData4X[0], kMenuDataY);
 }
 
 void Controller::lcd_drawMetro_PrecountData() {
     lcd_setMenuDataState(WHITE);
-    const char *textPtr;
+    const char* textPtr;
     (metronome.precount) ? textPtr = kDataOn : textPtr = kDataOff;
     lcd.drawText(textPtr, kMenuDataTextSize, kMenuData4X[1], kMenuDataY);
 }
@@ -4692,15 +5311,6 @@ void Controller::lcd_drawEqMenu() {
         lcd.drawText(kHeaderEqFreq[i], 2, kMenuHeader8X[i + 2] - 2, kMenuHeaderY);
     }
 
-    lcd.setFont(FONT_05x07);
-    for (uint8_t i = 0; i < 6; i++) {
-        if ((i > 0) && (i < 5)) {
-            lcd.drawText("Q ", 2, kMenuHeader8X[i + 2] - 2, 52);
-        }
-        lcd.drawText("HZ", 2, kMenuHeader8X[i + 2] - 2, 66);
-        lcd.drawText("DB", 2, kMenuHeader8X[i + 2] - 2, 80);
-    }
-
     lcd.setForeColor(WHITE);
     lcd.drawHLine(401, 33, 6);
     lcd.drawLine(406, 33, 411, 38);
@@ -4727,7 +5337,7 @@ void Controller::lcd_drawEqMenu() {
 
 void Controller::lcd_drawEq_ActiveData() {
     lcd_setMenuDataState(WHITE);
-    const char *textPtr;
+    const char* textPtr;
     (eq.active) ? textPtr = kDataOn : textPtr = kDataOff;
     lcd.drawText(textPtr, kMenuDataTextSize, kMenuData8X[1], kMenuDataY);
 }
@@ -4735,30 +5345,30 @@ void Controller::lcd_drawEq_ActiveData() {
 void Controller::lcd_drawEq_LowShelfData() {
     lcd_setMenuDataState(WHITE);
     lcd.setFont(FONT_05x07);
-    lcd.drawText(kEqFreqDataLibrary[eq.freqLowShelf].nameShortR, kMenuDataShortTextSize, kMenuData8X[2] + 4, 66);
-    lcd.drawText(kEqGainDataLibrary[eq.gainLowShelf].nameShortR, kMenuDataShortTextSize, kMenuData8X[2] + 4, 80);
+    lcd.drawText(kEqFreqDataLibrary[eq.freqLowShelf].nameShortR, kMenuDataShortTextSize, kMenuData8X[2] + 2, 60);
+    lcd.setFont(FONT_07x09);
+    lcd.drawText(kEqGainDataLibrary[eq.gainLowShelf].nameShortR, kMenuDataShortTextSize, kMenuData8X[2] + 2, kMenuDataY);
 }
 
 void Controller::lcd_drawEq_HighShelfData() {
     lcd_setMenuDataState(WHITE);
     lcd.setFont(FONT_05x07);
-    lcd.drawText(kEqFreqDataLibrary[eq.freqHighShelf].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 4, 66);
-    lcd.drawText(kEqGainDataLibrary[eq.gainHighShelf].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 4, 80);
+    lcd.drawText(kEqFreqDataLibrary[eq.freqHighShelf].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, 60);
+    lcd.setFont(FONT_07x09);
+    lcd.drawText(kEqGainDataLibrary[eq.gainHighShelf].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
 }
 
 void Controller::lcd_drawEq_PeakData(uint8_t peakNum_) {
     lcd_setMenuDataState(WHITE);
     lcd.setFont(FONT_05x07);
-    lcd.setForeColor(GRAY_60);
-    lcd.drawText(kEqQDataLibrary[eq.qPeak[peakNum_]].nameShortR, kMenuDataShortTextSize, kMenuData8X[3 + peakNum_] + 4, 52);
-    lcd.setForeColor(WHITE);
-    lcd.drawText(kEqFreqDataLibrary[eq.freqPeak[peakNum_]].nameShortR, kMenuDataShortTextSize, kMenuData8X[3 + peakNum_] + 4, 66);
-    lcd.drawText(kEqGainDataLibrary[eq.gainPeak[peakNum_]].nameShortR, kMenuDataShortTextSize, kMenuData8X[3 + peakNum_] + 4, 80);
+    lcd.drawText(kEqFreqDataLibrary[eq.freqPeak[peakNum_]].nameShortR, kMenuDataShortTextSize, kMenuData8X[3 + peakNum_] + 2, 60);
+    lcd.setFont(FONT_07x09);
+    lcd.drawText(kEqGainDataLibrary[eq.gainPeak[peakNum_]].nameShortR, kMenuDataShortTextSize, kMenuData8X[3 + peakNum_] + 2, kMenuDataY);
 }
 
 // osc functions
 
-void Controller::lcd_drawOsc0Menu(Osc &osc_) {
+void Controller::lcd_drawOsc0Menu(Osc& osc_) {
     lcd_drawMenuIcon(OSC_A0_MENU);
 
     lcd_setMenuHeaderState(CYAN);
@@ -4794,7 +5404,7 @@ void Controller::lcd_drawOsc0Menu(Osc &osc_) {
     lcd_drawOsc_NormalizeData(osc_);
 }
 
-void Controller::lcd_drawOsc1Menu(Osc &osc_) {
+void Controller::lcd_drawOsc1Menu(Osc& osc_) {
     lcd_drawMenuIcon(OSC_A1_MENU);
 
     lcd_setMenuHeaderState(CYAN);
@@ -4830,7 +5440,7 @@ void Controller::lcd_drawOsc1Menu(Osc &osc_) {
     lcd_drawOsc_YFlipData(osc_);
 }
 
-void Controller::lcd_drawOscLfoMenu(Osc &osc_, Lfo &lfo_) {
+void Controller::lcd_drawOscLfoMenu(Osc& osc_, Lfo& lfo_) {
     lcd_drawMenuIcon(OSC_A2_MENU);
 
     lcd_setMenuHeaderState(CYAN);
@@ -4864,14 +5474,14 @@ void Controller::lcd_drawOscLfoMenu(Osc &osc_, Lfo &lfo_) {
     lcd_drawOscLfo_LoopData(osc_, lfo_);
 }
 
-void Controller::lcd_drawOsc_ActiveData(Osc &osc_) {
+void Controller::lcd_drawOsc_ActiveData(Osc& osc_) {
     lcd_setMenuDataState(WHITE);
-    const char *textPtr;
+    const char* textPtr;
     (osc_.active) ? textPtr = kDataOn : textPtr = kDataOff;
     lcd.drawText(textPtr, kMenuDataTextSize, kMenuData4X[0], kMenuDataY);
 }
 
-void Controller::lcd_drawOsc_WavetableData(Osc &osc_) {
+void Controller::lcd_drawOsc_WavetableData(Osc& osc_) {
     (osc_.wavetableLoaded == osc_.wavetableSelected) ? lcd_setMenuDataState(WHITE) : lcd_setMenuDataState(GRAY_60);
     lcd.drawText(osc_.wavetableSelectedData.nameShortR, kMenuDataTextSize, kMenuData4X[1], kMenuDataY);
 
@@ -4905,31 +5515,31 @@ void Controller::lcd_drawOsc_WavetableData(Osc &osc_) {
     // lcd.drawNumber(layer.sampleSector[layer.playSampleSector].size, 5, 50, 65);
 }
 
-void Controller::lcd_drawOsc_LevelData(Osc &osc_) {
+void Controller::lcd_drawOsc_LevelData(Osc& osc_) {
     lcd_setMenuDataState(WHITE);
     char kData[kMenuDataShortTextSize + 1];
     (osc_.level == kMaxOscLevel) ? sprintf(kData, " %03d", osc_.level) : sprintf(kData, "  %02d", osc_.level);
     lcd.drawText(kData, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
 }
 
-void Controller::lcd_drawOsc_TuneData(Osc &osc_) {
+void Controller::lcd_drawOsc_TuneData(Osc& osc_) {
     lcd_setMenuDataState(WHITE);
     lcd.drawText(kOscTuneDataLibrary[osc_.tune].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
 }
 
-void Controller::lcd_drawOsc_PhaseData(Osc &osc_) {
+void Controller::lcd_drawOsc_PhaseData(Osc& osc_) {
     lcd_setMenuDataState(WHITE);
     lcd.drawText(kOscPhaseDataLibrary[osc_.phase].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
 }
 
-void Controller::lcd_drawOsc_NormalizeData(Osc &osc_) {
+void Controller::lcd_drawOsc_NormalizeData(Osc& osc_) {
     lcd_setMenuDataState(WHITE);
-    const char *textPtr;
+    const char* textPtr;
     (osc_.normalize) ? textPtr = kDataShortROn : textPtr = kDataShortROff;
     lcd.drawText(textPtr, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
 }
 
-void Controller::lcd_drawOsc_StartData(Osc &osc_) {
+void Controller::lcd_drawOsc_StartData(Osc& osc_) {
     lcd_setMenuDataState(WHITE);
     if (osc_.wavetableLoaded != -1) {
         char text[5];
@@ -4940,7 +5550,7 @@ void Controller::lcd_drawOsc_StartData(Osc &osc_) {
     }
 }
 
-void Controller::lcd_drawOsc_EndData(Osc &osc_) {
+void Controller::lcd_drawOsc_EndData(Osc& osc_) {
     lcd_setMenuDataState(WHITE);
     if (osc_.wavetableLoaded != -1) {
         char text[5];
@@ -4951,50 +5561,50 @@ void Controller::lcd_drawOsc_EndData(Osc &osc_) {
     }
 }
 
-void Controller::lcd_drawOsc_XFlipData(Osc &osc_) {
+void Controller::lcd_drawOsc_XFlipData(Osc& osc_) {
     lcd_setMenuDataState(WHITE);
-    const char *textPtr;
+    const char* textPtr;
     (osc_.xFlip) ? textPtr = kDataShortROn : textPtr = kDataShortROff;
     lcd.drawText(textPtr, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
 }
 
-void Controller::lcd_drawOsc_YFlipData(Osc &osc_) {
+void Controller::lcd_drawOsc_YFlipData(Osc& osc_) {
     lcd_setMenuDataState(WHITE);
-    const char *textPtr;
+    const char* textPtr;
     (osc_.yFlip) ? textPtr = kDataShortROn : textPtr = kDataShortROff;
     lcd.drawText(textPtr, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
 }
 
-void Controller::lcd_drawOscLfo_ActiveData(Osc &osc_, Lfo &lfo_) {
+void Controller::lcd_drawOscLfo_ActiveData(Osc& osc_, Lfo& lfo_) {
     lcd_setMenuDataState(WHITE);
-    const char *textPtr;
+    const char* textPtr;
     (lfo_.active) ? textPtr = kDataOn : textPtr = kDataOff;
     lcd.drawText(textPtr, kMenuDataTextSize, kMenuData4X[0], kMenuDataY);
 }
 
-void Controller::lcd_drawOscLfo_TypeData(Osc &osc_, Lfo &lfo_) {
+void Controller::lcd_drawOscLfo_TypeData(Osc& osc_, Lfo& lfo_) {
     lcd_setMenuDataState(WHITE);
     lcd.drawText(kLfoTypeDataLibrary[lfo_.type].nameLongR, kMenuDataTextSize, kMenuData4X[1], kMenuDataY);
 }
 
-void Controller::lcd_drawOscLfo_TargetData(Osc &osc_, Lfo &lfo_) {
+void Controller::lcd_drawOscLfo_TargetData(Osc& osc_, Lfo& lfo_) {
     lcd_setMenuDataState(WHITE);
     lcd.drawText(kLfoTargetDataLibrary[lfo_.target].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
 }
 
-void Controller::lcd_drawOscLfo_RateData(Osc &osc_, Lfo &lfo_) {
+void Controller::lcd_drawOscLfo_RateData(Osc& osc_, Lfo& lfo_) {
     lcd_setMenuDataState(WHITE);
     lcd.drawText(kLfoRateDataLibrary[lfo_.rate].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
 }
 
-void Controller::lcd_drawOscLfo_DepthData(Osc &osc_, Lfo &lfo_) {
+void Controller::lcd_drawOscLfo_DepthData(Osc& osc_, Lfo& lfo_) {
     lcd_setMenuDataState(WHITE);
     lcd.drawText(kLfoDepthDataLibrary[lfo_.depth].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
 }
 
-void Controller::lcd_drawOscLfo_LoopData(Osc &osc_, Lfo &lfo_) {
+void Controller::lcd_drawOscLfo_LoopData(Osc& osc_, Lfo& lfo_) {
     lcd_setMenuDataState(WHITE);
-    const char *textPtr;
+    const char* textPtr;
     (lfo_.loop) ? textPtr = kDataShortROn : textPtr = kDataShortROff;
     lcd.drawText(textPtr, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
 }
@@ -5037,7 +5647,7 @@ void Controller::lcd_drawFilterMenu(uint8_t filterNum_) {
 
 void Controller::lcd_drawFilter_ActiveData(uint8_t filterNum_) {
     lcd_setMenuDataState(WHITE);
-    const char *textPtr;
+    const char* textPtr;
     (filter[filterNum_].active) ? textPtr = kDataOn : textPtr = kDataOff;
     lcd.drawText(textPtr, kMenuDataTextSize, kMenuData8X[1], kMenuDataY);
 }
@@ -5110,7 +5720,7 @@ void Controller::lcd_drawEnvelopeMenu() {
 
 void Controller::lcd_drawEnvelope_ActiveData() {
     lcd_setMenuDataState(WHITE);
-    const char *textPtr;
+    const char* textPtr;
     (envelope.active) ? textPtr = kDataOn : textPtr = kDataOff;
     lcd.drawText(textPtr, kMenuDataTextSize, kMenuData8X[1], kMenuDataY);
 }
@@ -5128,60 +5738,60 @@ void Controller::lcd_drawEnvelope_CurveData() {
 void Controller::lcd_drawEnvelope_AttackTimeData() {
     lcd_setMenuDataState(WHITE);
     switch (envelope.type) {
-    case ENV_ADSR:
-    case ENV_ASR:
-    case ENV_AD:
-        lcd.drawText(kEnvelopeTimeDataLibrary[envelope.attackTime].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
-        break;
+        case ENV_ADSR:
+        case ENV_ASR:
+        case ENV_AD:
+            lcd.drawText(kEnvelopeTimeDataLibrary[envelope.attackTime].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
+            break;
 
-    case ENV_OFF:
-        lcd.drawText(kDataDashShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
-        break;
+        case ENV_OFF:
+            lcd.drawText(kDataDashShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
+            break;
     }
 }
 
 void Controller::lcd_drawEnvelope_DecayTimeData() {
     lcd_setMenuDataState(WHITE);
     switch (envelope.type) {
-    case ENV_ADSR:
-    case ENV_AD:
-        lcd.drawText(kEnvelopeTimeDataLibrary[envelope.decayTime].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
-        break;
+        case ENV_ADSR:
+        case ENV_AD:
+            lcd.drawText(kEnvelopeTimeDataLibrary[envelope.decayTime].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
+            break;
 
-    case ENV_OFF:
-    case ENV_ASR:
-        lcd.drawText(kDataDashShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
-        break;
+        case ENV_OFF:
+        case ENV_ASR:
+            lcd.drawText(kDataDashShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
+            break;
     }
 }
 
 void Controller::lcd_drawEnvelope_SustainLevelData() {
     lcd_setMenuDataState(WHITE);
     switch (envelope.type) {
-    case ENV_ADSR:
-        lcd.drawText(kEnvelopeLevelDataLibrary[envelope.sustainLevel].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
-        break;
+        case ENV_ADSR:
+            lcd.drawText(kEnvelopeLevelDataLibrary[envelope.sustainLevel].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
+            break;
 
-    case ENV_OFF:
-    case ENV_ASR:
-    case ENV_AD:
-        lcd.drawText(kDataDashShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
-        break;
+        case ENV_OFF:
+        case ENV_ASR:
+        case ENV_AD:
+            lcd.drawText(kDataDashShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
+            break;
     }
 }
 
 void Controller::lcd_drawEnvelope_ReleaseTimeData() {
     lcd_setMenuDataState(WHITE);
     switch (envelope.type) {
-    case ENV_ADSR:
-    case ENV_ASR:
-        lcd.drawText(kEnvelopeTimeDataLibrary[envelope.releaseTime].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
-        break;
+        case ENV_ADSR:
+        case ENV_ASR:
+            lcd.drawText(kEnvelopeTimeDataLibrary[envelope.releaseTime].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
+            break;
 
-    case ENV_OFF:
-    case ENV_AD:
-        lcd.drawText(kDataDashShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
-        break;
+        case ENV_OFF:
+        case ENV_AD:
+            lcd.drawText(kDataDashShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
+            break;
     }
 }
 
@@ -5208,7 +5818,7 @@ void Controller::lcd_drawEffectMenu(uint8_t effectNum_) {
 
 void Controller::lcd_drawEffect_ActiveData(uint8_t effectNum_) {
     lcd_setMenuDataState(WHITE);
-    const char *textPtr;
+    const char* textPtr;
     (effect[effectNum_].active) ? textPtr = kDataOn : textPtr = kDataOff;
     lcd.drawText(textPtr, kMenuDataTextSize, kMenuData8X[1], kMenuDataY);
 }
@@ -5223,7 +5833,7 @@ void Controller::lcd_drawEffect_TypeData(uint8_t effectNum_) {
 }
 
 void Controller::lcd_drawEffect_AData(uint8_t effectNum_) {
-    Effect &effect_ = effect[effectNum_];
+    Effect& effect_ = effect[effectNum_];
     uint8_t type_ = effect[effectNum_].type;
 
     lcd_setMenuHeaderState(CYAN);
@@ -5233,51 +5843,51 @@ void Controller::lcd_drawEffect_AData(uint8_t effectNum_) {
     lcd_setMenuDataState(WHITE);
 
     switch (type_) {
-    case EF_DELAY:
-        lcd.drawText(kDelayTimeDataLibrary[effect_.delay.aTime].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
-        break;
+        case EF_DELAY:
+            lcd.drawText(kDelayTimeDataLibrary[effect_.delay.aTime].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
+            break;
 
-    case EF_CHORUS:
-        lcd.drawText(kChorusTimeDataLibrary[effect_.chorus.aTime].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
-        break;
+        case EF_CHORUS:
+            lcd.drawText(kChorusTimeDataLibrary[effect_.chorus.aTime].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
+            break;
 
-    case EF_FLANGER:
-        lcd.drawText(kFlangerTimeDataLibrary[effect_.flanger.aTime].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
-        break;
+        case EF_FLANGER:
+            lcd.drawText(kFlangerTimeDataLibrary[effect_.flanger.aTime].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
+            break;
 
-    case EF_PHASER:
-        lcd.drawText(kPhaserFreqDataLibrary[effect_.phaser.aStartFreq].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
-        break;
+        case EF_PHASER:
+            lcd.drawText(kPhaserFreqDataLibrary[effect_.phaser.aStartFreq].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
+            break;
 
-    case EF_COMPRESSOR:
-        lcd.drawText(
-            kCompressorThresholdDataLibrary[effect_.compressor.aThreshold].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
-        break;
+        case EF_COMPRESSOR:
+            lcd.drawText(
+                kCompressorThresholdDataLibrary[effect_.compressor.aThreshold].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
+            break;
 
-    case EF_EXPANDER:
-        lcd.drawText(
-            kExpanderThresholdDataLibrary[effect_.expander.aThreshold].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
-        break;
+        case EF_EXPANDER:
+            lcd.drawText(
+                kExpanderThresholdDataLibrary[effect_.expander.aThreshold].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
+            break;
 
-    case EF_OVERDRIVE:
-        lcd.drawText(
-            kOverdriveGainDataLibrary[effect_.overdrive.aGain].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
-        break;
+        case EF_OVERDRIVE:
+            lcd.drawText(
+                kOverdriveGainDataLibrary[effect_.overdrive.aGain].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
+            break;
 
-    case EF_DISTORTION:
-        lcd.drawText(
-            kDistortionGainDataLibrary[effect_.distortion.aGain].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
-        break;
+        case EF_DISTORTION:
+            lcd.drawText(
+                kDistortionGainDataLibrary[effect_.distortion.aGain].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
+            break;
 
-    case EF_BITCRUSHER:
-        lcd.drawText(
-            kBitcrusherResolutionDataLibrary[effect_.bitcrusher.aResolution].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
-        break;
+        case EF_BITCRUSHER:
+            lcd.drawText(
+                kBitcrusherResolutionDataLibrary[effect_.bitcrusher.aResolution].nameShortR, kMenuDataShortTextSize, kMenuData8X[3] + 2, kMenuDataY);
+            break;
     }
 }
 
 void Controller::lcd_drawEffect_BData(uint8_t effectNum_) {
-    Effect &effect_ = effect[effectNum_];
+    Effect& effect_ = effect[effectNum_];
     uint8_t type_ = effect[effectNum_].type;
 
     lcd_setMenuHeaderState(CYAN);
@@ -5287,52 +5897,52 @@ void Controller::lcd_drawEffect_BData(uint8_t effectNum_) {
     lcd_setMenuDataState(WHITE);
 
     switch (type_) {
-    case EF_DELAY:
-        lcd.drawText(
-            kDelayLevelDataLibrary[effect_.delay.bLevel].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
-        break;
+        case EF_DELAY:
+            lcd.drawText(
+                kDelayLevelDataLibrary[effect_.delay.bLevel].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
+            break;
 
-    case EF_CHORUS:
-        lcd.drawText(
-            kChorusFeedbackDataLibrary[effect_.chorus.bFeedback].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
-        break;
+        case EF_CHORUS:
+            lcd.drawText(
+                kChorusFeedbackDataLibrary[effect_.chorus.bFeedback].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
+            break;
 
-    case EF_FLANGER:
-        lcd.drawText(
-            kFlangerFeedbackDataLibrary[effect_.flanger.bFeedback].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
-        break;
+        case EF_FLANGER:
+            lcd.drawText(
+                kFlangerFeedbackDataLibrary[effect_.flanger.bFeedback].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
+            break;
 
-    case EF_PHASER:
-        lcd.drawText(kPhaserFreqDataLibrary[effect_.phaser.bEndFreq].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
-        break;
+        case EF_PHASER:
+            lcd.drawText(kPhaserFreqDataLibrary[effect_.phaser.bEndFreq].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
+            break;
 
-    case EF_COMPRESSOR:
-        lcd.drawText(
-            kCompressorRateDataLibrary[effect_.compressor.bRate].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
-        break;
+        case EF_COMPRESSOR:
+            lcd.drawText(
+                kCompressorRateDataLibrary[effect_.compressor.bRate].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
+            break;
 
-    case EF_EXPANDER:
-        lcd.drawText(kExpanderRateDataLibrary[effect_.expander.bRate].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
-        break;
+        case EF_EXPANDER:
+            lcd.drawText(kExpanderRateDataLibrary[effect_.expander.bRate].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
+            break;
 
-    case EF_OVERDRIVE:
-        lcd.drawText(kOverdriveThresholdDataLibrary[effect_.overdrive.bThreshold].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
-        break;
+        case EF_OVERDRIVE:
+            lcd.drawText(kOverdriveThresholdDataLibrary[effect_.overdrive.bThreshold].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
+            break;
 
-    case EF_DISTORTION:
-        lcd.drawText(
-            kDistortionThresholdDataLibrary[effect_.distortion.bThreshold].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
-        break;
+        case EF_DISTORTION:
+            lcd.drawText(
+                kDistortionThresholdDataLibrary[effect_.distortion.bThreshold].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
+            break;
 
-    case EF_BITCRUSHER:
-        lcd.drawText(
-            kBitcrusherSampleRateDataLibrary[effect_.bitcrusher.bSampleRate].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
-        break;
+        case EF_BITCRUSHER:
+            lcd.drawText(
+                kBitcrusherSampleRateDataLibrary[effect_.bitcrusher.bSampleRate].nameShortR, kMenuDataShortTextSize, kMenuData8X[4] + 2, kMenuDataY);
+            break;
     }
 }
 
 void Controller::lcd_drawEffect_CData(uint8_t effectNum_) {
-    Effect &effect_ = effect[effectNum_];
+    Effect& effect_ = effect[effectNum_];
     uint8_t type_ = effect[effectNum_].type;
 
     lcd_setMenuHeaderState(CYAN);
@@ -5342,50 +5952,50 @@ void Controller::lcd_drawEffect_CData(uint8_t effectNum_) {
     lcd_setMenuDataState(WHITE);
 
     switch (type_) {
-    case EF_DELAY:
-        lcd.drawText(kDelayFeedbackDataLibrary[effect_.delay.cFeedback].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
-        break;
+        case EF_DELAY:
+            lcd.drawText(kDelayFeedbackDataLibrary[effect_.delay.cFeedback].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
+            break;
 
-    case EF_CHORUS:
-        lcd.drawText(kChorusRateDataLibrary[effect_.chorus.cRate].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
-        break;
+        case EF_CHORUS:
+            lcd.drawText(kChorusRateDataLibrary[effect_.chorus.cRate].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
+            break;
 
-    case EF_FLANGER:
-        lcd.drawText(kFlangerRateDataLibrary[effect_.flanger.cRate].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
-        break;
+        case EF_FLANGER:
+            lcd.drawText(kFlangerRateDataLibrary[effect_.flanger.cRate].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
+            break;
 
-    case EF_PHASER:
-        lcd.drawText(kPhaserRateDataLibrary[effect_.phaser.cRate].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
-        break;
+        case EF_PHASER:
+            lcd.drawText(kPhaserRateDataLibrary[effect_.phaser.cRate].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
+            break;
 
-    case EF_COMPRESSOR:
-        lcd.drawText(
-            kCompressorAttackTimeDataLibrary[effect_.compressor.cAttackTime].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
-        break;
+        case EF_COMPRESSOR:
+            lcd.drawText(
+                kCompressorAttackTimeDataLibrary[effect_.compressor.cAttackTime].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
+            break;
 
-    case EF_EXPANDER:
-        lcd.drawText(kExpanderAttackTimeDataLibrary[effect_.expander.cAttackTime].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
-        break;
+        case EF_EXPANDER:
+            lcd.drawText(kExpanderAttackTimeDataLibrary[effect_.expander.cAttackTime].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
+            break;
 
-    case EF_OVERDRIVE:
-        lcd.drawText(
-            kOverdriveToneDataLibrary[effect_.overdrive.cTone].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
-        break;
+        case EF_OVERDRIVE:
+            lcd.drawText(
+                kOverdriveToneDataLibrary[effect_.overdrive.cTone].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
+            break;
 
-    case EF_DISTORTION:
-        lcd.drawText(
-            kDistortionToneDataLibrary[effect_.distortion.cTone].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
-        break;
+        case EF_DISTORTION:
+            lcd.drawText(
+                kDistortionToneDataLibrary[effect_.distortion.cTone].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
+            break;
 
-    case EF_BITCRUSHER:
-        lcd.drawText(
-            kBitcrusherThresholdDataLibrary[effect_.bitcrusher.cThreshold].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
-        break;
+        case EF_BITCRUSHER:
+            lcd.drawText(
+                kBitcrusherThresholdDataLibrary[effect_.bitcrusher.cThreshold].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
+            break;
     }
 }
 
 void Controller::lcd_drawEffect_DData(uint8_t effectNum_) {
-    Effect &effect_ = effect[effectNum_];
+    Effect& effect_ = effect[effectNum_];
     uint8_t type_ = effect[effectNum_].type;
 
     lcd_setMenuHeaderState(CYAN);
@@ -5395,50 +6005,50 @@ void Controller::lcd_drawEffect_DData(uint8_t effectNum_) {
     lcd_setMenuDataState(WHITE);
 
     switch (type_) {
-    case EF_DELAY:
-        lcd.drawText(kEffectMixDataLibrary[effect_.delay.dDry].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
-        break;
+        case EF_DELAY:
+            lcd.drawText(kEffectMixDataLibrary[effect_.delay.dDry].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
+            break;
 
-    case EF_CHORUS:
-        lcd.drawText(kEffectMixDataLibrary[effect_.chorus.dDry].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
-        break;
+        case EF_CHORUS:
+            lcd.drawText(kEffectMixDataLibrary[effect_.chorus.dDry].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
+            break;
 
-    case EF_FLANGER:
-        lcd.drawText(kEffectMixDataLibrary[effect_.flanger.dDry].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
-        break;
+        case EF_FLANGER:
+            lcd.drawText(kEffectMixDataLibrary[effect_.flanger.dDry].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
+            break;
 
-    case EF_PHASER:
-        lcd.drawText(kEffectMixDataLibrary[effect_.phaser.dDry].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
-        break;
+        case EF_PHASER:
+            lcd.drawText(kEffectMixDataLibrary[effect_.phaser.dDry].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
+            break;
 
-    case EF_COMPRESSOR:
-        lcd.drawText(
-            kCompressorReleaseTimeDataLibrary[effect_.compressor.dReleaseTime].nameShortR,
-            kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
-        break;
+        case EF_COMPRESSOR:
+            lcd.drawText(
+                kCompressorReleaseTimeDataLibrary[effect_.compressor.dReleaseTime].nameShortR,
+                kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
+            break;
 
-    case EF_EXPANDER:
-        lcd.drawText(
-            kExpanderReleaseTimeDataLibrary[effect_.expander.dReleaseTime].nameShortR,
-            kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
-        break;
+        case EF_EXPANDER:
+            lcd.drawText(
+                kExpanderReleaseTimeDataLibrary[effect_.expander.dReleaseTime].nameShortR,
+                kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
+            break;
 
-    case EF_OVERDRIVE:
-        lcd.drawText(kEffectMixDataLibrary[effect_.overdrive.dDry].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
-        break;
+        case EF_OVERDRIVE:
+            lcd.drawText(kEffectMixDataLibrary[effect_.overdrive.dDry].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
+            break;
 
-    case EF_DISTORTION:
-        lcd.drawText(kEffectMixDataLibrary[effect_.distortion.dDry].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
-        break;
+        case EF_DISTORTION:
+            lcd.drawText(kEffectMixDataLibrary[effect_.distortion.dDry].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
+            break;
 
-    case EF_BITCRUSHER:
-        lcd.drawText(kEffectMixDataLibrary[effect_.bitcrusher.dDry].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
-        break;
+        case EF_BITCRUSHER:
+            lcd.drawText(kEffectMixDataLibrary[effect_.bitcrusher.dDry].nameShortR, kMenuDataShortTextSize, kMenuData8X[6] + 2, kMenuDataY);
+            break;
     }
 }
 
 void Controller::lcd_drawEffect_EData(uint8_t effectNum_) {
-    Effect &effect_ = effect[effectNum_];
+    Effect& effect_ = effect[effectNum_];
     uint8_t type_ = effect[effectNum_].type;
 
     lcd_setMenuHeaderState(CYAN);
@@ -5448,41 +6058,41 @@ void Controller::lcd_drawEffect_EData(uint8_t effectNum_) {
     lcd_setMenuDataState(WHITE);
 
     switch (type_) {
-    case EF_DELAY:
-        lcd.drawText(kEffectMixDataLibrary[effect_.delay.eWet].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
-        break;
+        case EF_DELAY:
+            lcd.drawText(kEffectMixDataLibrary[effect_.delay.eWet].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
+            break;
 
-    case EF_CHORUS:
-        lcd.drawText(kEffectMixDataLibrary[effect_.chorus.eWet].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
-        break;
+        case EF_CHORUS:
+            lcd.drawText(kEffectMixDataLibrary[effect_.chorus.eWet].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
+            break;
 
-    case EF_FLANGER:
-        lcd.drawText(kEffectMixDataLibrary[effect_.flanger.eWet].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
-        break;
+        case EF_FLANGER:
+            lcd.drawText(kEffectMixDataLibrary[effect_.flanger.eWet].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
+            break;
 
-    case EF_PHASER:
-        lcd.drawText(kEffectMixDataLibrary[effect_.phaser.eWet].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
-        break;
+        case EF_PHASER:
+            lcd.drawText(kEffectMixDataLibrary[effect_.phaser.eWet].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
+            break;
 
-    case EF_COMPRESSOR:
-        lcd.drawText(kEffectMixDataLibrary[effect_.compressor.eMix].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
-        break;
+        case EF_COMPRESSOR:
+            lcd.drawText(kEffectMixDataLibrary[effect_.compressor.eMix].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
+            break;
 
-    case EF_EXPANDER:
-        lcd.drawText(kEffectMixDataLibrary[effect_.expander.eMix].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
-        break;
+        case EF_EXPANDER:
+            lcd.drawText(kEffectMixDataLibrary[effect_.expander.eMix].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
+            break;
 
-    case EF_OVERDRIVE:
-        lcd.drawText(kEffectMixDataLibrary[effect_.overdrive.eWet].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
-        break;
+        case EF_OVERDRIVE:
+            lcd.drawText(kEffectMixDataLibrary[effect_.overdrive.eWet].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
+            break;
 
-    case EF_DISTORTION:
-        lcd.drawText(kEffectMixDataLibrary[effect_.distortion.eWet].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
-        break;
+        case EF_DISTORTION:
+            lcd.drawText(kEffectMixDataLibrary[effect_.distortion.eWet].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
+            break;
 
-    case EF_BITCRUSHER:
-        lcd.drawText(kEffectMixDataLibrary[effect_.bitcrusher.eWet].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
-        break;
+        case EF_BITCRUSHER:
+            lcd.drawText(kEffectMixDataLibrary[effect_.bitcrusher.eWet].nameShortR, kMenuDataShortTextSize, kMenuData8X[7] + 2, kMenuDataY);
+            break;
     }
 }
 
@@ -5524,7 +6134,7 @@ void Controller::lcd_drawReverbMenu() {
 
 void Controller::lcd_drawReverb_ActiveData() {
     lcd_setMenuDataState(WHITE);
-    const char *textPtr;
+    const char* textPtr;
     (reverb.active) ? textPtr = kDataOn : textPtr = kDataOff;
     lcd.drawText(textPtr, kMenuDataTextSize, kMenuData8X[1], kMenuDataY);
 }
@@ -5602,7 +6212,7 @@ void Controller::lcd_drawKey_NoteData() {
 
 void Controller::lcd_drawKey_ArpegData() {
     lcd_setMenuDataState(WHITE);
-    const char *textPtr;
+    const char* textPtr;
     (key.arpeg) ? textPtr = kDataShortROn : textPtr = kDataShortROff;
     lcd.drawText(textPtr, kMenuDataShortTextSize, kMenuData8X[2] + 2, kMenuDataY);
 }
@@ -5620,13 +6230,13 @@ void Controller::lcd_drawKey_OscData() {
 void Controller::lcd_drawKey_ChordData() {
     lcd_setMenuDataState(WHITE);
     switch (key.chordType) {
-    case CHORD_3:
-        lcd.drawText(kKeyChord3DataLibrary[key.chord].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
-        break;
+        case CHORD_3:
+            lcd.drawText(kKeyChord3DataLibrary[key.chord].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
+            break;
 
-    case CHORD_4:
-        lcd.drawText(kKeyChord4DataLibrary[key.chord].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
-        break;
+        case CHORD_4:
+            lcd.drawText(kKeyChord4DataLibrary[key.chord].nameShortR, kMenuDataShortTextSize, kMenuData8X[5] + 2, kMenuDataY);
+            break;
     }
 }
 
@@ -5660,15 +6270,15 @@ void Controller::lcd_drawSongMenu() {
 
 void Controller::lcd_drawSong_BeatData() {
     lcd_setMenuDataState(WHITE);
-    Bank &bank = song.bankLibrary[activeBankNum];
-    const char *text;
+    Bank& bank = song.bankLibrary[activeBankNum];
+    const char* text;
     if ((selectedBeatNum != -1) && (key.note)) {
-        Beat &beat = bank.beatLibrary[selectedBeatNum];
+        Beat& beat = bank.beatLibrary[selectedBeatNum];
         uint8_t note = ((key.note - 1) + beat.note) % 12;
         uint8_t octave = beat.octave - 1;
         char dataText[11];
-        const char *noteText;
-        const char *octaveText;
+        const char* noteText;
+        const char* octaveText;
         noteText = kNoteTextDataLibrary[note];
         octaveText = kOctaveTextDataLibrary[octave];
         strcpy(dataText, noteText);
@@ -5696,7 +6306,7 @@ void Controller::lcd_drawSong_BeatData() {
 }
 
 void Controller::lcd_drawSong_BeatGraph() {
-    Bank &bank = song.bankLibrary[activeBankNum];
+    Bank& bank = song.bankLibrary[activeBankNum];
 
     lcd.setForeColor(WHITE);
     lcd.setBackColor(BLACK);
@@ -5705,8 +6315,8 @@ void Controller::lcd_drawSong_BeatGraph() {
 
     // draw text
     if (selectedBeatNum != -1) {
-        char *text;
-        Beat &beat = bank.beatLibrary[selectedBeatNum];
+        char* text;
+        Beat& beat = bank.beatLibrary[selectedBeatNum];
         uint16_t startInterval = beat.startInterval;
         uint16_t endInterval = beat.endInterval;
         uint8_t startBar = startInterval / barInterval;
@@ -5741,7 +6351,7 @@ void Controller::lcd_drawSong_BeatGraph() {
 
     // draw graph
     if (selectedBeatNum != -1) {
-        Beat &beat = bank.beatLibrary[selectedBeatNum];
+        Beat& beat = bank.beatLibrary[selectedBeatNum];
 
         // clear graph
         // lcd.clearRect(kBeatGraphStartX + 1, kBeatGraphStartY, kBeatGraphWidth -
@@ -5859,40 +6469,40 @@ void Controller::lcd_drawPlay() {
 }
 
 void Controller::lcd_drawIcon() {
-    const RGB16Color *indexPtr;
-    const uint8_t *dataPtr;
+    const RGB16Color* indexPtr;
+    const uint8_t* dataPtr;
     uint16_t xPos;
 
-    indexPtr = (const RGB16Color *)(RAM_ICON_PLAY_PALETTE_ADDRESS);
+    indexPtr = (const RGB16Color*)(RAM_ICON_PLAY_PALETTE_ADDRESS);
 
     if (resetIcon.flag) {
         (resetIcon.mode)
-            ? dataPtr = (const uint8_t *)(RAM_ICON_PLAY_RESET_ON_DATA_ADDRESS)
-            : dataPtr = (const uint8_t *)(RAM_ICON_PLAY_RESET_OFF_DATA_ADDRESS);
+            ? dataPtr = (const uint8_t*)(RAM_ICON_PLAY_RESET_ON_DATA_ADDRESS)
+            : dataPtr = (const uint8_t*)(RAM_ICON_PLAY_RESET_OFF_DATA_ADDRESS);
         lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconResetX, kIconPlayY, kIconPlayWidth, kIconPlayHeight);
         resetIcon.flag = false;
     }
 
     if (playIcon.flag) {
         (playIcon.mode)
-            ? dataPtr = (const uint8_t *)(RAM_ICON_PLAY_PLAY_ON_DATA_ADDRESS)
-            : dataPtr = (const uint8_t *)(RAM_ICON_PLAY_PLAY_OFF_DATA_ADDRESS);
+            ? dataPtr = (const uint8_t*)(RAM_ICON_PLAY_PLAY_ON_DATA_ADDRESS)
+            : dataPtr = (const uint8_t*)(RAM_ICON_PLAY_PLAY_OFF_DATA_ADDRESS);
         lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconPlayX, kIconPlayY, kIconPlayWidth, kIconPlayHeight);
         playIcon.flag = false;
     }
 
     if (stopIcon.flag) {
         (stopIcon.mode)
-            ? dataPtr = (const uint8_t *)(RAM_ICON_PLAY_STOP_ON_DATA_ADDRESS)
-            : dataPtr = (const uint8_t *)(RAM_ICON_PLAY_STOP_OFF_DATA_ADDRESS);
+            ? dataPtr = (const uint8_t*)(RAM_ICON_PLAY_STOP_ON_DATA_ADDRESS)
+            : dataPtr = (const uint8_t*)(RAM_ICON_PLAY_STOP_OFF_DATA_ADDRESS);
         lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconStopX, kIconPlayY, kIconPlayWidth, kIconPlayHeight);
         stopIcon.flag = false;
     }
 
     if (recordIcon.flag) {
         (recordIcon.mode)
-            ? dataPtr = (const uint8_t *)(RAM_ICON_PLAY_RECORD_ON_DATA_ADDRESS)
-            : dataPtr = (const uint8_t *)(RAM_ICON_PLAY_RECORD_OFF_DATA_ADDRESS);
+            ? dataPtr = (const uint8_t*)(RAM_ICON_PLAY_RECORD_ON_DATA_ADDRESS)
+            : dataPtr = (const uint8_t*)(RAM_ICON_PLAY_RECORD_OFF_DATA_ADDRESS);
         lcd.drawRGB16Image(indexPtr, dataPtr, 64, kIconRecordX, kIconPlayY, kIconPlayWidth, kIconPlayHeight);
         recordIcon.flag = false;
     }
@@ -6010,7 +6620,7 @@ void Controller::lcd_drawMeasureBar() {
 
 void Controller::lcd_drawStartBeat(uint8_t bankNum_, uint8_t beatNum_, bool selected_) {
     if (bankNum_ == activeBankNum) {
-        Beat &beat = song.bankLibrary[bankNum_].beatLibrary[beatNum_];
+        Beat& beat = song.bankLibrary[bankNum_].beatLibrary[beatNum_];
         // calculate intervals
         uint16_t startInterval = beat.startInterval;
         // calculate x - y positions
@@ -6026,7 +6636,7 @@ void Controller::lcd_drawStartBeat(uint8_t bankNum_, uint8_t beatNum_, bool sele
 
 void Controller::lcd_drawEndBeat(uint8_t bankNum_, uint8_t beatNum_, bool selected_) {
     if (bankNum_ == activeBankNum) {
-        Beat &beat = song.bankLibrary[bankNum_].beatLibrary[beatNum_];
+        Beat& beat = song.bankLibrary[bankNum_].beatLibrary[beatNum_];
         // calculate intervals
         uint16_t startInterval = beat.startInterval;
         uint16_t endInterval = beat.endInterval;
@@ -6044,7 +6654,7 @@ void Controller::lcd_drawEndBeat(uint8_t bankNum_, uint8_t beatNum_, bool select
 
 void Controller::lcd_drawBeat(uint8_t bankNum_, uint8_t beatNum_, bool selected_) {
     if (bankNum_ == activeBankNum) {
-        Beat &beat = song.bankLibrary[bankNum_].beatLibrary[beatNum_];
+        Beat& beat = song.bankLibrary[bankNum_].beatLibrary[beatNum_];
         // calculate intervals
         uint16_t startInterval = beat.startInterval;
         uint16_t endInterval = beat.endInterval;
@@ -6062,7 +6672,7 @@ void Controller::lcd_drawBeat(uint8_t bankNum_, uint8_t beatNum_, bool selected_
 
 void Controller::lcd_clearBeat(uint8_t bankNum_, uint8_t beatNum_) {
     if (bankNum_ == activeBankNum) {
-        Beat &beat = song.bankLibrary[bankNum_].beatLibrary[beatNum_];
+        Beat& beat = song.bankLibrary[bankNum_].beatLibrary[beatNum_];
         if (beat.active) {
             // calculate intervals
             uint16_t startInterval = beat.startInterval;
@@ -6083,10 +6693,10 @@ void Controller::lcd_clearBeat(uint8_t bankNum_, uint8_t beatNum_) {
 void Controller::lcd_drawSong(uint8_t bankNum_) {
     if (bankNum_ == activeBankNum) {
         lcd_clearSong();
-        Bank &bank = song.bankLibrary[bankNum_];
+        Bank& bank = song.bankLibrary[bankNum_];
         if (bank.lastActiveBeatNum != -1) {
             for (uint8_t i = 0; i <= bank.lastActiveBeatNum; i++) {
-                Beat &beat = bank.beatLibrary[i];
+                Beat& beat = bank.beatLibrary[i];
                 if (beat.active)
                     lcd_drawBeat(bankNum_, i, false);
             }
@@ -6105,7 +6715,7 @@ void Controller::lcd_clearSong() {
 
 void Controller::lcd_clearBeatInterval(uint8_t bankNum_, uint8_t beatNum_, uint16_t startInterval_, uint16_t endInterval_) {
     if (bankNum_ == activeBankNum) {
-        Beat &beat = song.bankLibrary[bankNum_].beatLibrary[beatNum_];
+        Beat& beat = song.bankLibrary[bankNum_].beatLibrary[beatNum_];
         if (beat.active) {
             // calculate x - y positions
             uint16_t xStart = kSongX + (startInterval_ * kSongWidth / songInterval);
@@ -6125,11 +6735,11 @@ void Controller::lcd_clearBeatInterval(uint8_t bankNum_, uint8_t beatNum_, uint1
 // info song
 
 void Controller::lcd_drawInfo_Song_Select(bool selected) {
-    const RGB16Color *palettePtr;
-    const uint8_t *dataPtr;
+    const RGB16Color* palettePtr;
+    const uint8_t* dataPtr;
 
-    palettePtr = (const RGB16Color *)(RAM_BUTTON_SONG_PALETTE_ADDRESS);
-    (selected) ? dataPtr = (const uint8_t *)(RAM_BUTTON_SONG_ON_DATA_ADDRESS) : dataPtr = (const uint8_t *)(RAM_BUTTON_SONG_OFF_DATA_ADDRESS);
+    palettePtr = (const RGB16Color*)(RAM_BUTTON_SONG_PALETTE_ADDRESS);
+    (selected) ? dataPtr = (const uint8_t*)(RAM_BUTTON_SONG_ON_DATA_ADDRESS) : dataPtr = (const uint8_t*)(RAM_BUTTON_SONG_OFF_DATA_ADDRESS);
 
     lcd.drawRGB16Image(palettePtr, dataPtr, 64, kButtonSongX, kButtonSongY, kButtonSongWidth, kButtonSongHeight);
 }
@@ -6137,11 +6747,11 @@ void Controller::lcd_drawInfo_Song_Select(bool selected) {
 // info key
 
 void Controller::lcd_drawInfo_Key_Select(bool selected) {
-    const RGB16Color *palettePtr;
-    const uint8_t *dataPtr;
+    const RGB16Color* palettePtr;
+    const uint8_t* dataPtr;
 
-    palettePtr = (const RGB16Color *)(RAM_BUTTON_KEY_PALETTE_ADDRESS);
-    (selected) ? dataPtr = (const uint8_t *)(RAM_BUTTON_KEY_ON_DATA_ADDRESS) : dataPtr = (const uint8_t *)(RAM_BUTTON_KEY_OFF_DATA_ADDRESS);
+    palettePtr = (const RGB16Color*)(RAM_BUTTON_KEY_PALETTE_ADDRESS);
+    (selected) ? dataPtr = (const uint8_t*)(RAM_BUTTON_KEY_ON_DATA_ADDRESS) : dataPtr = (const uint8_t*)(RAM_BUTTON_KEY_OFF_DATA_ADDRESS);
 
     lcd.drawRGB16Image(palettePtr, dataPtr, 64, kButtonKeyX, kButtonKeyY, kButtonKeyWidth, kButtonKeyHeight);
 }
@@ -6159,11 +6769,11 @@ void Controller::lcd_drawInfo_Key_NoteData() {
     lcd.setAlignment(LEFT);
     lcd.drawText(kKeyNoteDataLibrary[key.note].nameShortL, kMenuDataShortTextSize, xPos, yPos);
 
-    const RGB16Color *indexPtr;
-    const uint8_t *dataPtr;
+    const RGB16Color* indexPtr;
+    const uint8_t* dataPtr;
 
-    indexPtr = (const RGB16Color *)(RAM_GRAPH_KEY_PALETTE_ADDRESS);
-    dataPtr = (const uint8_t *)(RAM_GRAPH_KEY_DATA_ADDRESS + (kInfoGraphWidth * kInfoGraphHeight * key.note));
+    indexPtr = (const RGB16Color*)(RAM_GRAPH_KEY_PALETTE_ADDRESS);
+    dataPtr = (const uint8_t*)(RAM_GRAPH_KEY_DATA_ADDRESS + (kInfoGraphWidth * kInfoGraphHeight * key.note));
 
     lcd.drawRGB16Image(indexPtr, dataPtr, 64, kInfoKeyGraphX, kInfoKeyGraphY, kInfoGraphWidth, kInfoGraphHeight);
 }
@@ -6179,7 +6789,7 @@ void Controller::lcd_drawInfo_Key_ArpegData() {
     lcd.setBackColor(backColor);
     lcd.setFont(FONT_05x07);
     lcd.setAlignment(LEFT);
-    const char *textPtr;
+    const char* textPtr;
     (key.arpeg) ? textPtr = kDataShortROn : textPtr = kDataShortROff;
     lcd.drawText(textPtr, kMenuDataShortTextSize, xPos, yPos);
 }
@@ -6224,13 +6834,13 @@ void Controller::lcd_drawInfo_Key_ChordData() {
     lcd.setFont(FONT_05x07);
     lcd.setAlignment(LEFT);
     switch (key.chordType) {
-    case CHORD_3:
-        lcd.drawText(kKeyChord3DataLibrary[key.chord].nameShortR, kMenuDataShortTextSize, xPos, yPos);
-        break;
+        case CHORD_3:
+            lcd.drawText(kKeyChord3DataLibrary[key.chord].nameShortR, kMenuDataShortTextSize, xPos, yPos);
+            break;
 
-    case CHORD_4:
-        lcd.drawText(kKeyChord4DataLibrary[key.chord].nameShortR, kMenuDataShortTextSize, xPos, yPos);
-        break;
+        case CHORD_4:
+            lcd.drawText(kKeyChord4DataLibrary[key.chord].nameShortR, kMenuDataShortTextSize, xPos, yPos);
+            break;
     }
 }
 
@@ -6263,89 +6873,89 @@ void Controller::lcd_drawInfo_Key_OctaveData() {
 }
 
 void Controller::lcd_drawInfo_Key_PatternData() {
-    const RGB16Color *indexPtr;
-    const uint8_t *dataPtr;
+    const RGB16Color* indexPtr;
+    const uint8_t* dataPtr;
 
     if (key.arpeg) {
-        indexPtr = (const RGB16Color *)(RAM_GRAPH_ARPEG_PALETTE_ADDRESS);
-        dataPtr = (const uint8_t *)(RAM_GRAPH_ARPEG_DATA_ADDRESS + (kInfoGraphWidth * kInfoGraphHeight * key.chordPattern));
+        indexPtr = (const RGB16Color*)(RAM_GRAPH_ARPEG_PALETTE_ADDRESS);
+        dataPtr = (const uint8_t*)(RAM_GRAPH_ARPEG_DATA_ADDRESS + (kInfoGraphWidth * kInfoGraphHeight * key.chordPattern));
     } else {
-        indexPtr = (const RGB16Color *)(RAM_GRAPH_ARPEG_PALETTE_ADDRESS);
-        dataPtr = (const uint8_t *)(RAM_GRAPH_ARPEG_DATA_ADDRESS);
+        indexPtr = (const RGB16Color*)(RAM_GRAPH_ARPEG_PALETTE_ADDRESS);
+        dataPtr = (const uint8_t*)(RAM_GRAPH_ARPEG_DATA_ADDRESS);
     }
     lcd.drawRGB16Image(indexPtr, dataPtr, 64, kInfoArpegGraphX, kInfoArpegGraphY, kInfoGraphWidth, kInfoGraphHeight);
 }
 
 // info osc
 
-void Controller::lcd_drawInfo_Osc_Select(Osc &osc_, uint8_t selected) {
-    const RGB16Color *palettePtr;
-    const uint8_t *dataPtr;
+void Controller::lcd_drawInfo_Osc_Select(Osc& osc_, uint8_t selected) {
+    const RGB16Color* palettePtr;
+    const uint8_t* dataPtr;
 
     switch (osc_.number) {
-    case 0:
-        palettePtr = (const RGB16Color *)(RAM_BUTTON_OSC_A_PALETTE_ADDRESS);
-        switch (selected) {
         case 0:
-            dataPtr = (const uint8_t *)(RAM_BUTTON_OSC_A_0_DATA_ADDRESS);
+            palettePtr = (const RGB16Color*)(RAM_BUTTON_OSC_A_PALETTE_ADDRESS);
+            switch (selected) {
+                case 0:
+                    dataPtr = (const uint8_t*)(RAM_BUTTON_OSC_A_0_DATA_ADDRESS);
+                    break;
+
+                case 1:
+                    dataPtr = (const uint8_t*)(RAM_BUTTON_OSC_A_1_DATA_ADDRESS);
+                    break;
+
+                case 2:
+                    dataPtr = (const uint8_t*)(RAM_BUTTON_OSC_A_2_DATA_ADDRESS);
+                    break;
+            }
+            lcd.drawRGB16Image(palettePtr, dataPtr, 64, kButtonOscAX, kButtonOscAY, kButtonOscAWidth, kButtonOscAHeight);
             break;
 
         case 1:
-            dataPtr = (const uint8_t *)(RAM_BUTTON_OSC_A_1_DATA_ADDRESS);
-            break;
+            palettePtr = (const RGB16Color*)(RAM_BUTTON_OSC_B_PALETTE_ADDRESS);
+            switch (selected) {
+                case 0:
+                    dataPtr = (const uint8_t*)(RAM_BUTTON_OSC_B_0_DATA_ADDRESS);
+                    break;
 
-        case 2:
-            dataPtr = (const uint8_t *)(RAM_BUTTON_OSC_A_2_DATA_ADDRESS);
-            break;
-        }
-        lcd.drawRGB16Image(palettePtr, dataPtr, 64, kButtonOscAX, kButtonOscAY, kButtonOscAWidth, kButtonOscAHeight);
-        break;
+                case 1:
+                    dataPtr = (const uint8_t*)(RAM_BUTTON_OSC_B_1_DATA_ADDRESS);
+                    break;
 
-    case 1:
-        palettePtr = (const RGB16Color *)(RAM_BUTTON_OSC_B_PALETTE_ADDRESS);
-        switch (selected) {
-        case 0:
-            dataPtr = (const uint8_t *)(RAM_BUTTON_OSC_B_0_DATA_ADDRESS);
+                case 2:
+                    dataPtr = (const uint8_t*)(RAM_BUTTON_OSC_B_2_DATA_ADDRESS);
+                    break;
+            }
+            lcd.drawRGB16Image(palettePtr, dataPtr, 64, kButtonOscBX, kButtonOscBY, kButtonOscBWidth, kButtonOscBHeight);
             break;
-
-        case 1:
-            dataPtr = (const uint8_t *)(RAM_BUTTON_OSC_B_1_DATA_ADDRESS);
-            break;
-
-        case 2:
-            dataPtr = (const uint8_t *)(RAM_BUTTON_OSC_B_2_DATA_ADDRESS);
-            break;
-        }
-        lcd.drawRGB16Image(palettePtr, dataPtr, 64, kButtonOscBX, kButtonOscBY, kButtonOscBWidth, kButtonOscBHeight);
-        break;
     }
 }
 
-void Controller::lcd_drawInfo_OscLfo_Select(Osc &osc_, Lfo &lfo_, bool selected) {
-    const RGB16Color *palettePtr;
-    const uint8_t *dataPtr;
+void Controller::lcd_drawInfo_OscLfo_Select(Osc& osc_, Lfo& lfo_, bool selected) {
+    const RGB16Color* palettePtr;
+    const uint8_t* dataPtr;
     uint16_t xPos;
 
     switch (osc_.number) {
-    case 0:
-        palettePtr = (const RGB16Color *)(RAM_BUTTON_OSC_A_LFO_PALETTE_ADDRESS);
-        (selected)
-            ? dataPtr = (const uint8_t *)(RAM_BUTTON_OSC_A_LFO_ON_DATA_ADDRESS)
-            : dataPtr = (const uint8_t *)(RAM_BUTTON_OSC_A_LFO_OFF_DATA_ADDRESS);
-        lcd.drawRGB16Image(palettePtr, dataPtr, 64, kButtonOscALfoX[lfo_.number], kButtonLfoY, kButtonLfoWidth, kButtonLfoHeight);
-        break;
+        case 0:
+            palettePtr = (const RGB16Color*)(RAM_BUTTON_OSC_A_LFO_PALETTE_ADDRESS);
+            (selected)
+                ? dataPtr = (const uint8_t*)(RAM_BUTTON_OSC_A_LFO_ON_DATA_ADDRESS)
+                : dataPtr = (const uint8_t*)(RAM_BUTTON_OSC_A_LFO_OFF_DATA_ADDRESS);
+            lcd.drawRGB16Image(palettePtr, dataPtr, 64, kButtonOscALfoX[lfo_.number], kButtonLfoY, kButtonLfoWidth, kButtonLfoHeight);
+            break;
 
-    case 1:
-        palettePtr = (const RGB16Color *)(RAM_BUTTON_OSC_B_LFO_PALETTE_ADDRESS);
-        (selected)
-            ? dataPtr = (const uint8_t *)(RAM_BUTTON_OSC_B_LFO_ON_DATA_ADDRESS)
-            : dataPtr = (const uint8_t *)(RAM_BUTTON_OSC_B_LFO_OFF_DATA_ADDRESS);
-        lcd.drawRGB16Image(palettePtr, dataPtr, 64, kButtonOscBLfoX[lfo_.number], kButtonLfoY, kButtonLfoWidth, kButtonLfoHeight);
-        break;
+        case 1:
+            palettePtr = (const RGB16Color*)(RAM_BUTTON_OSC_B_LFO_PALETTE_ADDRESS);
+            (selected)
+                ? dataPtr = (const uint8_t*)(RAM_BUTTON_OSC_B_LFO_ON_DATA_ADDRESS)
+                : dataPtr = (const uint8_t*)(RAM_BUTTON_OSC_B_LFO_OFF_DATA_ADDRESS);
+            lcd.drawRGB16Image(palettePtr, dataPtr, 64, kButtonOscBLfoX[lfo_.number], kButtonLfoY, kButtonLfoWidth, kButtonLfoHeight);
+            break;
     }
 }
 
-void Controller::lcd_drawInfo_Osc_ActiveData(Osc &osc_) {
+void Controller::lcd_drawInfo_Osc_ActiveData(Osc& osc_) {
     uint16_t xPos;
     uint16_t yPos;
 
@@ -6353,31 +6963,31 @@ void Controller::lcd_drawInfo_Osc_ActiveData(Osc &osc_) {
     RGB16Color backColor;
 
     switch (osc_.number) {
-    case 0:
-        xPos = kInfoStartX + 128;
-        yPos = kInfoStartY + 24;
-        foreColor = GREEN;
-        backColor = BLACK;
-        break;
+        case 0:
+            xPos = kInfoStartX + 128;
+            yPos = kInfoStartY + 24;
+            foreColor = GREEN;
+            backColor = BLACK;
+            break;
 
-    case 1:
-        xPos = kInfoStartX + 356;
-        yPos = kInfoStartY + 24;
-        foreColor = CYAN;
-        backColor = BLACK;
-        break;
+        case 1:
+            xPos = kInfoStartX + 356;
+            yPos = kInfoStartY + 24;
+            foreColor = CYAN;
+            backColor = BLACK;
+            break;
     }
 
     lcd.setForeColor(foreColor);
     lcd.setBackColor(backColor);
     lcd.setFont(FONT_05x07);
     lcd.setAlignment(LEFT);
-    const char *textPtr;
+    const char* textPtr;
     (osc_.active) ? textPtr = kDataShortLOn : textPtr = kDataShortLOff;
     lcd.drawText(textPtr, kMenuDataShortTextSize, xPos, yPos);
 }
 
-void Controller::lcd_drawInfo_Osc_WavetableData(Osc &osc_) {
+void Controller::lcd_drawInfo_Osc_WavetableData(Osc& osc_) {
     uint16_t xPos;
     uint16_t yPos;
 
@@ -6385,19 +6995,19 @@ void Controller::lcd_drawInfo_Osc_WavetableData(Osc &osc_) {
     RGB16Color backColor;
 
     switch (osc_.number) {
-    case 0:
-        xPos = kInfoStartX + 250;
-        yPos = kInfoStartY + 24;
-        foreColor = GREEN;
-        backColor = BLACK;
-        break;
+        case 0:
+            xPos = kInfoStartX + 250;
+            yPos = kInfoStartY + 24;
+            foreColor = GREEN;
+            backColor = BLACK;
+            break;
 
-    case 1:
-        xPos = kInfoStartX + 478;
-        yPos = kInfoStartY + 24;
-        foreColor = CYAN;
-        backColor = BLACK;
-        break;
+        case 1:
+            xPos = kInfoStartX + 478;
+            yPos = kInfoStartY + 24;
+            foreColor = CYAN;
+            backColor = BLACK;
+            break;
     }
 
     lcd.setForeColor(foreColor);
@@ -6407,7 +7017,7 @@ void Controller::lcd_drawInfo_Osc_WavetableData(Osc &osc_) {
     lcd.drawText(osc_.wavetableLoadedData.nameShortR, 10, xPos, yPos);
 }
 
-void Controller::lcd_drawInfo_Osc_LevelData(Osc &osc_) {
+void Controller::lcd_drawInfo_Osc_LevelData(Osc& osc_) {
     uint16_t xPos;
     uint16_t yPos;
 
@@ -6415,19 +7025,19 @@ void Controller::lcd_drawInfo_Osc_LevelData(Osc &osc_) {
     RGB16Color backColor;
 
     switch (osc_.number) {
-    case 0:
-        xPos = kInfoStartX + 128;
-        yPos = kInfoStartY + 104;
-        foreColor = GREEN;
-        backColor = BLACK;
-        break;
+        case 0:
+            xPos = kInfoStartX + 128;
+            yPos = kInfoStartY + 104;
+            foreColor = GREEN;
+            backColor = BLACK;
+            break;
 
-    case 1:
-        xPos = kInfoStartX + 356;
-        yPos = kInfoStartY + 104;
-        foreColor = CYAN;
-        backColor = BLACK;
-        break;
+        case 1:
+            xPos = kInfoStartX + 356;
+            yPos = kInfoStartY + 104;
+            foreColor = CYAN;
+            backColor = BLACK;
+            break;
     }
 
     lcd.setForeColor(foreColor);
@@ -6439,7 +7049,7 @@ void Controller::lcd_drawInfo_Osc_LevelData(Osc &osc_) {
     lcd.drawText(kData, kMenuDataShortTextSize, xPos, yPos);
 }
 
-void Controller::lcd_drawInfo_Osc_TuneData(Osc &osc_) {
+void Controller::lcd_drawInfo_Osc_TuneData(Osc& osc_) {
     uint16_t xPos;
     uint16_t yPos;
 
@@ -6447,19 +7057,19 @@ void Controller::lcd_drawInfo_Osc_TuneData(Osc &osc_) {
     RGB16Color backColor;
 
     switch (osc_.number) {
-    case 0:
-        xPos = kInfoStartX + 292;
-        yPos = kInfoStartY + 104;
-        foreColor = GREEN;
-        backColor = BLACK;
-        break;
+        case 0:
+            xPos = kInfoStartX + 292;
+            yPos = kInfoStartY + 104;
+            foreColor = GREEN;
+            backColor = BLACK;
+            break;
 
-    case 1:
-        xPos = kInfoStartX + 520;
-        yPos = kInfoStartY + 104;
-        foreColor = CYAN;
-        backColor = BLACK;
-        break;
+        case 1:
+            xPos = kInfoStartX + 520;
+            yPos = kInfoStartY + 104;
+            foreColor = CYAN;
+            backColor = BLACK;
+            break;
     }
 
     lcd.setForeColor(foreColor);
@@ -6469,7 +7079,7 @@ void Controller::lcd_drawInfo_Osc_TuneData(Osc &osc_) {
     lcd.drawText(kOscTuneDataLibrary[osc_.tune].nameShortR, kMenuDataShortTextSize, xPos, yPos);
 }
 
-void Controller::lcd_drawInfo_Osc_PhaseData(Osc &osc_) {
+void Controller::lcd_drawInfo_Osc_PhaseData(Osc& osc_) {
     RGB16Color foreColor;
     RGB16Color backColor;
 
@@ -6483,15 +7093,15 @@ void Controller::lcd_drawInfo_Osc_PhaseData(Osc &osc_) {
     }
 
     switch (osc_.number) {
-    case 0:
-        foreColor = GREEN;
-        backColor = BLACK;
-        break;
+        case 0:
+            foreColor = GREEN;
+            backColor = BLACK;
+            break;
 
-    case 1:
-        foreColor = CYAN;
-        backColor = BLACK;
-        break;
+        case 1:
+            foreColor = CYAN;
+            backColor = BLACK;
+            break;
     }
 
     lcd.setForeColor(foreColor);
@@ -6503,7 +7113,7 @@ void Controller::lcd_drawInfo_Osc_PhaseData(Osc &osc_) {
     lcd.drawVLine(kInfoPhaseX1[osc_.number][osc_.phase], kInfoPhaseY1, 3);
 }
 
-void Controller::lcd_drawInfo_Osc_GraphData(Osc &osc_) {
+void Controller::lcd_drawInfo_Osc_GraphData(Osc& osc_) {
     uint16_t xPos;
     uint16_t yPos;
 
@@ -6511,19 +7121,19 @@ void Controller::lcd_drawInfo_Osc_GraphData(Osc &osc_) {
     RGB16Color backColor;
 
     switch (osc_.number) {
-    case 0:
-        xPos = kInfoStartX + 128;
-        yPos = kInfoStartY + 45;
-        foreColor = GREEN;
-        backColor = BLACK;
-        break;
+        case 0:
+            xPos = kInfoStartX + 128;
+            yPos = kInfoStartY + 45;
+            foreColor = GREEN;
+            backColor = BLACK;
+            break;
 
-    case 1:
-        xPos = kInfoStartX + 356;
-        yPos = kInfoStartY + 45;
-        foreColor = CYAN;
-        backColor = BLACK;
-        break;
+        case 1:
+            xPos = kInfoStartX + 356;
+            yPos = kInfoStartY + 45;
+            foreColor = CYAN;
+            backColor = BLACK;
+            break;
     }
 
     lcd.setForeColor(foreColor);
@@ -6592,7 +7202,7 @@ void Controller::lcd_drawInfo_Osc_GraphData(Osc &osc_) {
     }
 }
 
-void Controller::lcd_drawInfo_OscLfo_ActiveData(Osc &osc_, Lfo &lfo_) {
+void Controller::lcd_drawInfo_OscLfo_ActiveData(Osc& osc_, Lfo& lfo_) {
     uint16_t xPos;
     uint16_t yPos;
 
@@ -6600,47 +7210,47 @@ void Controller::lcd_drawInfo_OscLfo_ActiveData(Osc &osc_, Lfo &lfo_) {
     RGB16Color backColor;
 
     switch (osc_.number) {
-    case 0:
-        switch (lfo_.number) {
         case 0:
-            xPos = kInfoStartX + 128;
+            switch (lfo_.number) {
+                case 0:
+                    xPos = kInfoStartX + 128;
+                    break;
+
+                case 1:
+                    xPos = kInfoStartX + 237;
+                    break;
+            }
+            yPos = kInfoStartY + 133;
+            foreColor = GREEN;
+            backColor = BLACK;
             break;
 
         case 1:
-            xPos = kInfoStartX + 237;
-            break;
-        }
-        yPos = kInfoStartY + 133;
-        foreColor = GREEN;
-        backColor = BLACK;
-        break;
+            switch (lfo_.number) {
+                case 0:
+                    xPos = kInfoStartX + 356;
+                    break;
 
-    case 1:
-        switch (lfo_.number) {
-        case 0:
-            xPos = kInfoStartX + 356;
+                case 1:
+                    xPos = kInfoStartX + 465;
+                    break;
+            }
+            yPos = kInfoStartY + 133;
+            foreColor = CYAN;
+            backColor = BLACK;
             break;
-
-        case 1:
-            xPos = kInfoStartX + 465;
-            break;
-        }
-        yPos = kInfoStartY + 133;
-        foreColor = CYAN;
-        backColor = BLACK;
-        break;
     }
 
     lcd.setForeColor(foreColor);
     lcd.setBackColor(backColor);
     lcd.setFont(FONT_05x07);
     lcd.setAlignment(LEFT);
-    const char *textPtr;
+    const char* textPtr;
     (lfo_.active) ? textPtr = kDataShortLOn : textPtr = kDataShortLOff;
     lcd.drawText(textPtr, kMenuDataShortTextSize, xPos, yPos);
 }
 
-void Controller::lcd_drawInfo_OscLfo_TypeData(Osc &osc_, Lfo &lfo_) {
+void Controller::lcd_drawInfo_OscLfo_TypeData(Osc& osc_, Lfo& lfo_) {
     uint16_t xPos;
     uint16_t yPos;
 
@@ -6648,35 +7258,35 @@ void Controller::lcd_drawInfo_OscLfo_TypeData(Osc &osc_, Lfo &lfo_) {
     RGB16Color backColor;
 
     switch (osc_.number) {
-    case 0:
-        switch (lfo_.number) {
         case 0:
-            xPos = kInfoStartX + 183;
+            switch (lfo_.number) {
+                case 0:
+                    xPos = kInfoStartX + 183;
+                    break;
+
+                case 1:
+                    xPos = kInfoStartX + 292;
+                    break;
+            }
+            yPos = kInfoStartY + 133;
+            foreColor = GREEN;
+            backColor = BLACK;
             break;
 
         case 1:
-            xPos = kInfoStartX + 292;
-            break;
-        }
-        yPos = kInfoStartY + 133;
-        foreColor = GREEN;
-        backColor = BLACK;
-        break;
+            switch (lfo_.number) {
+                case 0:
+                    xPos = kInfoStartX + 411;
+                    break;
 
-    case 1:
-        switch (lfo_.number) {
-        case 0:
-            xPos = kInfoStartX + 411;
+                case 1:
+                    xPos = kInfoStartX + 520;
+                    break;
+            }
+            yPos = kInfoStartY + 133;
+            foreColor = CYAN;
+            backColor = BLACK;
             break;
-
-        case 1:
-            xPos = kInfoStartX + 520;
-            break;
-        }
-        yPos = kInfoStartY + 133;
-        foreColor = CYAN;
-        backColor = BLACK;
-        break;
     }
 
     lcd.setForeColor(foreColor);
@@ -6686,7 +7296,7 @@ void Controller::lcd_drawInfo_OscLfo_TypeData(Osc &osc_, Lfo &lfo_) {
     lcd.drawText(kLfoTypeDataLibrary[lfo_.type].nameShortR, kMenuDataShortTextSize, xPos, yPos);
 }
 
-void Controller::lcd_drawInfo_OscLfo_TargetData(Osc &osc_, Lfo &lfo_) {
+void Controller::lcd_drawInfo_OscLfo_TargetData(Osc& osc_, Lfo& lfo_) {
     uint16_t xPos;
     uint16_t yPos;
 
@@ -6694,35 +7304,35 @@ void Controller::lcd_drawInfo_OscLfo_TargetData(Osc &osc_, Lfo &lfo_) {
     RGB16Color backColor;
 
     switch (osc_.number) {
-    case 0:
-        switch (lfo_.number) {
         case 0:
-            xPos = kInfoStartX + 128;
+            switch (lfo_.number) {
+                case 0:
+                    xPos = kInfoStartX + 128;
+                    break;
+
+                case 1:
+                    xPos = kInfoStartX + 237;
+                    break;
+            }
+            yPos = kInfoStartY + 213;
+            foreColor = GREEN;
+            backColor = BLACK;
             break;
 
         case 1:
-            xPos = kInfoStartX + 237;
-            break;
-        }
-        yPos = kInfoStartY + 213;
-        foreColor = GREEN;
-        backColor = BLACK;
-        break;
+            switch (lfo_.number) {
+                case 0:
+                    xPos = kInfoStartX + 356;
+                    break;
 
-    case 1:
-        switch (lfo_.number) {
-        case 0:
-            xPos = kInfoStartX + 356;
+                case 1:
+                    xPos = kInfoStartX + 465;
+                    break;
+            }
+            yPos = kInfoStartY + 213;
+            foreColor = CYAN;
+            backColor = BLACK;
             break;
-
-        case 1:
-            xPos = kInfoStartX + 465;
-            break;
-        }
-        yPos = kInfoStartY + 213;
-        foreColor = CYAN;
-        backColor = BLACK;
-        break;
     }
 
     lcd.setForeColor(foreColor);
@@ -6732,7 +7342,7 @@ void Controller::lcd_drawInfo_OscLfo_TargetData(Osc &osc_, Lfo &lfo_) {
     lcd.drawText(kLfoTargetDataLibrary[lfo_.target].nameShortL, kMenuDataShortTextSize, xPos, yPos);
 }
 
-void Controller::lcd_drawInfo_OscLfo_RateData(Osc &osc_, Lfo &lfo_) {
+void Controller::lcd_drawInfo_OscLfo_RateData(Osc& osc_, Lfo& lfo_) {
     uint16_t xPos;
     uint16_t yPos;
 
@@ -6740,35 +7350,35 @@ void Controller::lcd_drawInfo_OscLfo_RateData(Osc &osc_, Lfo &lfo_) {
     RGB16Color backColor;
 
     switch (osc_.number) {
-    case 0:
-        switch (lfo_.number) {
         case 0:
-            xPos = kInfoStartX + 183;
+            switch (lfo_.number) {
+                case 0:
+                    xPos = kInfoStartX + 183;
+                    break;
+
+                case 1:
+                    xPos = kInfoStartX + 292;
+                    break;
+            }
+            yPos = kInfoStartY + 213;
+            foreColor = GREEN;
+            backColor = BLACK;
             break;
 
         case 1:
-            xPos = kInfoStartX + 292;
-            break;
-        }
-        yPos = kInfoStartY + 213;
-        foreColor = GREEN;
-        backColor = BLACK;
-        break;
+            switch (lfo_.number) {
+                case 0:
+                    xPos = kInfoStartX + 411;
+                    break;
 
-    case 1:
-        switch (lfo_.number) {
-        case 0:
-            xPos = kInfoStartX + 411;
+                case 1:
+                    xPos = kInfoStartX + 520;
+                    break;
+            }
+            yPos = kInfoStartY + 213;
+            foreColor = CYAN;
+            backColor = BLACK;
             break;
-
-        case 1:
-            xPos = kInfoStartX + 520;
-            break;
-        }
-        yPos = kInfoStartY + 213;
-        foreColor = CYAN;
-        backColor = BLACK;
-        break;
     }
 
     lcd.setForeColor(foreColor);
@@ -6778,37 +7388,37 @@ void Controller::lcd_drawInfo_OscLfo_RateData(Osc &osc_, Lfo &lfo_) {
     lcd.drawText(kLfoRateDataLibrary[lfo_.rate].nameShortR, kMenuDataShortTextSize, xPos, yPos);
 }
 
-void Controller::lcd_drawInfo_OscLfo_GraphData(Osc &osc_, Lfo &lfo_) {
-    const RGB16Color *indexPtr;
-    const uint8_t *dataPtr;
+void Controller::lcd_drawInfo_OscLfo_GraphData(Osc& osc_, Lfo& lfo_) {
+    const RGB16Color* indexPtr;
+    const uint8_t* dataPtr;
 
     switch (osc_.number) {
-    case 0:
-        indexPtr = (const RGB16Color *)(RAM_GRAPH_LFO_A_PALETTE_ADDRESS);
-        (lfo_.active)
-            ? dataPtr = (const uint8_t *)(RAM_GRAPH_LFO_A_DATA_ADDRESS + (kInfoGraphWidth * kInfoGraphHeight * (lfo_.type + 1)))
-            : dataPtr = (const uint8_t *)(RAM_GRAPH_LFO_A_DATA_ADDRESS);
-        lcd.drawRGB16Image(indexPtr, dataPtr, 64, kInfoOscLfoGraphX[osc_.number][lfo_.number], kInfoOscLfoGraphY, kInfoGraphWidth, kInfoGraphHeight);
-        break;
+        case 0:
+            indexPtr = (const RGB16Color*)(RAM_GRAPH_LFO_A_PALETTE_ADDRESS);
+            (lfo_.active)
+                ? dataPtr = (const uint8_t*)(RAM_GRAPH_LFO_A_DATA_ADDRESS + (kInfoGraphWidth * kInfoGraphHeight * (lfo_.type + 1)))
+                : dataPtr = (const uint8_t*)(RAM_GRAPH_LFO_A_DATA_ADDRESS);
+            lcd.drawRGB16Image(indexPtr, dataPtr, 64, kInfoOscLfoGraphX[osc_.number][lfo_.number], kInfoOscLfoGraphY, kInfoGraphWidth, kInfoGraphHeight);
+            break;
 
-    case 1:
-        indexPtr = (const RGB16Color *)(RAM_GRAPH_LFO_B_PALETTE_ADDRESS);
-        (lfo_.active)
-            ? dataPtr = (const uint8_t *)(RAM_GRAPH_LFO_B_DATA_ADDRESS + (kInfoGraphWidth * kInfoGraphHeight * (lfo_.type + 1)))
-            : dataPtr = (const uint8_t *)(RAM_GRAPH_LFO_B_DATA_ADDRESS);
-        lcd.drawRGB16Image(indexPtr, dataPtr, 64, kInfoOscLfoGraphX[osc_.number][lfo_.number], kInfoOscLfoGraphY, kInfoGraphWidth, kInfoGraphHeight);
-        break;
+        case 1:
+            indexPtr = (const RGB16Color*)(RAM_GRAPH_LFO_B_PALETTE_ADDRESS);
+            (lfo_.active)
+                ? dataPtr = (const uint8_t*)(RAM_GRAPH_LFO_B_DATA_ADDRESS + (kInfoGraphWidth * kInfoGraphHeight * (lfo_.type + 1)))
+                : dataPtr = (const uint8_t*)(RAM_GRAPH_LFO_B_DATA_ADDRESS);
+            lcd.drawRGB16Image(indexPtr, dataPtr, 64, kInfoOscLfoGraphX[osc_.number][lfo_.number], kInfoOscLfoGraphY, kInfoGraphWidth, kInfoGraphHeight);
+            break;
     }
 }
 
 // info filter
 
 void Controller::lcd_drawInfo_Filter_Select(uint8_t filterNum_, bool selected) {
-    const RGB16Color *palettePtr;
-    const uint8_t *dataPtr;
+    const RGB16Color* palettePtr;
+    const uint8_t* dataPtr;
 
-    palettePtr = (const RGB16Color *)(RAM_BUTTON_FILTER_PALETTE_ADDRESS);
-    (selected) ? dataPtr = (const uint8_t *)(RAM_BUTTON_FILTER_ON_DATA_ADDRESS) : dataPtr = (const uint8_t *)(RAM_BUTTON_FILTER_OFF_DATA_ADDRESS);
+    palettePtr = (const RGB16Color*)(RAM_BUTTON_FILTER_PALETTE_ADDRESS);
+    (selected) ? dataPtr = (const uint8_t*)(RAM_BUTTON_FILTER_ON_DATA_ADDRESS) : dataPtr = (const uint8_t*)(RAM_BUTTON_FILTER_OFF_DATA_ADDRESS);
 
     lcd.drawRGB16Image(palettePtr, dataPtr, 64, kButtonFilterX[filterNum_], kButtonFilterY[filterNum_], kButtonFilterWidth, kButtonFilterHeight);
 }
@@ -6818,13 +7428,13 @@ void Controller::lcd_drawInfo_Filter_ActiveData(uint8_t filterNum_) {
     uint16_t yPos;
 
     switch (filterNum_) {
-    case 0:
-        yPos = kInfoStartY + 24;
-        break;
+        case 0:
+            yPos = kInfoStartY + 24;
+            break;
 
-    case 1:
-        yPos = kInfoStartY + 133;
-        break;
+        case 1:
+            yPos = kInfoStartY + 133;
+            break;
     }
 
     RGB16Color foreColor = LBLUE;
@@ -6834,7 +7444,7 @@ void Controller::lcd_drawInfo_Filter_ActiveData(uint8_t filterNum_) {
     lcd.setBackColor(backColor);
     lcd.setFont(FONT_05x07);
     lcd.setAlignment(LEFT);
-    const char *textPtr;
+    const char* textPtr;
     (filter[filterNum_].active) ? textPtr = kDataShortLOn : textPtr = kDataShortLOff;
     lcd.drawText(textPtr, kMenuDataShortTextSize, xPos, yPos);
 }
@@ -6844,13 +7454,13 @@ void Controller::lcd_drawInfo_Filter_TypeData(uint8_t filterNum_) {
     uint16_t yPos;
 
     switch (filterNum_) {
-    case 0:
-        yPos = kInfoStartY + 24;
-        break;
+        case 0:
+            yPos = kInfoStartY + 24;
+            break;
 
-    case 1:
-        yPos = kInfoStartY + 133;
-        break;
+        case 1:
+            yPos = kInfoStartY + 133;
+            break;
     }
 
     RGB16Color foreColor = LBLUE;
@@ -6863,15 +7473,15 @@ void Controller::lcd_drawInfo_Filter_TypeData(uint8_t filterNum_) {
 
     lcd.drawText(kFilterTypeDataLibrary[filter[filterNum_].type].nameShortR, kMenuDataShortTextSize, xPos, yPos);
 
-    const RGB16Color *indexPtr;
-    const uint8_t *dataPtr;
+    const RGB16Color* indexPtr;
+    const uint8_t* dataPtr;
 
     if (filter[filterNum_].active) {
-        indexPtr = (const RGB16Color *)(RAM_GRAPH_FILTER_PALETTE_ADDRESS);
-        dataPtr = (const uint8_t *)(RAM_GRAPH_FILTER_DATA_ADDRESS + (kInfoGraphWidth * kInfoGraphHeight * filter[filterNum_].type));
+        indexPtr = (const RGB16Color*)(RAM_GRAPH_FILTER_PALETTE_ADDRESS);
+        dataPtr = (const uint8_t*)(RAM_GRAPH_FILTER_DATA_ADDRESS + (kInfoGraphWidth * kInfoGraphHeight * filter[filterNum_].type));
     } else {
-        indexPtr = (const RGB16Color *)(RAM_GRAPH_FILTER_PALETTE_ADDRESS);
-        dataPtr = (const uint8_t *)(RAM_GRAPH_FILTER_DATA_ADDRESS);
+        indexPtr = (const RGB16Color*)(RAM_GRAPH_FILTER_PALETTE_ADDRESS);
+        dataPtr = (const uint8_t*)(RAM_GRAPH_FILTER_DATA_ADDRESS);
     }
 
     lcd.drawRGB16Image(indexPtr, dataPtr, 64, kInfoFilterGraphX[filterNum_], kInfoFilterGraphY[filterNum_], kInfoGraphWidth, kInfoGraphHeight);
@@ -6882,13 +7492,13 @@ void Controller::lcd_drawInfo_Filter_FreqData(uint8_t filterNum_) {
     uint16_t yPos;
 
     switch (filterNum_) {
-    case 0:
-        yPos = kInfoStartY + 104;
-        break;
+        case 0:
+            yPos = kInfoStartY + 104;
+            break;
 
-    case 1:
-        yPos = kInfoStartY + 213;
-        break;
+        case 1:
+            yPos = kInfoStartY + 213;
+            break;
     }
 
     RGB16Color foreColor = LBLUE;
@@ -6907,13 +7517,13 @@ void Controller::lcd_drawInfo_Filter_ResData(uint8_t filterNum_) {
     uint16_t yPos;
 
     switch (filterNum_) {
-    case 0:
-        yPos = kInfoStartY + 104;
-        break;
+        case 0:
+            yPos = kInfoStartY + 104;
+            break;
 
-    case 1:
-        yPos = kInfoStartY + 213;
-        break;
+        case 1:
+            yPos = kInfoStartY + 213;
+            break;
     }
 
     RGB16Color foreColor = LBLUE;
@@ -6930,13 +7540,13 @@ void Controller::lcd_drawInfo_Filter_ResData(uint8_t filterNum_) {
 // info envelope
 
 void Controller::lcd_drawInfo_Envelope_Select(bool selected) {
-    const RGB16Color *palettePtr;
-    const uint8_t *dataPtr;
+    const RGB16Color* palettePtr;
+    const uint8_t* dataPtr;
 
-    palettePtr = (const RGB16Color *)(RAM_BUTTON_ENVELOPE_PALETTE_ADDRESS);
+    palettePtr = (const RGB16Color*)(RAM_BUTTON_ENVELOPE_PALETTE_ADDRESS);
     (selected)
-        ? dataPtr = (const uint8_t *)(RAM_BUTTON_ENVELOPE_ON_DATA_ADDRESS)
-        : dataPtr = (const uint8_t *)(RAM_BUTTON_ENVELOPE_OFF_DATA_ADDRESS);
+        ? dataPtr = (const uint8_t*)(RAM_BUTTON_ENVELOPE_ON_DATA_ADDRESS)
+        : dataPtr = (const uint8_t*)(RAM_BUTTON_ENVELOPE_OFF_DATA_ADDRESS);
 
     lcd.drawRGB16Image(palettePtr, dataPtr, 64, kButtonEnvelopeX, kButtonEnvelopeY, kButtonEnvelopeWidth, kButtonEnvelopeHeight);
 }
@@ -6952,7 +7562,7 @@ void Controller::lcd_drawInfo_Envelope_ActiveData() {
     lcd.setBackColor(backColor);
     lcd.setFont(FONT_05x07);
     lcd.setAlignment(LEFT);
-    const char *textPtr;
+    const char* textPtr;
     (envelope.active) ? textPtr = kDataShortLOn : textPtr = kDataShortLOff;
     lcd.drawText(textPtr, kMenuDataShortTextSize, xPos, yPos);
 }
@@ -6970,15 +7580,15 @@ void Controller::lcd_drawInfo_Envelope_TypeData() {
     lcd.setAlignment(LEFT);
     lcd.drawText(kEnvelopeTypeDataLibrary[envelope.type].nameShortR, kMenuDataShortTextSize, xPos, yPos);
 
-    const RGB16Color *indexPtr;
-    const uint8_t *dataPtr;
+    const RGB16Color* indexPtr;
+    const uint8_t* dataPtr;
 
     if (envelope.active) {
-        indexPtr = (const RGB16Color *)(RAM_GRAPH_ENVELOPE_PALETTE_ADDRESS);
-        dataPtr = (const uint8_t *)(RAM_GRAPH_ENVELOPE_DATA_ADDRESS + (kInfoGraphWidth * kInfoGraphHeight * envelope.type));
+        indexPtr = (const RGB16Color*)(RAM_GRAPH_ENVELOPE_PALETTE_ADDRESS);
+        dataPtr = (const uint8_t*)(RAM_GRAPH_ENVELOPE_DATA_ADDRESS + (kInfoGraphWidth * kInfoGraphHeight * envelope.type));
     } else {
-        indexPtr = (const RGB16Color *)(RAM_GRAPH_ENVELOPE_PALETTE_ADDRESS);
-        dataPtr = (const uint8_t *)(RAM_GRAPH_ENVELOPE_DATA_ADDRESS);
+        indexPtr = (const RGB16Color*)(RAM_GRAPH_ENVELOPE_PALETTE_ADDRESS);
+        dataPtr = (const uint8_t*)(RAM_GRAPH_ENVELOPE_DATA_ADDRESS);
     }
 
     lcd.drawRGB16Image(indexPtr, dataPtr, 64, kInfoEnvelopeGraphX, kInfoEnvelopeGraphY, kInfoGraphWidth, kInfoGraphHeight);
@@ -7011,15 +7621,15 @@ void Controller::lcd_drawInfo_Envelope_AttackTimeData() {
     lcd.setAlignment(LEFT);
 
     switch (envelope.type) {
-    case ENV_OFF:
-        lcd.drawText(kDataDashShortR, kMenuDataShortTextSize, xPos, yPos);
-        break;
+        case ENV_OFF:
+            lcd.drawText(kDataDashShortR, kMenuDataShortTextSize, xPos, yPos);
+            break;
 
-    case ENV_ADSR:
-    case ENV_ASR:
-    case ENV_AD:
-        lcd.drawText(kEnvelopeTimeDataLibrary[envelope.attackTime].nameShortR, kMenuDataShortTextSize, xPos, yPos);
-        break;
+        case ENV_ADSR:
+        case ENV_ASR:
+        case ENV_AD:
+            lcd.drawText(kEnvelopeTimeDataLibrary[envelope.attackTime].nameShortR, kMenuDataShortTextSize, xPos, yPos);
+            break;
     }
 }
 
@@ -7036,15 +7646,15 @@ void Controller::lcd_drawInfo_Envelope_DecayTimeData() {
     lcd.setAlignment(LEFT);
 
     switch (envelope.type) {
-    case ENV_OFF:
-    case ENV_ASR:
-        lcd.drawText(kDataDashShortR, kMenuDataShortTextSize, xPos, yPos);
-        break;
+        case ENV_OFF:
+        case ENV_ASR:
+            lcd.drawText(kDataDashShortR, kMenuDataShortTextSize, xPos, yPos);
+            break;
 
-    case ENV_ADSR:
-    case ENV_AD:
-        lcd.drawText(kEnvelopeTimeDataLibrary[envelope.decayTime].nameShortR, kMenuDataShortTextSize, xPos, yPos);
-        break;
+        case ENV_ADSR:
+        case ENV_AD:
+            lcd.drawText(kEnvelopeTimeDataLibrary[envelope.decayTime].nameShortR, kMenuDataShortTextSize, xPos, yPos);
+            break;
     }
 }
 
@@ -7061,15 +7671,15 @@ void Controller::lcd_drawInfo_Envelope_SustainLevelData() {
     lcd.setAlignment(LEFT);
 
     switch (envelope.type) {
-    case ENV_OFF:
-    case ENV_ASR:
-    case ENV_AD:
-        lcd.drawText(kDataDashShortR, kMenuDataShortTextSize, xPos, yPos);
-        break;
+        case ENV_OFF:
+        case ENV_ASR:
+        case ENV_AD:
+            lcd.drawText(kDataDashShortR, kMenuDataShortTextSize, xPos, yPos);
+            break;
 
-    case ENV_ADSR:
-        lcd.drawText(kEnvelopeLevelDataLibrary[envelope.sustainLevel].nameShortR, kMenuDataShortTextSize, xPos, yPos);
-        break;
+        case ENV_ADSR:
+            lcd.drawText(kEnvelopeLevelDataLibrary[envelope.sustainLevel].nameShortR, kMenuDataShortTextSize, xPos, yPos);
+            break;
     }
 }
 
@@ -7086,15 +7696,15 @@ void Controller::lcd_drawInfo_Envelope_ReleaseTimeData() {
     lcd.setAlignment(LEFT);
 
     switch (envelope.type) {
-    case ENV_OFF:
-    case ENV_AD:
-        lcd.drawText(kDataDashShortR, kMenuDataShortTextSize, xPos, yPos);
-        break;
+        case ENV_OFF:
+        case ENV_AD:
+            lcd.drawText(kDataDashShortR, kMenuDataShortTextSize, xPos, yPos);
+            break;
 
-    case ENV_ADSR:
-    case ENV_ASR:
-        lcd.drawText(kEnvelopeTimeDataLibrary[envelope.releaseTime].nameShortR, kMenuDataShortTextSize, xPos, yPos);
-        break;
+        case ENV_ADSR:
+        case ENV_ASR:
+            lcd.drawText(kEnvelopeTimeDataLibrary[envelope.releaseTime].nameShortR, kMenuDataShortTextSize, xPos, yPos);
+            break;
     }
 }
 
@@ -7139,25 +7749,25 @@ void Controller::file_menuRight() {
         lcd_transitionSelect();
 
         switch (menuTab) {
-        case 1:
-            lcd_drawFileBox(1, fileStatus);
-            lcd_drawFile_NewData();
-            lcd_drawFile_LoadData();
-            break;
+            case 1:
+                lcd_drawFileBox(1, fileStatus);
+                lcd_drawFile_NewData();
+                lcd_drawFile_LoadData();
+                break;
 
-        case 2:
-            lcd_clearFileBox(1);
-            lcd_drawFileBox(2, fileStatus);
-            lcd_drawFile_LoadData();
-            lcd_drawFile_SaveData();
-            break;
+            case 2:
+                lcd_clearFileBox(1);
+                lcd_drawFileBox(2, fileStatus);
+                lcd_drawFile_LoadData();
+                lcd_drawFile_SaveData();
+                break;
 
-        case 3:
-            lcd_clearFileBox(2);
-            lcd_drawFileBox(3, fileStatus);
-            lcd_drawFile_SaveData();
-            lcd_drawFile_ClearData();
-            break;
+            case 3:
+                lcd_clearFileBox(2);
+                lcd_drawFileBox(3, fileStatus);
+                lcd_drawFile_SaveData();
+                lcd_drawFile_ClearData();
+                break;
         }
     }
 }
@@ -7171,25 +7781,25 @@ void Controller::file_menuLeft() {
         lcd_transitionSelect();
 
         switch (menuTab) {
-        case 0:
-            lcd_clearFileBox(1);
-            lcd_drawFile_NewData();
-            lcd_drawFile_LoadData();
-            break;
+            case 0:
+                lcd_clearFileBox(1);
+                lcd_drawFile_NewData();
+                lcd_drawFile_LoadData();
+                break;
 
-        case 1:
-            lcd_clearFileBox(2);
-            lcd_drawFileBox(1, fileStatus);
-            lcd_drawFile_LoadData();
-            lcd_drawFile_SaveData();
-            break;
+            case 1:
+                lcd_clearFileBox(2);
+                lcd_drawFileBox(1, fileStatus);
+                lcd_drawFile_LoadData();
+                lcd_drawFile_SaveData();
+                break;
 
-        case 2:
-            lcd_clearFileBox(3);
-            lcd_drawFileBox(2, fileStatus);
-            lcd_drawFile_SaveData();
-            lcd_drawFile_ClearData();
-            break;
+            case 2:
+                lcd_clearFileBox(3);
+                lcd_drawFileBox(2, fileStatus);
+                lcd_drawFile_SaveData();
+                lcd_drawFile_ClearData();
+                break;
         }
     }
 }
@@ -7199,23 +7809,23 @@ void Controller::file_menuUp() {
     sd_checkFile(fileMenuCounter);
 
     switch (menuTab) {
-    case 0:
-        break;
+        case 0:
+            break;
 
-    case 1:
-        lcd_drawFileBox(menuTab, fileStatus);
-        lcd_drawFile_LoadData();
-        break;
+        case 1:
+            lcd_drawFileBox(menuTab, fileStatus);
+            lcd_drawFile_LoadData();
+            break;
 
-    case 2:
-        lcd_drawFileBox(menuTab, fileStatus);
-        lcd_drawFile_SaveData();
-        break;
+        case 2:
+            lcd_drawFileBox(menuTab, fileStatus);
+            lcd_drawFile_SaveData();
+            break;
 
-    case 3:
-        lcd_drawFileBox(menuTab, fileStatus);
-        lcd_drawFile_ClearData();
-        break;
+        case 3:
+            lcd_drawFileBox(menuTab, fileStatus);
+            lcd_drawFile_ClearData();
+            break;
     }
 }
 
@@ -7224,23 +7834,23 @@ void Controller::file_menuDown() {
     sd_checkFile(fileMenuCounter);
 
     switch (menuTab) {
-    case 0:
-        break;
+        case 0:
+            break;
 
-    case 1:
-        lcd_drawFileBox(menuTab, fileStatus);
-        lcd_drawFile_LoadData();
-        break;
+        case 1:
+            lcd_drawFileBox(menuTab, fileStatus);
+            lcd_drawFile_LoadData();
+            break;
 
-    case 2:
-        lcd_drawFileBox(menuTab, fileStatus);
-        lcd_drawFile_SaveData();
-        break;
+        case 2:
+            lcd_drawFileBox(menuTab, fileStatus);
+            lcd_drawFile_SaveData();
+            break;
 
-    case 3:
-        lcd_drawFileBox(menuTab, fileStatus);
-        lcd_drawFile_ClearData();
-        break;
+        case 3:
+            lcd_drawFileBox(menuTab, fileStatus);
+            lcd_drawFile_ClearData();
+            break;
     }
 }
 
@@ -7291,24 +7901,24 @@ void Controller::file_loadAction() {
     setOctave(kInitialOctave);
     activeBankNum = 0;
     lcd_drawBank(activeBankNum, false);
-    
+
     song_reset();
 
     switch (sd_loadFile(fileMenuCounter)) {
-    case SD_OK:
-        alertType = ALERT_LOADSUCCESS;
-        break;
+        case SD_OK:
+            alertType = ALERT_LOADSUCCESS;
+            break;
 
-    case SD_ERROR:
-        alertType = ALERT_LOADERROR;
-        break;
+        case SD_ERROR:
+            alertType = ALERT_LOADERROR;
+            break;
 
-    case SD_ERROR_DETECT:
-        alertType = ALERT_MISSINGWAVETABLE;
-        break;
+        case SD_ERROR_DETECT:
+            alertType = ALERT_MISSINGWAVETABLE;
+            break;
 
-    default:
-        break;
+        default:
+            break;
     }
 
     copyBeatNote = -1;
@@ -7389,25 +7999,25 @@ void Controller::synthkit_menuRight() {
         lcd_transitionSelect();
 
         switch (menuTab) {
-        case 1:
-            lcd_drawFileBox(1, synthkitStatus);
-            lcd_drawSynthkit_NewData();
-            lcd_drawSynthkit_LoadData();
-            break;
+            case 1:
+                lcd_drawFileBox(1, synthkitStatus);
+                lcd_drawSynthkit_NewData();
+                lcd_drawSynthkit_LoadData();
+                break;
 
-        case 2:
-            lcd_clearFileBox(1);
-            lcd_drawFileBox(2, synthkitStatus);
-            lcd_drawSynthkit_LoadData();
-            lcd_drawSynthkit_SaveData();
-            break;
+            case 2:
+                lcd_clearFileBox(1);
+                lcd_drawFileBox(2, synthkitStatus);
+                lcd_drawSynthkit_LoadData();
+                lcd_drawSynthkit_SaveData();
+                break;
 
-        case 3:
-            lcd_clearFileBox(2);
-            lcd_drawFileBox(3, synthkitStatus);
-            lcd_drawSynthkit_SaveData();
-            lcd_drawSynthkit_ClearData();
-            break;
+            case 3:
+                lcd_clearFileBox(2);
+                lcd_drawFileBox(3, synthkitStatus);
+                lcd_drawSynthkit_SaveData();
+                lcd_drawSynthkit_ClearData();
+                break;
         }
     }
 }
@@ -7421,25 +8031,25 @@ void Controller::synthkit_menuLeft() {
         lcd_transitionSelect();
 
         switch (menuTab) {
-        case 0:
-            lcd_clearFileBox(1);
-            lcd_drawSynthkit_NewData();
-            lcd_drawSynthkit_LoadData();
-            break;
+            case 0:
+                lcd_clearFileBox(1);
+                lcd_drawSynthkit_NewData();
+                lcd_drawSynthkit_LoadData();
+                break;
 
-        case 1:
-            lcd_clearFileBox(2);
-            lcd_drawFileBox(1, synthkitStatus);
-            lcd_drawSynthkit_LoadData();
-            lcd_drawSynthkit_SaveData();
-            break;
+            case 1:
+                lcd_clearFileBox(2);
+                lcd_drawFileBox(1, synthkitStatus);
+                lcd_drawSynthkit_LoadData();
+                lcd_drawSynthkit_SaveData();
+                break;
 
-        case 2:
-            lcd_clearFileBox(3);
-            lcd_drawFileBox(2, synthkitStatus);
-            lcd_drawSynthkit_SaveData();
-            lcd_drawSynthkit_ClearData();
-            break;
+            case 2:
+                lcd_clearFileBox(3);
+                lcd_drawFileBox(2, synthkitStatus);
+                lcd_drawSynthkit_SaveData();
+                lcd_drawSynthkit_ClearData();
+                break;
         }
     }
 }
@@ -7449,23 +8059,23 @@ void Controller::synthkit_menuUp() {
     sd_checkSynthkit(synthkitMenuCounter);
 
     switch (menuTab) {
-    case 0:
-        break;
+        case 0:
+            break;
 
-    case 1:
-        lcd_drawFileBox(menuTab, synthkitStatus);
-        lcd_drawSynthkit_LoadData();
-        break;
+        case 1:
+            lcd_drawFileBox(menuTab, synthkitStatus);
+            lcd_drawSynthkit_LoadData();
+            break;
 
-    case 2:
-        lcd_drawFileBox(menuTab, synthkitStatus);
-        lcd_drawSynthkit_SaveData();
-        break;
+        case 2:
+            lcd_drawFileBox(menuTab, synthkitStatus);
+            lcd_drawSynthkit_SaveData();
+            break;
 
-    case 3:
-        lcd_drawFileBox(menuTab, synthkitStatus);
-        lcd_drawSynthkit_ClearData();
-        break;
+        case 3:
+            lcd_drawFileBox(menuTab, synthkitStatus);
+            lcd_drawSynthkit_ClearData();
+            break;
     }
 }
 
@@ -7474,23 +8084,23 @@ void Controller::synthkit_menuDown() {
     sd_checkSynthkit(synthkitMenuCounter);
 
     switch (menuTab) {
-    case 0:
-        break;
+        case 0:
+            break;
 
-    case 1:
-        lcd_drawFileBox(menuTab, synthkitStatus);
-        lcd_drawSynthkit_LoadData();
-        break;
+        case 1:
+            lcd_drawFileBox(menuTab, synthkitStatus);
+            lcd_drawSynthkit_LoadData();
+            break;
 
-    case 2:
-        lcd_drawFileBox(menuTab, synthkitStatus);
-        lcd_drawSynthkit_SaveData();
-        break;
+        case 2:
+            lcd_drawFileBox(menuTab, synthkitStatus);
+            lcd_drawSynthkit_SaveData();
+            break;
 
-    case 3:
-        lcd_drawFileBox(menuTab, synthkitStatus);
-        lcd_drawSynthkit_ClearData();
-        break;
+        case 3:
+            lcd_drawFileBox(menuTab, synthkitStatus);
+            lcd_drawSynthkit_ClearData();
+            break;
     }
 }
 
@@ -7526,20 +8136,20 @@ void Controller::synthkit_loadSelect() {
 void Controller::synthkit_loadAction() {
     lcd_clearAlert();
     switch (sd_loadSynthkit(0, synthkitMenuCounter)) {
-    case SD_OK:
-        alertType = ALERT_LOADSUCCESS;
-        break;
+        case SD_OK:
+            alertType = ALERT_LOADSUCCESS;
+            break;
 
-    case SD_ERROR:
-        alertType = ALERT_LOADERROR;
-        break;
+        case SD_ERROR:
+            alertType = ALERT_LOADERROR;
+            break;
 
-    case SD_ERROR_DETECT:
-        alertType = ALERT_MISSINGWAVETABLE;
-        break;
+        case SD_ERROR_DETECT:
+            alertType = ALERT_MISSINGWAVETABLE;
+            break;
 
-    default:
-        break;
+        default:
+            break;
     }
 
     lcd_drawAlert();
@@ -7610,11 +8220,15 @@ void Controller::system_select() {
 void Controller::system_reset() {
     system_setVolume(kInitialSystemVolume);
     system_setPan(kInitialSystemPan);
-    system_setLimiter(kInitialSystemLimiter);
+    system_setNormalize(kInitialSystemNormalize);
     system_setMidiIn(kInitialSystemMidiIn);
     system_setMidiOut(kInitialSystemMidiOut);
+    system_setMidiInChannel(kInitialSystemMidiInChannel);
+    system_setMidiOutChannel(kInitialSystemMidiOutChannel);
     system_setSyncIn(kInitialSystemSyncIn);
     system_setSyncOut(kInitialSystemSyncOut);
+    system_setSyncInPpqn(kInitialSystemSyncInPpqn);
+    system_setSyncOutPpqn(kInitialSystemSyncOutPpqn);
 }
 
 void Controller::system_menuRight() {
@@ -7629,103 +8243,160 @@ void Controller::system_menuLeft() {
     if (menuTab > kMinMenu8Tab) {
         preMenuTab = menuTab;
         (menuTab == 2) ? menuTab -= 2 : menuTab -= 1;
+        if (menuTab == 3) subMenuTab = 0;
         lcd_transitionSelect();
     }
 }
 
 void Controller::system_menuUp() {
     switch (menuTab) {
-    case 0:
-        if (system.volume < kMaxSystemVolume) {
-            system_setVolume(system.volume + 1);
-        }
-        break;
+        case 0:
+            if (system.volume < kMaxSystemVolume) {
+                system_setVolume(system.volume + 1);
+            }
+            break;
 
-    case 2:
-        if (system.pan < kMaxSystemPan) {
-            system_setPan(system.pan + 1);
-        }
-        break;
+        case 2:
+            if (system.pan < kMaxSystemPan) {
+                system_setPan(system.pan + 1);
+            }
+            break;
 
-    case 3:
-        system_setLimiter(!system.limiter);
-        break;
+        case 3:
+            system_setNormalize(!system.normalize);
+            break;
 
-    case 4:
-        if (system.midiIn < kMaxSystemMidiIn) {
-            system_setMidiIn(system.midiIn + 1);
-        }
-        break;
+        case 4:
+            if (subMenuTab == 1) {
+                if (system.midi.rxChannel < kMaxSystemMidiChannel) {
+                    system_setMidiInChannel(system.midi.rxChannel + 1);
+                }
+            } else {
+                if (system.midiIn < kMaxSystemMidiIn) {
+                    system_setMidiIn(system.midiIn + 1);
+                } else {
+                    system_setMidiIn(kMinSystemMidiIn);
+                }
+            }
+            break;
 
-    case 5:
-        if (system.midiOut < kMaxSystemMidiOut) {
-            system_setMidiOut(system.midiOut + 1);
-        }
-        break;
+        case 5:
+            if (subMenuTab == 1) {
+                if (system.midi.txChannel < kMaxSystemMidiChannel) {
+                    system_setMidiOutChannel(system.midi.txChannel + 1);
+                }
+            } else {
+                if (system.midiOut < kMaxSystemMidiOut) {
+                    system_setMidiOut(system.midiOut + 1);
+                } else {
+                    system_setMidiOut(kMinSystemMidiOut);
+                }
+            }
+            break;
 
-    case 6:
-        if (system.syncIn < kMaxSystemSyncIn) {
-            system_setSyncIn(system.syncIn + 1);
-        } else {
-            system_setSyncIn(kMinSystemSyncIn);
-        }
-        break;
+        case 6:
+            if (subMenuTab == 1) {
+                if (systemSyncInPpqn < kMaxSystemSyncPpqn) {
+                    system_setSyncInPpqn(systemSyncInPpqn + 1);
+                }
+            } else {
+                if (system.syncIn < kMaxSystemSyncIn) {
+                    system_setSyncIn(system.syncIn + 1);
+                } else {
+                    system_setSyncIn(kMinSystemSyncIn);
+                }
+            }
+            break;
 
-    case 7:
-        if (system.syncOut < kMaxSystemSyncOut) {
-            system_setSyncOut(system.syncOut + 1);
-        } else {
-            system_setSyncOut(kMinSystemSyncOut);
-        }
-        break;
+        case 7:
+            if (subMenuTab == 1) {
+                if (systemSyncOutPpqn < kMaxSystemSyncPpqn) {
+                    system_setSyncOutPpqn(systemSyncOutPpqn + 1);
+                }
+            } else {
+                if (system.syncOut < kMaxSystemSyncOut) {
+                    system_setSyncOut(system.syncOut + 1);
+                } else {
+                    system_setSyncOut(kMinSystemSyncOut);
+                }
+            }
+            break;
     }
 }
 
 void Controller::system_menuDown() {
     switch (menuTab) {
-    case 0:
-        if (system.volume > kMinSystemVolume) {
-            system_setVolume(system.volume - 1);
-        }
-        break;
+        case 0:
+            if (system.volume > kMinSystemVolume) {
+                system_setVolume(system.volume - 1);
+            }
+            break;
 
-    case 2:
-        if (system.pan > kMinSystemPan) {
-            system_setPan(system.pan - 1);
-        }
-        break;
+        case 2:
+            if (system.pan > kMinSystemPan) {
+                system_setPan(system.pan - 1);
+            }
+            break;
 
-    case 3:
-        system_setLimiter(!system.limiter);
-        break;
+        case 3:
+            system_setNormalize(!system.normalize);
+            break;
 
-    case 4:
-        if (system.midiIn > kMinSystemMidiIn) {
-            system_setMidiIn(system.midiIn - 1);
-        }
-        break;
+        case 4:
+            if (subMenuTab == 1) {
+                if (system.midi.rxChannel > kMinSystemMidiChannel) {
+                    system_setMidiInChannel(system.midi.rxChannel - 1);
+                }
+            } else {
+                if (system.midiIn > kMinSystemMidiIn) {
+                    system_setMidiIn(system.midiIn - 1);
+                } else {
+                    system_setMidiIn(kMaxSystemMidiIn);
+                }
+            }
+            break;
 
-    case 5:
-        if (system.midiOut > kMinSystemMidiOut) {
-            system_setMidiOut(system.midiOut - 1);
-        }
-        break;
+        case 5:
+            if (subMenuTab == 1) {
+                if (system.midi.txChannel > kMinSystemMidiChannel) {
+                    system_setMidiOutChannel(system.midi.txChannel - 1);
+                }
+            } else {
+                if (system.midiOut > kMinSystemMidiOut) {
+                    system_setMidiOut(system.midiOut - 1);
+                } else {
+                    system_setMidiOut(kMaxSystemMidiOut);
+                }
+            }
+            break;
 
-    case 6:
-        if (system.syncIn > kMinSystemSyncIn) {
-            system_setSyncIn(system.syncIn - 1);
-        } else {
-            system_setSyncIn(kMaxSystemSyncIn);
-        }
-        break;
+        case 6:
+            if (subMenuTab == 1) {
+                if (systemSyncInPpqn > kMinSystemSyncPpqn) {
+                    system_setSyncInPpqn(systemSyncInPpqn - 1);
+                }
+            } else {
+                if (system.syncIn > kMinSystemSyncIn) {
+                    system_setSyncIn(system.syncIn - 1);
+                } else {
+                    system_setSyncIn(kMaxSystemSyncIn);
+                }
+            }
+            break;
 
-    case 7:
-        if (system.syncOut > kMinSystemSyncOut) {
-            system_setSyncOut(system.syncOut - 1);
-        } else {
-            system_setSyncOut(kMaxSystemSyncOut);
-        }
-        break;
+        case 7:
+            if (subMenuTab == 1) {
+                if (systemSyncOutPpqn > kMinSystemSyncPpqn) {
+                    system_setSyncOutPpqn(systemSyncOutPpqn - 1);
+                }
+            } else {
+                if (system.syncOut > kMinSystemSyncOut) {
+                    system_setSyncOut(system.syncOut - 1);
+                } else {
+                    system_setSyncOut(kMaxSystemSyncOut);
+                }
+            }
+            break;
     }
 }
 
@@ -7758,22 +8429,40 @@ void Controller::system_setPan(uint8_t pan_) {
     }
 }
 
-void Controller::system_setLimiter(bool mode_) {
+void Controller::system_setNormalize(bool mode_) {
     // uodate data
-    system.limiter = mode_;
+    system.normalize = mode_;
     // update lcd
     if (menu == SYSTEM_MENU) {
-        lcd_drawSystem_LimiterData();
+        lcd_drawSystem_NormalizeData();
     }
 }
 
 void Controller::system_setMidiIn(uint8_t mode_) {
     if ((mode_ >= kMinSystemMidiIn) && (mode_ <= kMaxSystemMidiIn)) {
-        // update data
         system.midiIn = mode_;
-        system.midi.rxActive = kSystemMidiDataLibrary[system.midiIn].active;
-        system.midi.rxChannel = kSystemMidiDataLibrary[system.midiIn].channel;
-        // update lcd
+        system.midi.rxSync = kSystemMidiDataLibrary[system.midiIn].syncEnabled;
+        system.midi.rxNotes = kSystemMidiDataLibrary[system.midiIn].notesEnabled;
+        system.midi.rxActive = (system.midi.rxSync || system.midi.rxNotes);
+        if (system.syncIn || system.midi.rxSync) {
+            system.sync.slaveMode = true;
+            system.sync.masterMode = false;
+        } else if (system.syncOut || system.midi.txSync) {
+            system.sync.slaveMode = false;
+            system.sync.masterMode = true;
+        } else {
+            system.sync.slaveMode = false;
+            system.sync.masterMode = false;
+        }
+        if (menu == SYSTEM_MENU) {
+            lcd_drawSystem_MidiInData();
+        }
+    }
+}
+
+void Controller::system_setMidiInChannel(uint8_t channel_) {
+    if ((channel_ >= kMinSystemMidiChannel) && (channel_ <= kMaxSystemMidiChannel)) {
+        system.midi.rxChannel = channel_;
         if (menu == SYSTEM_MENU) {
             lcd_drawSystem_MidiInData();
         }
@@ -7782,11 +8471,29 @@ void Controller::system_setMidiIn(uint8_t mode_) {
 
 void Controller::system_setMidiOut(uint8_t mode_) {
     if ((mode_ >= kMinSystemMidiOut) && (mode_ <= kMaxSystemMidiOut)) {
-        // update data
         system.midiOut = mode_;
-        system.midi.txActive = kSystemMidiDataLibrary[system.midiOut].active;
-        system.midi.txChannel = kSystemMidiDataLibrary[system.midiOut].channel;
-        // update lcd
+        system.midi.txSync = kSystemMidiDataLibrary[system.midiOut].syncEnabled;
+        system.midi.txNotes = kSystemMidiDataLibrary[system.midiOut].notesEnabled;
+        system.midi.txActive = (system.midi.txSync || system.midi.txNotes);
+        if (system.syncIn || system.midi.rxSync) {
+            system.sync.slaveMode = true;
+            system.sync.masterMode = false;
+        } else if (system.syncOut || system.midi.txSync) {
+            system.sync.slaveMode = false;
+            system.sync.masterMode = true;
+        } else {
+            system.sync.slaveMode = false;
+            system.sync.masterMode = false;
+        }
+        if (menu == SYSTEM_MENU) {
+            lcd_drawSystem_MidiOutData();
+        }
+    }
+}
+
+void Controller::system_setMidiOutChannel(uint8_t channel_) {
+    if ((channel_ >= kMinSystemMidiChannel) && (channel_ <= kMaxSystemMidiChannel)) {
+        system.midi.txChannel = channel_;
         if (menu == SYSTEM_MENU) {
             lcd_drawSystem_MidiOutData();
         }
@@ -7794,64 +8501,108 @@ void Controller::system_setMidiOut(uint8_t mode_) {
 }
 
 void Controller::system_setSyncIn(uint8_t mode_) {
+    if (mode_ > kMaxSystemSyncIn) {
+        mode_ = kMaxSystemSyncIn;
+    }
     if ((mode_ >= kMinSystemSyncIn) && (mode_ <= kMaxSystemSyncIn)) {
-        // update data
         system.syncIn = mode_;
+        HAL_GPIO_WritePin(SYNC_IN_GND_GPIO_Port, SYNC_IN_GND_Pin, GPIO_PIN_RESET);
         system.sync.syncInTempo = kSystemSyncInDataLibrary[system.syncIn].tempoTrigger;
         system.sync.syncInPlay = kSystemSyncInDataLibrary[system.syncIn].playTrigger;
         system.sync.syncInBeat = kSystemSyncInDataLibrary[system.syncIn].beatTrigger;
-        if (system.syncIn) {
+        system.sync.rxPulseLastTick = 0;
+        system.sync.rxPulseInterval = 0;
+        system.sync.rxPulseBeatStart = 0;
+        system.sync.rxPulseCount = 0;
+        system.sync.rxPulseBpm = 0;
+        system.sync.rxPulseFlag = false;
+        system.sync.rxPlayFlag = false;
+        system.sync.rxRecordFlag = false;
+        system.sync.rxGateHigh = false;
+        system.sync.rxStopFlag = false;
+        system.sync.rxResetFlag = false;
+        syncInPlayArmed = false;
+        syncInRecordArmed = false;
+        if (system.syncIn || system.midi.rxSync) {
             system.sync.slaveMode = true;
             system.sync.masterMode = false;
-        } else if (system.syncOut) {
+        } else if (system.syncOut || system.midi.txSync) {
             system.sync.slaveMode = false;
             system.sync.masterMode = true;
         } else {
             system.sync.slaveMode = false;
             system.sync.masterMode = false;
         }
-        // update lcd
         if (menu == SYSTEM_MENU)
             lcd_drawSystem_SyncInData();
     }
 }
 
+void Controller::system_setSyncInPpqn(uint8_t ppqnIdx_) {
+    if ((ppqnIdx_ >= kMinSystemSyncPpqn) && (ppqnIdx_ <= kMaxSystemSyncPpqn)) {
+        systemSyncInPpqn = ppqnIdx_;
+        system.sync.rxPulseLastTick = 0;
+        system.sync.rxPulseInterval = 0;
+        system.sync.rxPulseBeatStart = 0;
+        system.sync.rxPulseCount = 0;
+        system.sync.rxPulseBpm = 0;
+        system.sync.rxPulseFlag = false;
+        if (menu == SYSTEM_MENU) {
+            lcd_drawSystem_SyncInData();
+        }
+    }
+}
+
 void Controller::system_setSyncOut(uint8_t mode_) {
+    if (mode_ > kMaxSystemSyncOut) {
+        mode_ = kMaxSystemSyncOut;
+    }
     if ((mode_ >= kMinSystemSyncOut) && (mode_ <= kMaxSystemSyncOut)) {
-        // update data
         system.syncOut = mode_;
         switch (mode_) {
-        case 0: // off
-            HAL_GPIO_WritePin(SYNC_OUT_RX_GPIO_Port, SYNC_OUT_RX_Pin, GPIO_PIN_RESET);
-            break;
-        case 1: // mode-rw
-            HAL_GPIO_WritePin(SYNC_OUT_RX_GPIO_Port, SYNC_OUT_RX_Pin, GPIO_PIN_SET);
-            break;
-        case 2: // mode-st
-            HAL_GPIO_WritePin(SYNC_OUT_RX_GPIO_Port, SYNC_OUT_RX_Pin, GPIO_PIN_RESET);
-            break;
+            case 0:
+                HAL_GPIO_WritePin(SYNC_OUT_GND_GPIO_Port, SYNC_OUT_GND_Pin, GPIO_PIN_RESET);
+                break;
+            case 1:
+                HAL_GPIO_WritePin(SYNC_OUT_GND_GPIO_Port, SYNC_OUT_GND_Pin, GPIO_PIN_RESET);
+                break;
+            case 2:
+                HAL_GPIO_WritePin(SYNC_OUT_GND_GPIO_Port, SYNC_OUT_GND_Pin, GPIO_PIN_RESET);
+                break;
         }
+        HAL_GPIO_WritePin(SYNC_OUT_GATE_GPIO_Port, SYNC_OUT_GATE_Pin,
+                          (mode_ == 2 && playActive) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        syncOutPulseTickAccumulator = 0;
         system.sync.syncOutTempo = kSystemSyncOutDataLibrary[system.syncOut].tempoTrigger;
         system.sync.syncOutPlay = kSystemSyncOutDataLibrary[system.syncOut].playTrigger;
         system.sync.syncOutBeat = kSystemSyncOutDataLibrary[system.syncOut].beatTrigger;
-        if (system.syncIn) {
+        if (system.syncIn || system.midi.rxSync) {
             system.sync.slaveMode = true;
             system.sync.masterMode = false;
-        } else if (system.syncOut) {
+        } else if (system.syncOut || system.midi.txSync) {
             system.sync.slaveMode = false;
             system.sync.masterMode = true;
         } else {
             system.sync.slaveMode = false;
             system.sync.masterMode = false;
         }
-        // update lcd
         if (menu == SYSTEM_MENU)
             lcd_drawSystem_SyncOutData();
     }
 }
 
+void Controller::system_setSyncOutPpqn(uint8_t ppqnIdx_) {
+    if ((ppqnIdx_ >= kMinSystemSyncPpqn) && (ppqnIdx_ <= kMaxSystemSyncPpqn)) {
+        systemSyncOutPpqn = ppqnIdx_;
+        syncOutPulseTickAccumulator = 0;
+        if (menu == SYSTEM_MENU) {
+            lcd_drawSystem_SyncOutData();
+        }
+    }
+}
+
 void Controller::system_volumeTransition(float volumeFloat_) {
-    SystemVolumeTransition &vTransition = system.volumeTransition;
+    SystemVolumeTransition& vTransition = system.volumeTransition;
 
     vTransition.targetVolume = volumeFloat_;
     system_calculateVolumeTransition();
@@ -7859,7 +8610,7 @@ void Controller::system_volumeTransition(float volumeFloat_) {
 }
 
 void Controller::system_panTransition(float volumeLeftFloat_, float volumeRightFloat_) {
-    SystemPanTransition &pTransition = system.panTransition;
+    SystemPanTransition& pTransition = system.panTransition;
 
     pTransition.targetVolumeLeft = volumeLeftFloat_;
     pTransition.targetVolumeRight = volumeRightFloat_;
@@ -7869,7 +8620,7 @@ void Controller::system_panTransition(float volumeLeftFloat_, float volumeRightF
 }
 
 void Controller::system_calculateVolumeTransition() {
-    SystemVolumeTransition &vTransition = system.volumeTransition;
+    SystemVolumeTransition& vTransition = system.volumeTransition;
 
     if (system.volumeFloat == vTransition.targetVolume) {
         vTransition.actionVolume = SYS_ACTION_NONE;
@@ -7881,7 +8632,7 @@ void Controller::system_calculateVolumeTransition() {
 }
 
 void Controller::system_calculatePanTransition() {
-    SystemPanTransition &pTransition = system.panTransition;
+    SystemPanTransition& pTransition = system.panTransition;
 
     if (system.volumeLeftFloat == pTransition.targetVolumeLeft) {
         pTransition.actionVolumeLeft = SYS_ACTION_NONE;
@@ -7957,105 +8708,105 @@ void Controller::rhythm_menuLeft() {
 
 void Controller::rhythm_menuUp() {
     switch (menuTab) {
-    case 0:
-        if ((rhythm.tempo < kMaxTempo) && (!system.sync.slaveMode)) {
-            rhythm_setTempo(rhythm.tempo + 1);
-        }
-        break;
+        case 0:
+            if ((rhythm.tempo < kMaxTempo) && (!system.sync.slaveMode)) {
+                rhythm_setTempo(rhythm.tempo + 1);
+            }
+            break;
 
-    case 1:
-        if (!rhythm.measureLock) {
-            if (rhythm.measure < kMaxMeasure) {
-                if (playActive) {
-                    alertFlag = true;
-                    alertType = ALERT_MEASUREUP;
-                    lcd_drawAlert();
-                } else {
-                    rhythm_setMeasure(rhythm.measure + 1);
+        case 1:
+            if (!rhythm.measureLock) {
+                if (rhythm.measure < kMaxMeasure) {
+                    if (playActive) {
+                        alertFlag = true;
+                        alertType = ALERT_MEASUREUP;
+                        lcd_drawAlert();
+                    } else {
+                        rhythm_setMeasure(rhythm.measure + 1);
+                    }
                 }
             }
-        }
-        break;
+            break;
 
-    case 2:
-        if (!rhythm.barLock) {
-            if (rhythm.bar < kMaxBar) {
-                if (playActive) {
-                    alertFlag = true;
-                    alertType = ALERT_BARUP;
-                    lcd_drawAlert();
-                } else {
-                    rhythm_setBar(rhythm.bar + 1);
+        case 2:
+            if (!rhythm.barLock) {
+                if (rhythm.bar < kMaxBar) {
+                    if (playActive) {
+                        alertFlag = true;
+                        alertType = ALERT_BARUP;
+                        lcd_drawAlert();
+                    } else {
+                        rhythm_setBar(rhythm.bar + 1);
+                    }
                 }
             }
-        }
-        break;
+            break;
 
-    case 3:
-        if (!rhythm.quantizeLock) {
-            if (rhythm.quantize < kMaxQuantize) {
-                if (playActive) {
-                    alertFlag = true;
-                    alertType = ALERT_QUANTIZEUP;
-                    lcd_drawAlert();
-                } else {
-                    rhythm_setQuantize(rhythm.quantize + 1);
+        case 3:
+            if (!rhythm.quantizeLock) {
+                if (rhythm.quantize < kMaxQuantize) {
+                    if (playActive) {
+                        alertFlag = true;
+                        alertType = ALERT_QUANTIZEUP;
+                        lcd_drawAlert();
+                    } else {
+                        rhythm_setQuantize(rhythm.quantize + 1);
+                    }
                 }
             }
-        }
-        break;
+            break;
     }
 }
 
 void Controller::rhythm_menuDown() {
     switch (menuTab) {
-    case 0:
-        if ((rhythm.tempo > kMinTempo) && (!system.sync.slaveMode)) {
-            rhythm_setTempo(rhythm.tempo - 1);
-        }
-        break;
+        case 0:
+            if ((rhythm.tempo > kMinTempo) && (!system.sync.slaveMode)) {
+                rhythm_setTempo(rhythm.tempo - 1);
+            }
+            break;
 
-    case 1:
-        if (!rhythm.measureLock) {
-            if (rhythm.measure > kMinMeasure) {
-                if (playActive) {
-                    alertFlag = true;
-                    alertType = ALERT_MEASUREDOWN;
-                    lcd_drawAlert();
-                } else {
-                    rhythm_setMeasure(rhythm.measure - 1);
+        case 1:
+            if (!rhythm.measureLock) {
+                if (rhythm.measure > kMinMeasure) {
+                    if (playActive) {
+                        alertFlag = true;
+                        alertType = ALERT_MEASUREDOWN;
+                        lcd_drawAlert();
+                    } else {
+                        rhythm_setMeasure(rhythm.measure - 1);
+                    }
                 }
             }
-        }
-        break;
+            break;
 
-    case 2:
-        if (!rhythm.barLock) {
-            if (rhythm.bar > kMinBar) {
-                if (playActive) {
-                    alertFlag = true;
-                    alertType = ALERT_BARDOWN;
-                    lcd_drawAlert();
-                } else {
-                    rhythm_setBar(rhythm.bar - 1);
+        case 2:
+            if (!rhythm.barLock) {
+                if (rhythm.bar > kMinBar) {
+                    if (playActive) {
+                        alertFlag = true;
+                        alertType = ALERT_BARDOWN;
+                        lcd_drawAlert();
+                    } else {
+                        rhythm_setBar(rhythm.bar - 1);
+                    }
                 }
             }
-        }
-        break;
+            break;
 
-    case 3:
-        if (!rhythm.quantizeLock) {
-            if (rhythm.quantize > kMinQuantize) {
-                if (playActive) {
-                    alertFlag = true;
-                    alertType = ALERT_QUANTIZEDOWN;
-                    lcd_drawAlert();
-                } else {
-                    rhythm_setQuantize(rhythm.quantize - 1);
+        case 3:
+            if (!rhythm.quantizeLock) {
+                if (rhythm.quantize > kMinQuantize) {
+                    if (playActive) {
+                        alertFlag = true;
+                        alertType = ALERT_QUANTIZEDOWN;
+                        lcd_drawAlert();
+                    } else {
+                        rhythm_setQuantize(rhythm.quantize - 1);
+                    }
                 }
             }
-        }
-        break;
+            break;
     }
 }
 
@@ -8177,45 +8928,45 @@ void Controller::metro_menuLeft() {
 
 void Controller::metro_menuUp() {
     switch (menuTab) {
-    case 0:
-        metro_setActive(!metronome.active);
-        break;
+        case 0:
+            metro_setActive(!metronome.active);
+            break;
 
-    case 1:
-        metro_setPrecount(!metronome.precount);
-        break;
+        case 1:
+            metro_setPrecount(!metronome.precount);
+            break;
 
-    case 2:
-        (metronome.sample < kMaxMetroSample) ? metro_setSample(metronome.sample + 1) : metro_setSample(kMinMetroSample);
-        break;
+        case 2:
+            (metronome.sample < kMaxMetroSample) ? metro_setSample(metronome.sample + 1) : metro_setSample(kMinMetroSample);
+            break;
 
-    case 3:
-        if (metronome.volume < kMaxMetroVolume) {
-            metro_setVolume(metronome.volume + 1);
-        }
-        break;
+        case 3:
+            if (metronome.volume < kMaxMetroVolume) {
+                metro_setVolume(metronome.volume + 1);
+            }
+            break;
     }
 }
 
 void Controller::metro_menuDown() {
     switch (menuTab) {
-    case 0:
-        metro_setActive(!metronome.active);
-        break;
+        case 0:
+            metro_setActive(!metronome.active);
+            break;
 
-    case 1:
-        metro_setPrecount(!metronome.precount);
-        break;
+        case 1:
+            metro_setPrecount(!metronome.precount);
+            break;
 
-    case 2:
-        (metronome.sample > kMinMetroSample) ? metro_setSample(metronome.sample - 1) : metro_setSample(kMaxMetroSample);
-        break;
+        case 2:
+            (metronome.sample > kMinMetroSample) ? metro_setSample(metronome.sample - 1) : metro_setSample(kMaxMetroSample);
+            break;
 
-    case 3:
-        if (metronome.volume > kMinMetroVolume) {
-            metro_setVolume(metronome.volume - 1);
-        }
-        break;
+        case 3:
+            if (metronome.volume > kMinMetroVolume) {
+                metro_setVolume(metronome.volume - 1);
+            }
+            break;
     }
 }
 
@@ -8261,7 +9012,7 @@ void Controller::metro_setVolume(uint8_t volume_) {
 }
 
 void Controller::metro_volumeTransition(float volumeFloat_) {
-    MetronomeVolumeTransition &vTransition = metronome.volumeTransition;
+    MetronomeVolumeTransition& vTransition = metronome.volumeTransition;
 
     vTransition.targetVolume = volumeFloat_;
     metro_calculateVolumeTransition();
@@ -8269,7 +9020,7 @@ void Controller::metro_volumeTransition(float volumeFloat_) {
 }
 
 void Controller::metro_calculateVolumeTransition() {
-    MetronomeVolumeTransition &vTransition = metronome.volumeTransition;
+    MetronomeVolumeTransition& vTransition = metronome.volumeTransition;
 
     if (metronome.volumeFloat == vTransition.targetVolume) {
         vTransition.actionVolume = MET_ACTION_NONE;
@@ -8298,6 +9049,7 @@ void Controller::eq_select() {
 
 void Controller::eq_reset() {
     eq_setActive(kInitialEqActive);
+    eq.q = kInitialEqQ;
     eq_setFreqLowShelf(kInitialEqFreqLowShelf);
     eq_setGainLowShelf(kInitialEqGainLowShelf);
     eq_setFreqHighShelf(kInitialEqFreqHighShelf);
@@ -8305,14 +9057,11 @@ void Controller::eq_reset() {
     for (uint8_t i = 0; i < 4; i++) {
         eq_setFreqPeak(i, kInitialEqFreqPeak[i]);
         eq_setGainPeak(i, kInitialEqGainPeak[i]);
-        eq_setQPeak(i, kInitialEqQPeak[i]);
     }
 }
 
 void Controller::eq_menuRight() {
     if (menuTab < kMaxMenu8Tab) {
-        if ((menuTab == 6) && (subMenuTab == 2))
-            subMenuTab = 1;
         preMenuTab = menuTab;
         (menuTab == 0) ? menuTab += 2 : menuTab += 1;
         lcd_transitionSelect();
@@ -8321,268 +9070,170 @@ void Controller::eq_menuRight() {
 
 void Controller::eq_menuLeft() {
     if (menuTab > kMinMenu8Tab) {
-        if (menuTab == 2)
-            subMenuTab = 0;
-        if ((menuTab == 3) && (subMenuTab == 2))
-            subMenuTab = 1;
         preMenuTab = menuTab;
         (menuTab == 2) ? menuTab -= 2 : menuTab -= 1;
+        if (menuTab == 0) subMenuTab = 0;
         lcd_transitionSelect();
     }
 }
 
 void Controller::eq_menuUp() {
     switch (menuTab) {
-    case 0:
-        eq_setActive(!eq.active);
-        break;
-
-    case 2:
-        switch (subMenuTab) {
         case 0:
-            if (eq.gainLowShelf < kMaxEqGain) {
-                eq_setGainLowShelf(eq.gainLowShelf + 1);
-            }
-            break;
-
-        case 1:
-            if (eq.freqLowShelf < kMaxEqFreq) {
-                eq_setFreqLowShelf(eq.freqLowShelf + 1);
-            }
-            break;
-        }
-        break;
-
-    case 3:
-        switch (subMenuTab) {
-        case 0:
-            if (eq.gainPeak[0] < kMaxEqGain) {
-                eq_setGainPeak(0, eq.gainPeak[0] + 1);
-            }
-            break;
-
-        case 1:
-            if (eq.freqPeak[0] < kMaxEqFreq) {
-                eq_setFreqPeak(0, eq.freqPeak[0] + 1);
-            }
+            eq_setActive(!eq.active);
             break;
 
         case 2:
-            if (eq.qPeak[0] < kMaxEqQ) {
-                eq_setQPeak(0, eq.qPeak[0] + 1);
-            }
-            break;
-        }
-        break;
-
-    case 4:
-        switch (subMenuTab) {
-        case 0:
-            if (eq.gainPeak[1] < kMaxEqGain) {
-                eq_setGainPeak(1, eq.gainPeak[1] + 1);
+            if (subMenuTab == 1) {
+                if (eq.freqLowShelf < kMaxEqFreq) {
+                    eq_setFreqLowShelf(eq.freqLowShelf + 1);
+                }
+            } else {
+                if (eq.gainLowShelf < kMaxEqGain) {
+                    eq_setGainLowShelf(eq.gainLowShelf + 1);
+                }
             }
             break;
 
-        case 1:
-            if (eq.freqPeak[1] < kMaxEqFreq) {
-                eq_setFreqPeak(1, eq.freqPeak[1] + 1);
+        case 3:
+            if (subMenuTab == 1) {
+                if (eq.freqPeak[0] < kMaxEqFreq) {
+                    eq_setFreqPeak(0, eq.freqPeak[0] + 1);
+                }
+            } else {
+                if (eq.gainPeak[0] < kMaxEqGain) {
+                    eq_setGainPeak(0, eq.gainPeak[0] + 1);
+                }
             }
             break;
 
-        case 2:
-            if (eq.qPeak[1] < kMaxEqQ) {
-                eq_setQPeak(1, eq.qPeak[1] + 1);
-            }
-            break;
-        }
-        break;
-
-    case 5:
-        switch (subMenuTab) {
-        case 0:
-            if (eq.gainPeak[2] < kMaxEqGain) {
-                eq_setGainPeak(2, eq.gainPeak[2] + 1);
+        case 4:
+            if (subMenuTab == 1) {
+                if (eq.freqPeak[1] < kMaxEqFreq) {
+                    eq_setFreqPeak(1, eq.freqPeak[1] + 1);
+                }
+            } else {
+                if (eq.gainPeak[1] < kMaxEqGain) {
+                    eq_setGainPeak(1, eq.gainPeak[1] + 1);
+                }
             }
             break;
 
-        case 1:
-            if (eq.freqPeak[2] < kMaxEqFreq) {
-                eq_setFreqPeak(2, eq.freqPeak[2] + 1);
+        case 5:
+            if (subMenuTab == 1) {
+                if (eq.freqPeak[2] < kMaxEqFreq) {
+                    eq_setFreqPeak(2, eq.freqPeak[2] + 1);
+                }
+            } else {
+                if (eq.gainPeak[2] < kMaxEqGain) {
+                    eq_setGainPeak(2, eq.gainPeak[2] + 1);
+                }
             }
             break;
 
-        case 2:
-            if (eq.qPeak[2] < kMaxEqQ) {
-                eq_setQPeak(2, eq.qPeak[2] + 1);
-            }
-            break;
-        }
-        break;
-
-    case 6:
-        switch (subMenuTab) {
-        case 0:
-            if (eq.gainPeak[3] < kMaxEqGain) {
-                eq_setGainPeak(3, eq.gainPeak[3] + 1);
+        case 6:
+            if (subMenuTab == 1) {
+                if (eq.freqPeak[3] < kMaxEqFreq) {
+                    eq_setFreqPeak(3, eq.freqPeak[3] + 1);
+                }
+            } else {
+                if (eq.gainPeak[3] < kMaxEqGain) {
+                    eq_setGainPeak(3, eq.gainPeak[3] + 1);
+                }
             }
             break;
 
-        case 1:
-            if (eq.freqPeak[3] < kMaxEqFreq) {
-                eq_setFreqPeak(3, eq.freqPeak[3] + 1);
+        case 7:
+            if (subMenuTab == 1) {
+                if (eq.freqHighShelf < kMaxEqFreq) {
+                    eq_setFreqHighShelf(eq.freqHighShelf + 1);
+                }
+            } else {
+                if (eq.gainHighShelf < kMaxEqGain) {
+                    eq_setGainHighShelf(eq.gainHighShelf + 1);
+                }
             }
             break;
-
-        case 2:
-            if (eq.qPeak[3] < kMaxEqQ) {
-                eq_setQPeak(3, eq.qPeak[3] + 1);
-            }
-            break;
-        }
-        break;
-
-    case 7:
-        switch (subMenuTab) {
-        case 0:
-            if (eq.gainHighShelf < kMaxEqGain) {
-                eq_setGainHighShelf(eq.gainHighShelf + 1);
-            }
-            break;
-
-        case 1:
-            if (eq.freqHighShelf < kMaxEqFreq) {
-                eq_setFreqHighShelf(eq.freqHighShelf + 1);
-            }
-            break;
-        }
-        break;
     }
 }
 
 void Controller::eq_menuDown() {
     switch (menuTab) {
-    case 0:
-        eq_setActive(!eq.active);
-        break;
-
-    case 2:
-        switch (subMenuTab) {
         case 0:
-            if (eq.gainLowShelf > kMinEqGain) {
-                eq_setGainLowShelf(eq.gainLowShelf - 1);
-            }
-            break;
-
-        case 1:
-            if (eq.freqLowShelf > kMinEqFreq) {
-                eq_setFreqLowShelf(eq.freqLowShelf - 1);
-            }
-            break;
-        }
-        break;
-
-    case 3:
-        switch (subMenuTab) {
-        case 0:
-            if (eq.gainPeak[0] > kMinEqGain) {
-                eq_setGainPeak(0, eq.gainPeak[0] - 1);
-            }
-            break;
-
-        case 1:
-            if (eq.freqPeak[0] > kMinEqFreq) {
-                eq_setFreqPeak(0, eq.freqPeak[0] - 1);
-            }
+            eq_setActive(!eq.active);
             break;
 
         case 2:
-            if (eq.qPeak[0] > kMinEqQ) {
-                eq_setQPeak(0, eq.qPeak[0] - 1);
-            }
-            break;
-        }
-        break;
-
-    case 4:
-        switch (subMenuTab) {
-        case 0:
-            if (eq.gainPeak[1] > kMinEqGain) {
-                eq_setGainPeak(1, eq.gainPeak[1] - 1);
+            if (subMenuTab == 1) {
+                if (eq.freqLowShelf > kMinEqFreq) {
+                    eq_setFreqLowShelf(eq.freqLowShelf - 1);
+                }
+            } else {
+                if (eq.gainLowShelf > kMinEqGain) {
+                    eq_setGainLowShelf(eq.gainLowShelf - 1);
+                }
             }
             break;
 
-        case 1:
-            if (eq.freqPeak[1] > kMinEqFreq) {
-                eq_setFreqPeak(1, eq.freqPeak[1] - 1);
+        case 3:
+            if (subMenuTab == 1) {
+                if (eq.freqPeak[0] > kMinEqFreq) {
+                    eq_setFreqPeak(0, eq.freqPeak[0] - 1);
+                }
+            } else {
+                if (eq.gainPeak[0] > kMinEqGain) {
+                    eq_setGainPeak(0, eq.gainPeak[0] - 1);
+                }
             }
             break;
 
-        case 2:
-            if (eq.qPeak[1] > kMinEqQ) {
-                eq_setQPeak(1, eq.qPeak[1] - 1);
-            }
-            break;
-        }
-        break;
-
-    case 5:
-        switch (subMenuTab) {
-        case 0:
-            if (eq.gainPeak[2] > kMinEqGain) {
-                eq_setGainPeak(2, eq.gainPeak[2] - 1);
+        case 4:
+            if (subMenuTab == 1) {
+                if (eq.freqPeak[1] > kMinEqFreq) {
+                    eq_setFreqPeak(1, eq.freqPeak[1] - 1);
+                }
+            } else {
+                if (eq.gainPeak[1] > kMinEqGain) {
+                    eq_setGainPeak(1, eq.gainPeak[1] - 1);
+                }
             }
             break;
 
-        case 1:
-            if (eq.freqPeak[2] > kMinEqFreq) {
-                eq_setFreqPeak(2, eq.freqPeak[2] - 1);
+        case 5:
+            if (subMenuTab == 1) {
+                if (eq.freqPeak[2] > kMinEqFreq) {
+                    eq_setFreqPeak(2, eq.freqPeak[2] - 1);
+                }
+            } else {
+                if (eq.gainPeak[2] > kMinEqGain) {
+                    eq_setGainPeak(2, eq.gainPeak[2] - 1);
+                }
             }
             break;
 
-        case 2:
-            if (eq.qPeak[2] > kMinEqQ) {
-                eq_setQPeak(2, eq.qPeak[2] - 1);
-            }
-            break;
-        }
-        break;
-
-    case 6:
-        switch (subMenuTab) {
-        case 0:
-            if (eq.gainPeak[3] > kMinEqGain) {
-                eq_setGainPeak(3, eq.gainPeak[3] - 1);
+        case 6:
+            if (subMenuTab == 1) {
+                if (eq.freqPeak[3] > kMinEqFreq) {
+                    eq_setFreqPeak(3, eq.freqPeak[3] - 1);
+                }
+            } else {
+                if (eq.gainPeak[3] > kMinEqGain) {
+                    eq_setGainPeak(3, eq.gainPeak[3] - 1);
+                }
             }
             break;
 
-        case 1:
-            if (eq.freqPeak[3] > kMinEqFreq) {
-                eq_setFreqPeak(3, eq.freqPeak[3] - 1);
+        case 7:
+            if (subMenuTab == 1) {
+                if (eq.freqHighShelf > kMinEqFreq) {
+                    eq_setFreqHighShelf(eq.freqHighShelf - 1);
+                }
+            } else {
+                if (eq.gainHighShelf > kMinEqGain) {
+                    eq_setGainHighShelf(eq.gainHighShelf - 1);
+                }
             }
             break;
-
-        case 2:
-            if (eq.qPeak[3] > kMinEqQ) {
-                eq_setQPeak(3, eq.qPeak[3] - 1);
-            }
-            break;
-        }
-        break;
-
-    case 7:
-        switch (subMenuTab) {
-        case 0:
-            if (eq.gainHighShelf > kMinEqGain) {
-                eq_setGainHighShelf(eq.gainHighShelf - 1);
-            }
-            break;
-
-        case 1:
-            if (eq.freqHighShelf > kMinEqFreq) {
-                eq_setFreqHighShelf(eq.freqHighShelf - 1);
-            }
-        }
-        break;
     }
 }
 
@@ -8666,19 +9317,8 @@ void Controller::eq_setGainPeak(uint8_t peakNum_, uint8_t gain_) {
     }
 }
 
-void Controller::eq_setQPeak(uint8_t peakNum_, uint8_t q_) {
-    if ((q_ >= kMinEqQ) && (q_ <= kMaxEqQ)) {
-        // update data
-        eq.qPeak[peakNum_] = q_;
-        eq.calculateCoefPeak(peakNum_);
-        // update lcd
-        if (menu == EQ_MENU)
-            lcd_drawEq_PeakData(peakNum_);
-    }
-}
-
 void Controller::eq_genTransition(EqTransitionMode mode_, bool activeActive_, bool targetActive_) {
-    EqGenTransition &gTransition = eq.genTransition;
+    EqGenTransition& gTransition = eq.genTransition;
 
     gTransition.mode = mode_;
     gTransition.phase = EQ_PHASE_A;
@@ -8687,32 +9327,32 @@ void Controller::eq_genTransition(EqTransitionMode mode_, bool activeActive_, bo
     gTransition.targetActive = targetActive_;
 
     switch (mode_) {
-    case EQ_MODE_NONE:
-        break;
-
-    case EQ_MODE_ACTIVE:
-        switch (targetActive_) {
-        case true:
-            gTransition.activeDry = 1.0;
-            gTransition.targetDry = 0.0;
-
-            gTransition.activeWet = 0.0;
-            gTransition.targetWet = 1.0;
-
-            transitionShowFlag = 2;
+        case EQ_MODE_NONE:
             break;
 
-        case false:
-            gTransition.activeDry = 0.0;
-            gTransition.targetDry = 1.0;
+        case EQ_MODE_ACTIVE:
+            switch (targetActive_) {
+                case true:
+                    gTransition.activeDry = 1.0;
+                    gTransition.targetDry = 0.0;
 
-            gTransition.activeWet = 1.0;
-            gTransition.targetWet = 0.0;
+                    gTransition.activeWet = 0.0;
+                    gTransition.targetWet = 1.0;
 
-            transitionShowFlag = 1;
+                    transitionShowFlag = 2;
+                    break;
+
+                case false:
+                    gTransition.activeDry = 0.0;
+                    gTransition.targetDry = 1.0;
+
+                    gTransition.activeWet = 1.0;
+                    gTransition.targetWet = 0.0;
+
+                    transitionShowFlag = 1;
+                    break;
+            }
             break;
-        }
-        break;
     }
 
     eq_calculateActiveTransition();
@@ -8720,7 +9360,7 @@ void Controller::eq_genTransition(EqTransitionMode mode_, bool activeActive_, bo
 }
 
 void Controller::eq_calculateActiveTransition() {
-    EqGenTransition &gTransition = eq.genTransition;
+    EqGenTransition& gTransition = eq.genTransition;
 
     if (gTransition.activeDry == gTransition.targetDry) {
         gTransition.actionDry = EQ_ACTION_NONE;
@@ -8741,7 +9381,7 @@ void Controller::eq_calculateActiveTransition() {
 
 /* Osc functions -------------------------------------------------------------*/
 
-void Controller::osc_select(Osc &osc_) {
+void Controller::osc_select(Osc& osc_) {
     if (osc_.number == 0) {
         if ((menu == OSC_A0_MENU) || (menu == OSC_A1_MENU)) {
             preMenu = menu;
@@ -8851,7 +9491,7 @@ void Controller::osc_select(Osc &osc_) {
     }
 }
 
-void Controller::osc_reset(Osc &osc_) {
+void Controller::osc_reset(Osc& osc_) {
     osc_setActive(osc_, kInitialOscActive);
     osc_setWavetableSelected(osc_, kInitialOscWavetable);
     osc_setWavetableLoaded(osc_, true);
@@ -8865,14 +9505,14 @@ void Controller::osc_reset(Osc &osc_) {
     osc_lfo_reset(osc_, osc_.lfo[1]);
 }
 
-void Controller::osc_lfo_reset(Osc &osc_, Lfo &lfo_) {
+void Controller::osc_lfo_reset(Osc& osc_, Lfo& lfo_) {
     osc_lfo_setActive(osc_, lfo_, kInitialLfoActive);
     osc_lfo_setType(osc_, lfo_, kInitialLfoType);
     osc_lfo_setRate(osc_, lfo_, kInitialLfoRate);
     osc_lfo_setDepth(osc_, lfo_, kInitialLfoDepth);
 }
 
-void Controller::osc_menuRight(Osc &osc_) {
+void Controller::osc_menuRight(Osc& osc_) {
     if ((menu == OSC_A0_MENU) && (menuTab == 7)) {
         preMenu = menu;
         menu = OSC_A1_MENU;
@@ -8896,7 +9536,7 @@ void Controller::osc_menuRight(Osc &osc_) {
     }
 }
 
-void Controller::osc_menuLeft(Osc &osc_) {
+void Controller::osc_menuLeft(Osc& osc_) {
     if ((menu == OSC_A1_MENU) && (menuTab == 4)) {
         preMenu = menu;
         menu = OSC_A0_MENU;
@@ -8920,430 +9560,430 @@ void Controller::osc_menuLeft(Osc &osc_) {
     }
 }
 
-void Controller::osc_menuUp(Osc &osc_) {
+void Controller::osc_menuUp(Osc& osc_) {
     uint8_t lfoTarget;
 
     switch (menu) {
-    case OSC_A0_MENU:
-    case OSC_B0_MENU:
-        switch (menuTab) {
-        case 0:
-            osc_setActive(osc_, !osc_.active);
-            break;
-
-        case 2:
-            if (wavetableLibrarySize > 0) {
-                (osc_.wavetableSelected < (wavetableLibrarySize - 1)) ? osc_setWavetableSelected(osc_, osc_.wavetableSelected + 1) : osc_setWavetableSelected(osc_, -1);
-            }
-            break;
-
-        case 4:
-            if (osc_.level < kMaxOscLevel)
-                osc_setLevel(osc_, osc_.level + 5);
-            break;
-
-        case 5:
-            if (osc_.tune < kMaxOscTune)
-                osc_setTune(osc_, osc_.tune + 1);
-            break;
-
-        case 6:
-            if (osc_.phase < kMaxOscPhase)
-                osc_setPhase(osc_, osc_.phase + 1);
-            break;
-
-        case 7:
-            osc_setNormalize(osc_, !osc_.normalize);
-            break;
-        }
-        break;
-
-    case OSC_A1_MENU:
-    case OSC_B1_MENU:
-        switch (menuTab) {
-        case 0:
-            osc_setActive(osc_, !osc_.active);
-            break;
-
-        case 2:
-            if (wavetableLibrarySize > 0) {
-                (osc_.wavetableSelected < (wavetableLibrarySize - 1)) ? osc_setWavetableSelected(osc_, osc_.wavetableSelected + 1) : osc_setWavetableSelected(osc_, -1);
-            }
-            break;
-
-        case 4:
-            if (osc_.start < osc_.end)
-                osc_setStart(osc_, osc_.start + 1);
-            break;
-
-        case 5:
-            if (osc_.end < kStepDataLibrary[osc_.wavetableLoadedData.step].max)
-                osc_setEnd(osc_, osc_.end + 1);
-            break;
-
-        case 6:
-            osc_setXFlip(osc_, !osc_.xFlip);
-            break;
-
-        case 7:
-            osc_setYFlip(osc_, !osc_.yFlip);
-            break;
-        }
-        break;
-
-    case OSC_A2_MENU:
-    case OSC_B2_MENU:
-        switch (menuTab) {
-        case 0:
-            osc_lfo_setActive(osc_, osc_.lfo[0], !osc_.lfo[0].active);
-            break;
-
-        case 2:
-            (osc_.lfo[0].type < kMaxLfoType) ? osc_lfo_setType(osc_, osc_.lfo[0], osc_.lfo[0].type + 1) : osc_lfo_setType(osc_, osc_.lfo[0], kMinLfoType);
-            break;
-
-        case 4:
-            switch (osc_.lfo[0].target) {
-            case 0:
-                switch (osc_.lfo[1].target) {
-                case 1:
-                    lfoTarget = 2;
+        case OSC_A0_MENU:
+        case OSC_B0_MENU:
+            switch (menuTab) {
+                case 0:
+                    osc_setActive(osc_, !osc_.active);
                     break;
 
                 case 2:
-                    lfoTarget = 1;
-                    break;
-                }
-                break;
-
-            case 1:
-                switch (osc_.lfo[1].target) {
-                case 0:
-                    lfoTarget = 2;
+                    if (wavetableLibrarySize > 0) {
+                        (osc_.wavetableSelected < (wavetableLibrarySize - 1)) ? osc_setWavetableSelected(osc_, osc_.wavetableSelected + 1) : osc_setWavetableSelected(osc_, -1);
+                    }
                     break;
 
-                case 2:
-                    lfoTarget = 0;
-                    break;
-                }
-                break;
-
-            case 2:
-                switch (osc_.lfo[1].target) {
-                case 0:
-                    lfoTarget = 1;
+                case 4:
+                    if (osc_.level < kMaxOscLevel)
+                        osc_setLevel(osc_, osc_.level + 5);
                     break;
 
-                case 1:
-                    lfoTarget = 0;
+                case 5:
+                    if (osc_.tune < kMaxOscTune)
+                        osc_setTune(osc_, osc_.tune + 1);
                     break;
-                }
-                break;
+
+                case 6:
+                    if (osc_.phase < kMaxOscPhase)
+                        osc_setPhase(osc_, osc_.phase + 1);
+                    break;
+
+                case 7:
+                    osc_setNormalize(osc_, !osc_.normalize);
+                    break;
             }
-
-            osc_lfo_setTarget(osc_, osc_.lfo[0], lfoTarget);
             break;
 
-        case 5:
-            if (osc_.lfo[0].rate < kMaxLfoRate)
-                osc_lfo_setRate(osc_, osc_.lfo[0], osc_.lfo[0].rate + 1);
-            break;
-
-        case 6:
-            if (osc_.lfo[0].depth < kMaxLfoDepth)
-                osc_lfo_setDepth(osc_, osc_.lfo[0], osc_.lfo[0].depth + 1);
-            break;
-
-        case 7:
-            osc_lfo_setLoop(osc_, osc_.lfo[0], !osc_.lfo[0].loop);
-            break;
-        }
-        break;
-
-    case OSC_A3_MENU:
-    case OSC_B3_MENU:
-        switch (menuTab) {
-        case 0:
-            osc_lfo_setActive(osc_, osc_.lfo[1], !osc_.lfo[1].active);
-            break;
-
-        case 2:
-            (osc_.lfo[1].type < kMaxLfoType) ? osc_lfo_setType(osc_, osc_.lfo[1], osc_.lfo[1].type + 1) : osc_lfo_setType(osc_, osc_.lfo[1], kMinLfoType);
-            break;
-
-        case 4:
-            switch (osc_.lfo[1].target) {
-            case 0:
-                switch (osc_.lfo[0].target) {
-                case 1:
-                    lfoTarget = 2;
+        case OSC_A1_MENU:
+        case OSC_B1_MENU:
+            switch (menuTab) {
+                case 0:
+                    osc_setActive(osc_, !osc_.active);
                     break;
 
                 case 2:
-                    lfoTarget = 1;
-                    break;
-                }
-                break;
-
-            case 1:
-                switch (osc_.lfo[0].target) {
-                case 0:
-                    lfoTarget = 2;
+                    if (wavetableLibrarySize > 0) {
+                        (osc_.wavetableSelected < (wavetableLibrarySize - 1)) ? osc_setWavetableSelected(osc_, osc_.wavetableSelected + 1) : osc_setWavetableSelected(osc_, -1);
+                    }
                     break;
 
-                case 2:
-                    lfoTarget = 0;
-                    break;
-                }
-                break;
-
-            case 2:
-                switch (osc_.lfo[0].target) {
-                case 0:
-                    lfoTarget = 1;
+                case 4:
+                    if (osc_.start < osc_.end)
+                        osc_setStart(osc_, osc_.start + 1);
                     break;
 
-                case 1:
-                    lfoTarget = 0;
+                case 5:
+                    if (osc_.end < kStepDataLibrary[osc_.wavetableLoadedData.step].max)
+                        osc_setEnd(osc_, osc_.end + 1);
                     break;
-                }
-                break;
+
+                case 6:
+                    osc_setXFlip(osc_, !osc_.xFlip);
+                    break;
+
+                case 7:
+                    osc_setYFlip(osc_, !osc_.yFlip);
+                    break;
             }
-
-            osc_lfo_setTarget(osc_, osc_.lfo[1], lfoTarget);
-
             break;
 
-        case 5:
-            if (osc_.lfo[1].rate < kMaxLfoRate)
-                osc_lfo_setRate(osc_, osc_.lfo[1], osc_.lfo[1].rate + 1);
+        case OSC_A2_MENU:
+        case OSC_B2_MENU:
+            switch (menuTab) {
+                case 0:
+                    osc_lfo_setActive(osc_, osc_.lfo[0], !osc_.lfo[0].active);
+                    break;
+
+                case 2:
+                    (osc_.lfo[0].type < kMaxLfoType) ? osc_lfo_setType(osc_, osc_.lfo[0], osc_.lfo[0].type + 1) : osc_lfo_setType(osc_, osc_.lfo[0], kMinLfoType);
+                    break;
+
+                case 4:
+                    switch (osc_.lfo[0].target) {
+                        case 0:
+                            switch (osc_.lfo[1].target) {
+                                case 1:
+                                    lfoTarget = 2;
+                                    break;
+
+                                case 2:
+                                    lfoTarget = 1;
+                                    break;
+                            }
+                            break;
+
+                        case 1:
+                            switch (osc_.lfo[1].target) {
+                                case 0:
+                                    lfoTarget = 2;
+                                    break;
+
+                                case 2:
+                                    lfoTarget = 0;
+                                    break;
+                            }
+                            break;
+
+                        case 2:
+                            switch (osc_.lfo[1].target) {
+                                case 0:
+                                    lfoTarget = 1;
+                                    break;
+
+                                case 1:
+                                    lfoTarget = 0;
+                                    break;
+                            }
+                            break;
+                    }
+
+                    osc_lfo_setTarget(osc_, osc_.lfo[0], lfoTarget);
+                    break;
+
+                case 5:
+                    if (osc_.lfo[0].rate < kMaxLfoRate)
+                        osc_lfo_setRate(osc_, osc_.lfo[0], osc_.lfo[0].rate + 1);
+                    break;
+
+                case 6:
+                    if (osc_.lfo[0].depth < kMaxLfoDepth)
+                        osc_lfo_setDepth(osc_, osc_.lfo[0], osc_.lfo[0].depth + 1);
+                    break;
+
+                case 7:
+                    osc_lfo_setLoop(osc_, osc_.lfo[0], !osc_.lfo[0].loop);
+                    break;
+            }
             break;
 
-        case 6:
-            if (osc_.lfo[1].depth < kMaxLfoDepth)
-                osc_lfo_setDepth(osc_, osc_.lfo[1], osc_.lfo[1].depth + 1);
+        case OSC_A3_MENU:
+        case OSC_B3_MENU:
+            switch (menuTab) {
+                case 0:
+                    osc_lfo_setActive(osc_, osc_.lfo[1], !osc_.lfo[1].active);
+                    break;
+
+                case 2:
+                    (osc_.lfo[1].type < kMaxLfoType) ? osc_lfo_setType(osc_, osc_.lfo[1], osc_.lfo[1].type + 1) : osc_lfo_setType(osc_, osc_.lfo[1], kMinLfoType);
+                    break;
+
+                case 4:
+                    switch (osc_.lfo[1].target) {
+                        case 0:
+                            switch (osc_.lfo[0].target) {
+                                case 1:
+                                    lfoTarget = 2;
+                                    break;
+
+                                case 2:
+                                    lfoTarget = 1;
+                                    break;
+                            }
+                            break;
+
+                        case 1:
+                            switch (osc_.lfo[0].target) {
+                                case 0:
+                                    lfoTarget = 2;
+                                    break;
+
+                                case 2:
+                                    lfoTarget = 0;
+                                    break;
+                            }
+                            break;
+
+                        case 2:
+                            switch (osc_.lfo[0].target) {
+                                case 0:
+                                    lfoTarget = 1;
+                                    break;
+
+                                case 1:
+                                    lfoTarget = 0;
+                                    break;
+                            }
+                            break;
+                    }
+
+                    osc_lfo_setTarget(osc_, osc_.lfo[1], lfoTarget);
+
+                    break;
+
+                case 5:
+                    if (osc_.lfo[1].rate < kMaxLfoRate)
+                        osc_lfo_setRate(osc_, osc_.lfo[1], osc_.lfo[1].rate + 1);
+                    break;
+
+                case 6:
+                    if (osc_.lfo[1].depth < kMaxLfoDepth)
+                        osc_lfo_setDepth(osc_, osc_.lfo[1], osc_.lfo[1].depth + 1);
+                    break;
+
+                case 7:
+                    osc_lfo_setLoop(osc_, osc_.lfo[1], !osc_.lfo[1].loop);
+                    break;
+            }
             break;
 
-        case 7:
-            osc_lfo_setLoop(osc_, osc_.lfo[1], !osc_.lfo[1].loop);
+        default:
             break;
-        }
-        break;
-
-    default:
-        break;
     }
 }
 
-void Controller::osc_menuDown(Osc &osc_) {
+void Controller::osc_menuDown(Osc& osc_) {
     uint8_t lfoTarget;
 
     switch (menu) {
-    case OSC_A0_MENU:
-    case OSC_B0_MENU:
-        switch (menuTab) {
-        case 0:
-            osc_setActive(osc_, !osc_.active);
-            break;
+        case OSC_A0_MENU:
+        case OSC_B0_MENU:
+            switch (menuTab) {
+                case 0:
+                    osc_setActive(osc_, !osc_.active);
+                    break;
 
-        case 2:
-            if (wavetableLibrarySize > 0) {
-                (osc_.wavetableSelected > -1) ? osc_setWavetableSelected(osc_, osc_.wavetableSelected - 1) : osc_setWavetableSelected(osc_, wavetableLibrarySize - 1);
+                case 2:
+                    if (wavetableLibrarySize > 0) {
+                        (osc_.wavetableSelected > -1) ? osc_setWavetableSelected(osc_, osc_.wavetableSelected - 1) : osc_setWavetableSelected(osc_, wavetableLibrarySize - 1);
+                    }
+                    break;
+
+                case 4:
+                    if (osc_.level > kMinOscLevel)
+                        osc_setLevel(osc_, osc_.level - 5);
+                    break;
+
+                case 5:
+                    if (osc_.tune > kMinOscTune)
+                        osc_setTune(osc_, osc_.tune - 1);
+                    break;
+
+                case 6:
+                    if (osc_.phase > kMinOscPhase)
+                        osc_setPhase(osc_, osc_.phase - 1);
+                    break;
+
+                case 7:
+                    osc_setNormalize(osc_, !osc_.normalize);
+                    break;
             }
             break;
 
-        case 4:
-            if (osc_.level > kMinOscLevel)
-                osc_setLevel(osc_, osc_.level - 5);
-            break;
-
-        case 5:
-            if (osc_.tune > kMinOscTune)
-                osc_setTune(osc_, osc_.tune - 1);
-            break;
-
-        case 6:
-            if (osc_.phase > kMinOscPhase)
-                osc_setPhase(osc_, osc_.phase - 1);
-            break;
-
-        case 7:
-            osc_setNormalize(osc_, !osc_.normalize);
-            break;
-        }
-        break;
-
-    case OSC_A1_MENU:
-    case OSC_B1_MENU:
-        switch (menuTab) {
-        case 0:
-            osc_setActive(osc_, !osc_.active);
-            break;
-
-        case 4:
-            if (osc_.start > kStepDataLibrary[osc_.wavetableLoadedData.step].min)
-                osc_setStart(osc_, osc_.start - 1);
-            break;
-
-        case 5:
-            if (osc_.end > osc_.start)
-                osc_setEnd(osc_, osc_.end - 1);
-            break;
-
-        case 6:
-            osc_setXFlip(osc_, !osc_.xFlip);
-            break;
-
-        case 7:
-            osc_setYFlip(osc_, !osc_.yFlip);
-            break;
-        }
-        break;
-
-    case OSC_A2_MENU:
-    case OSC_B2_MENU:
-        switch (menuTab) {
-        case 0:
-            osc_lfo_setActive(osc_, osc_.lfo[0], !osc_.lfo[0].active);
-            break;
-
-        case 2:
-            (osc_.lfo[0].type > kMinLfoType) ? osc_lfo_setType(osc_, osc_.lfo[0], osc_.lfo[0].type - 1) : osc_lfo_setType(osc_, osc_.lfo[0], kMaxLfoType);
-            break;
-
-        case 4:
-            switch (osc_.lfo[0].target) {
-            case 0:
-                switch (osc_.lfo[1].target) {
-                case 1:
-                    lfoTarget = 2;
-                    break;
-
-                case 2:
-                    lfoTarget = 1;
-                    break;
-                }
-                break;
-
-            case 1:
-                switch (osc_.lfo[1].target) {
+        case OSC_A1_MENU:
+        case OSC_B1_MENU:
+            switch (menuTab) {
                 case 0:
-                    lfoTarget = 2;
+                    osc_setActive(osc_, !osc_.active);
                     break;
 
-                case 2:
-                    lfoTarget = 0;
-                    break;
-                }
-                break;
-
-            case 2:
-                switch (osc_.lfo[1].target) {
-                case 0:
-                    lfoTarget = 1;
+                case 4:
+                    if (osc_.start > kStepDataLibrary[osc_.wavetableLoadedData.step].min)
+                        osc_setStart(osc_, osc_.start - 1);
                     break;
 
-                case 1:
-                    lfoTarget = 0;
+                case 5:
+                    if (osc_.end > osc_.start)
+                        osc_setEnd(osc_, osc_.end - 1);
                     break;
-                }
-                break;
+
+                case 6:
+                    osc_setXFlip(osc_, !osc_.xFlip);
+                    break;
+
+                case 7:
+                    osc_setYFlip(osc_, !osc_.yFlip);
+                    break;
             }
-
-            osc_lfo_setTarget(osc_, osc_.lfo[0], lfoTarget);
             break;
 
-        case 5:
-            if (osc_.lfo[0].rate > kMinLfoRate)
-                osc_lfo_setRate(osc_, osc_.lfo[0], osc_.lfo[0].rate - 1);
-            break;
-
-        case 6:
-            if (osc_.lfo[0].depth > kMinLfoDepth)
-                osc_lfo_setDepth(osc_, osc_.lfo[0], osc_.lfo[0].depth - 1);
-            break;
-
-        case 7:
-            osc_lfo_setLoop(osc_, osc_.lfo[0], !osc_.lfo[0].loop);
-            break;
-        }
-        break;
-
-    case OSC_A3_MENU:
-    case OSC_B3_MENU:
-        switch (menuTab) {
-        case 0:
-            osc_lfo_setActive(osc_, osc_.lfo[1], !osc_.lfo[1].active);
-            break;
-
-        case 2:
-            (osc_.lfo[1].type > kMinLfoType) ? osc_lfo_setType(osc_, osc_.lfo[1], osc_.lfo[1].type - 1) : osc_lfo_setType(osc_, osc_.lfo[1], kMaxLfoType);
-            break;
-
-        case 4:
-            switch (osc_.lfo[1].target) {
-            case 0:
-                switch (osc_.lfo[0].target) {
-                case 1:
-                    lfoTarget = 2;
+        case OSC_A2_MENU:
+        case OSC_B2_MENU:
+            switch (menuTab) {
+                case 0:
+                    osc_lfo_setActive(osc_, osc_.lfo[0], !osc_.lfo[0].active);
                     break;
 
                 case 2:
-                    lfoTarget = 1;
-                    break;
-                }
-                break;
-
-            case 1:
-                switch (osc_.lfo[0].target) {
-                case 0:
-                    lfoTarget = 2;
+                    (osc_.lfo[0].type > kMinLfoType) ? osc_lfo_setType(osc_, osc_.lfo[0], osc_.lfo[0].type - 1) : osc_lfo_setType(osc_, osc_.lfo[0], kMaxLfoType);
                     break;
 
-                case 2:
-                    lfoTarget = 0;
-                    break;
-                }
-                break;
+                case 4:
+                    switch (osc_.lfo[0].target) {
+                        case 0:
+                            switch (osc_.lfo[1].target) {
+                                case 1:
+                                    lfoTarget = 2;
+                                    break;
 
-            case 2:
-                switch (osc_.lfo[0].target) {
-                case 0:
-                    lfoTarget = 1;
+                                case 2:
+                                    lfoTarget = 1;
+                                    break;
+                            }
+                            break;
+
+                        case 1:
+                            switch (osc_.lfo[1].target) {
+                                case 0:
+                                    lfoTarget = 2;
+                                    break;
+
+                                case 2:
+                                    lfoTarget = 0;
+                                    break;
+                            }
+                            break;
+
+                        case 2:
+                            switch (osc_.lfo[1].target) {
+                                case 0:
+                                    lfoTarget = 1;
+                                    break;
+
+                                case 1:
+                                    lfoTarget = 0;
+                                    break;
+                            }
+                            break;
+                    }
+
+                    osc_lfo_setTarget(osc_, osc_.lfo[0], lfoTarget);
                     break;
 
-                case 1:
-                    lfoTarget = 0;
+                case 5:
+                    if (osc_.lfo[0].rate > kMinLfoRate)
+                        osc_lfo_setRate(osc_, osc_.lfo[0], osc_.lfo[0].rate - 1);
                     break;
-                }
-                break;
+
+                case 6:
+                    if (osc_.lfo[0].depth > kMinLfoDepth)
+                        osc_lfo_setDepth(osc_, osc_.lfo[0], osc_.lfo[0].depth - 1);
+                    break;
+
+                case 7:
+                    osc_lfo_setLoop(osc_, osc_.lfo[0], !osc_.lfo[0].loop);
+                    break;
             }
-
-            osc_lfo_setTarget(osc_, osc_.lfo[1], lfoTarget);
             break;
 
-        case 5:
-            if (osc_.lfo[1].rate > kMinLfoRate)
-                osc_lfo_setRate(osc_, osc_.lfo[1], osc_.lfo[1].rate - 1);
+        case OSC_A3_MENU:
+        case OSC_B3_MENU:
+            switch (menuTab) {
+                case 0:
+                    osc_lfo_setActive(osc_, osc_.lfo[1], !osc_.lfo[1].active);
+                    break;
+
+                case 2:
+                    (osc_.lfo[1].type > kMinLfoType) ? osc_lfo_setType(osc_, osc_.lfo[1], osc_.lfo[1].type - 1) : osc_lfo_setType(osc_, osc_.lfo[1], kMaxLfoType);
+                    break;
+
+                case 4:
+                    switch (osc_.lfo[1].target) {
+                        case 0:
+                            switch (osc_.lfo[0].target) {
+                                case 1:
+                                    lfoTarget = 2;
+                                    break;
+
+                                case 2:
+                                    lfoTarget = 1;
+                                    break;
+                            }
+                            break;
+
+                        case 1:
+                            switch (osc_.lfo[0].target) {
+                                case 0:
+                                    lfoTarget = 2;
+                                    break;
+
+                                case 2:
+                                    lfoTarget = 0;
+                                    break;
+                            }
+                            break;
+
+                        case 2:
+                            switch (osc_.lfo[0].target) {
+                                case 0:
+                                    lfoTarget = 1;
+                                    break;
+
+                                case 1:
+                                    lfoTarget = 0;
+                                    break;
+                            }
+                            break;
+                    }
+
+                    osc_lfo_setTarget(osc_, osc_.lfo[1], lfoTarget);
+                    break;
+
+                case 5:
+                    if (osc_.lfo[1].rate > kMinLfoRate)
+                        osc_lfo_setRate(osc_, osc_.lfo[1], osc_.lfo[1].rate - 1);
+                    break;
+
+                case 6:
+                    if (osc_.lfo[1].depth > kMinLfoDepth)
+                        osc_lfo_setDepth(osc_, osc_.lfo[1], osc_.lfo[1].depth - 1);
+                    break;
+
+                case 7:
+                    osc_lfo_setLoop(osc_, osc_.lfo[1], !osc_.lfo[1].loop);
+                    break;
+            }
             break;
 
-        case 6:
-            if (osc_.lfo[1].depth > kMinLfoDepth)
-                osc_lfo_setDepth(osc_, osc_.lfo[1], osc_.lfo[1].depth - 1);
+        default:
             break;
-
-        case 7:
-            osc_lfo_setLoop(osc_, osc_.lfo[1], !osc_.lfo[1].loop);
-            break;
-        }
-        break;
-
-    default:
-        break;
     }
 }
 
-void Controller::osc_setActive(Osc &osc_, bool active_) {
+void Controller::osc_setActive(Osc& osc_, bool active_) {
     // update data
     osc_.active = active_;
     // update lcd
@@ -9353,8 +9993,9 @@ void Controller::osc_setActive(Osc &osc_, bool active_) {
     lcd_drawInfo_Osc_GraphData(osc_);
 }
 
-void Controller::osc_setWavetableSelected(Osc &osc_, int16_t wavetable_) {
+void Controller::osc_setWavetableSelected(Osc& osc_, int16_t wavetable_) {
     if ((wavetable_ >= -1) && (wavetable_ < wavetableLibrarySize)) {
+        osc_.wavetableLoading = true;
         // disable keyboard
         keyboard_disable();
         // update data
@@ -9377,7 +10018,7 @@ void Controller::osc_setWavetableSelected(Osc &osc_, int16_t wavetable_) {
                 // write nameLongR
                 strncpy(osc_.wavetableSelectedData.nameLongR, temp, kFileNameSize);
                 // write nameShort
-                char *temp2 = strtok(temp, ".");
+                char* temp2 = strtok(temp, ".");
                 uint8_t length = strlen(temp2);
                 if (length > 10) {
                     strncpy(osc_.wavetableSelectedData.nameShortR, temp2, 9);
@@ -9434,37 +10075,37 @@ void Controller::osc_setWavetableSelected(Osc &osc_, int16_t wavetable_) {
                                     osc_.wavetableSelectedData.coefSampleSize = 1.0f;
                                     // calculate sampleSize
                                     switch (osc_.wavSelectedData.fmt_chunk.nbrChannels) {
-                                    case 0x01:
-                                        osc_.wavetableSelectedData.coefSampleSize *= 1;
-                                        osc_.wavetableSelectedData.channel = CH_MONO;
-                                        break;
+                                        case 0x01:
+                                            osc_.wavetableSelectedData.coefSampleSize *= 1;
+                                            osc_.wavetableSelectedData.channel = CH_MONO;
+                                            break;
 
-                                    case 0x02:
-                                        osc_.wavetableSelectedData.coefSampleSize *= 0.5;
-                                        osc_.wavetableSelectedData.channel = CH_STEREO;
-                                        break;
+                                        case 0x02:
+                                            osc_.wavetableSelectedData.coefSampleSize *= 0.5;
+                                            osc_.wavetableSelectedData.channel = CH_STEREO;
+                                            break;
                                     }
 
                                     switch (osc_.wavSelectedData.fmt_chunk.bitPerSample) {
-                                    case 8:
-                                        osc_.wavetableSelectedData.coefSampleSize *= 1;
-                                        osc_.wavetableSelectedData.bitdepth = BD_08;
-                                        break;
+                                        case 8:
+                                            osc_.wavetableSelectedData.coefSampleSize *= 1;
+                                            osc_.wavetableSelectedData.bitdepth = BD_08;
+                                            break;
 
-                                    case 16:
-                                        osc_.wavetableSelectedData.coefSampleSize /= 2;
-                                        osc_.wavetableSelectedData.bitdepth = BD_16;
-                                        break;
+                                        case 16:
+                                            osc_.wavetableSelectedData.coefSampleSize /= 2;
+                                            osc_.wavetableSelectedData.bitdepth = BD_16;
+                                            break;
 
-                                    case 24:
-                                        osc_.wavetableSelectedData.coefSampleSize /= 3;
-                                        osc_.wavetableSelectedData.bitdepth = BD_24;
-                                        break;
+                                        case 24:
+                                            osc_.wavetableSelectedData.coefSampleSize /= 3;
+                                            osc_.wavetableSelectedData.bitdepth = BD_24;
+                                            break;
 
-                                    case 32:
-                                        osc_.wavetableSelectedData.coefSampleSize /= 4;
-                                        osc_.wavetableSelectedData.bitdepth = BD_32;
-                                        break;
+                                        case 32:
+                                            osc_.wavetableSelectedData.coefSampleSize /= 4;
+                                            osc_.wavetableSelectedData.bitdepth = BD_32;
+                                            break;
                                     }
 
                                     osc_.wavetableSelectedData.sampleByteSize = osc_.wavSelectedData.data_chunk.chunkSize;
@@ -9474,149 +10115,149 @@ void Controller::osc_setWavetableSelected(Osc &osc_, int16_t wavetable_) {
 
                                     if (remainder == 0) {
                                         switch (osc_.wavetableSelectedData.stepSize) {
-                                        case 1:
-                                            osc_.wavetableSelectedData.step = ST_001;
-                                            break;
+                                            case 1:
+                                                osc_.wavetableSelectedData.step = ST_001;
+                                                break;
 
-                                        case 2:
-                                            osc_.wavetableSelectedData.step = ST_002;
-                                            break;
+                                            case 2:
+                                                osc_.wavetableSelectedData.step = ST_002;
+                                                break;
 
-                                        case 4:
-                                            osc_.wavetableSelectedData.step = ST_004;
-                                            break;
+                                            case 4:
+                                                osc_.wavetableSelectedData.step = ST_004;
+                                                break;
 
-                                        case 8:
-                                            osc_.wavetableSelectedData.step = ST_008;
-                                            break;
+                                            case 8:
+                                                osc_.wavetableSelectedData.step = ST_008;
+                                                break;
 
-                                        case 16:
-                                            osc_.wavetableSelectedData.step = ST_016;
-                                            break;
+                                            case 16:
+                                                osc_.wavetableSelectedData.step = ST_016;
+                                                break;
 
-                                        case 24:
-                                            osc_.wavetableSelectedData.step = ST_024;
-                                            break;
+                                            case 24:
+                                                osc_.wavetableSelectedData.step = ST_024;
+                                                break;
 
-                                        case 32:
-                                            osc_.wavetableSelectedData.step = ST_032;
-                                            break;
+                                            case 32:
+                                                osc_.wavetableSelectedData.step = ST_032;
+                                                break;
 
-                                        case 40:
-                                            osc_.wavetableSelectedData.step = ST_040;
-                                            break;
+                                            case 40:
+                                                osc_.wavetableSelectedData.step = ST_040;
+                                                break;
 
-                                        case 48:
-                                            osc_.wavetableSelectedData.step = ST_048;
-                                            break;
+                                            case 48:
+                                                osc_.wavetableSelectedData.step = ST_048;
+                                                break;
 
-                                        case 56:
-                                            osc_.wavetableSelectedData.step = ST_056;
-                                            break;
+                                            case 56:
+                                                osc_.wavetableSelectedData.step = ST_056;
+                                                break;
 
-                                        case 64:
-                                            osc_.wavetableSelectedData.step = ST_064;
-                                            break;
+                                            case 64:
+                                                osc_.wavetableSelectedData.step = ST_064;
+                                                break;
 
-                                        case 72:
-                                            osc_.wavetableSelectedData.step = ST_072;
-                                            break;
+                                            case 72:
+                                                osc_.wavetableSelectedData.step = ST_072;
+                                                break;
 
-                                        case 80:
-                                            osc_.wavetableSelectedData.step = ST_080;
-                                            break;
+                                            case 80:
+                                                osc_.wavetableSelectedData.step = ST_080;
+                                                break;
 
-                                        case 88:
-                                            osc_.wavetableSelectedData.step = ST_088;
-                                            break;
+                                            case 88:
+                                                osc_.wavetableSelectedData.step = ST_088;
+                                                break;
 
-                                        case 96:
-                                            osc_.wavetableSelectedData.step = ST_096;
-                                            break;
+                                            case 96:
+                                                osc_.wavetableSelectedData.step = ST_096;
+                                                break;
 
-                                        case 104:
-                                            osc_.wavetableSelectedData.step = ST_104;
-                                            break;
+                                            case 104:
+                                                osc_.wavetableSelectedData.step = ST_104;
+                                                break;
 
-                                        case 112:
-                                            osc_.wavetableSelectedData.step = ST_112;
-                                            break;
+                                            case 112:
+                                                osc_.wavetableSelectedData.step = ST_112;
+                                                break;
 
-                                        case 120:
-                                            osc_.wavetableSelectedData.step = ST_120;
-                                            break;
+                                            case 120:
+                                                osc_.wavetableSelectedData.step = ST_120;
+                                                break;
 
-                                        case 128:
-                                            osc_.wavetableSelectedData.step = ST_128;
-                                            break;
+                                            case 128:
+                                                osc_.wavetableSelectedData.step = ST_128;
+                                                break;
 
-                                        case 136:
-                                            osc_.wavetableSelectedData.step = ST_136;
-                                            break;
+                                            case 136:
+                                                osc_.wavetableSelectedData.step = ST_136;
+                                                break;
 
-                                        case 144:
-                                            osc_.wavetableSelectedData.step = ST_144;
-                                            break;
+                                            case 144:
+                                                osc_.wavetableSelectedData.step = ST_144;
+                                                break;
 
-                                        case 152:
-                                            osc_.wavetableSelectedData.step = ST_152;
-                                            break;
+                                            case 152:
+                                                osc_.wavetableSelectedData.step = ST_152;
+                                                break;
 
-                                        case 160:
-                                            osc_.wavetableSelectedData.step = ST_160;
-                                            break;
+                                            case 160:
+                                                osc_.wavetableSelectedData.step = ST_160;
+                                                break;
 
-                                        case 168:
-                                            osc_.wavetableSelectedData.step = ST_168;
-                                            break;
+                                            case 168:
+                                                osc_.wavetableSelectedData.step = ST_168;
+                                                break;
 
-                                        case 176:
-                                            osc_.wavetableSelectedData.step = ST_176;
-                                            break;
+                                            case 176:
+                                                osc_.wavetableSelectedData.step = ST_176;
+                                                break;
 
-                                        case 184:
-                                            osc_.wavetableSelectedData.step = ST_184;
-                                            break;
+                                            case 184:
+                                                osc_.wavetableSelectedData.step = ST_184;
+                                                break;
 
-                                        case 192:
-                                            osc_.wavetableSelectedData.step = ST_192;
-                                            break;
+                                            case 192:
+                                                osc_.wavetableSelectedData.step = ST_192;
+                                                break;
 
-                                        case 200:
-                                            osc_.wavetableSelectedData.step = ST_200;
-                                            break;
+                                            case 200:
+                                                osc_.wavetableSelectedData.step = ST_200;
+                                                break;
 
-                                        case 208:
-                                            osc_.wavetableSelectedData.step = ST_208;
-                                            break;
+                                            case 208:
+                                                osc_.wavetableSelectedData.step = ST_208;
+                                                break;
 
-                                        case 216:
-                                            osc_.wavetableSelectedData.step = ST_216;
-                                            break;
+                                            case 216:
+                                                osc_.wavetableSelectedData.step = ST_216;
+                                                break;
 
-                                        case 224:
-                                            osc_.wavetableSelectedData.step = ST_224;
-                                            break;
+                                            case 224:
+                                                osc_.wavetableSelectedData.step = ST_224;
+                                                break;
 
-                                        case 232:
-                                            osc_.wavetableSelectedData.step = ST_232;
-                                            break;
+                                            case 232:
+                                                osc_.wavetableSelectedData.step = ST_232;
+                                                break;
 
-                                        case 240:
-                                            osc_.wavetableSelectedData.step = ST_240;
-                                            break;
+                                            case 240:
+                                                osc_.wavetableSelectedData.step = ST_240;
+                                                break;
 
-                                        case 248:
-                                            osc_.wavetableSelectedData.step = ST_248;
-                                            break;
+                                            case 248:
+                                                osc_.wavetableSelectedData.step = ST_248;
+                                                break;
 
-                                        case 256:
-                                            osc_.wavetableSelectedData.step = ST_256;
-                                            break;
+                                            case 256:
+                                                osc_.wavetableSelectedData.step = ST_256;
+                                                break;
 
-                                        default:
-                                            osc_.wavetableSelectedData.step = ST_NA;
-                                            break;
+                                            default:
+                                                osc_.wavetableSelectedData.step = ST_NA;
+                                                break;
                                         }
                                     } else {
                                         osc_.wavetableSelectedData.step = ST_NA;
@@ -9660,6 +10301,7 @@ void Controller::osc_setWavetableSelected(Osc &osc_, int16_t wavetable_) {
             osc_.wavetableSelectedReadError = false;
             osc_.wavetableSelectedTypeError = false;
         }
+        osc_.wavetableLoading = false;
         f_close(&sd.file);
         // enable keyboard
         keyboard_enable();
@@ -9669,8 +10311,9 @@ void Controller::osc_setWavetableSelected(Osc &osc_, int16_t wavetable_) {
     }
 }
 
-void Controller::osc_setWavetableLoaded(Osc &osc_, bool view_) {
+void Controller::osc_setWavetableLoaded(Osc& osc_, bool view_) {
     if ((!osc_.wavetableSelectedReadError) && (!osc_.wavetableSelectedTypeError) && (osc_.wavetableSelected != osc_.wavetableLoaded)) {
+        osc_.wavetableLoading = true;
         // disable keyboard
         keyboard_disable();
         if (osc_.wavetableSelected != -1) {
@@ -9689,11 +10332,12 @@ void Controller::osc_setWavetableLoaded(Osc &osc_, bool view_) {
                 }
                 // read sample
                 uint32_t rawDataSize = osc_.wavetableLoadedData.sampleByteSize;
-                uint32_t rawArraySize = 96000;
+                // 98304 = 96KB: a multiple of 1024 for clean SD sector-aligned reads.
+                uint32_t rawArraySize = 98304;
                 uint32_t rawArrayCounterMax = rawDataSize / rawArraySize;
                 uint32_t rawArrayRemainder = rawDataSize % rawArraySize;
 
-                uint8_t rawArray[rawArraySize];
+                static uint8_t rawArray[98304];
 
                 uint8_t coefChannel;
                 uint8_t coefBps;
@@ -9701,30 +10345,30 @@ void Controller::osc_setWavetableLoaded(Osc &osc_, bool view_) {
                 uint32_t sdramDataCounter = 0;
 
                 switch (osc_.wavLoadedData.fmt_chunk.nbrChannels) {
-                case 1:
-                    coefChannel = 1;
-                    break;
-                case 2:
-                    coefChannel = 2;
-                    break;
+                    case 1:
+                        coefChannel = 1;
+                        break;
+                    case 2:
+                        coefChannel = 2;
+                        break;
                 }
 
                 switch (osc_.wavLoadedData.fmt_chunk.bitPerSample) {
-                case 8:
-                    coefBps = 1;
-                    break;
+                    case 8:
+                        coefBps = 1;
+                        break;
 
-                case 16:
-                    coefBps = 2;
-                    break;
+                    case 16:
+                        coefBps = 2;
+                        break;
 
-                case 24:
-                    coefBps = 3;
-                    break;
+                    case 24:
+                        coefBps = 3;
+                        break;
 
-                case 32:
-                    coefBps = 4;
-                    break;
+                    case 32:
+                        coefBps = 4;
+                        break;
                 }
 
                 uint32_t offsetSize = coefChannel * coefBps;
@@ -9743,38 +10387,50 @@ void Controller::osc_setWavetableLoaded(Osc &osc_, bool view_) {
 
                 f_close(&sd.file);
                 if ((f_open(&sd.file, fileName, FA_READ) == FR_OK) && (f_lseek(&sd.file, osc_.wavLoadedData.data_chunk.chunkStartByte + 8) == FR_OK)) {
-                    (osc_.playWavetableSector == 0) ? osc_.writeWavetableSector = 1 : osc_.writeWavetableSector = 0;
-                    osc_.wavetableSector[osc_.writeWavetableSector].size = osc_.wavetableLoadedData.sampleSize - 1;
+                    uint32_t primask = __get_PRIMASK();
+                    __disable_irq();
+                    bool currentSectorBusy =
+                        (sD.beatPlayData[0].oscPlayData[osc_.number].sdramReadActive &&
+                         (sD.beatPlayData[0].oscPlayData[osc_.number].address == kRamWavetableAddressLibrary[osc_.number][osc_.playWavetableSector])) ||
+                        (sD.beatPlayData[1].oscPlayData[osc_.number].sdramReadActive &&
+                         (sD.beatPlayData[1].oscPlayData[osc_.number].address == kRamWavetableAddressLibrary[osc_.number][osc_.playWavetableSector]));
+                    osc_.writeWavetableSector = currentSectorBusy ? ((osc_.playWavetableSector == 0) ? 1 : 0) : osc_.playWavetableSector;
+                    osc_.wavetableSector[osc_.writeWavetableSector].writeMode = true;
+                    __set_PRIMASK(primask);
+                    osc_.wavetableSector[osc_.writeWavetableSector].size = (osc_.wavetableLoadedData.sampleSize > 0) ? (osc_.wavetableLoadedData.sampleSize - 1) : 0;
+
+                    bool wavetableReadFailed = false;
                     for (uint32_t i = 0; i <= rawArrayCounterMax; i++) {
                         // file to raw
                         (i < rawArrayCounterMax) ? readArraySize = rawArraySize : readArraySize = rawArrayRemainder;
-                        if (f_read(&sd.file, (char *)&rawArray, readArraySize, &sd.bytesread) == FR_OK) {
-
+                        if ((f_read(&sd.file, (char*)&rawArray, readArraySize, &sd.bytesread) == FR_OK) && (sd.bytesread == readArraySize)) {
                             // raw to temp
                             readSampleSize = readArraySize / offsetSize;
                             int16_t writeData;
 
                             for (int j = 0; j < readSampleSize; j++) {
                                 if (osc_.wavLoadedData.fmt_chunk.bitPerSample == 8) {
-                                    int8_t *dataPtr = (int8_t *)&rawArray[j * offsetSize];
+                                    int8_t* dataPtr = (int8_t*)&rawArray[j * offsetSize];
                                     int8_t temp = *dataPtr - 128;
                                     int16_t data = (int16_t)(temp << 8);
                                     if (temp >> 7)
                                         data |= (0xFF << 16);
                                     writeData = data;
                                 } else if (osc_.wavLoadedData.fmt_chunk.bitPerSample == 16) {
-                                    int16_t *dataPtr = (int16_t *)&rawArray[j * offsetSize];
+                                    int16_t* dataPtr = (int16_t*)&rawArray[j * offsetSize];
                                     writeData = (int16_t)*dataPtr;
                                 } else if (osc_.wavLoadedData.fmt_chunk.bitPerSample == 24) {
-                                    int16_t *dataPtr = (int16_t *)&rawArray[(j * offsetSize) + 1];
+                                    int16_t* dataPtr = (int16_t*)&rawArray[(j * offsetSize) + 1];
                                     writeData = (int16_t)*dataPtr;
                                 } else if (osc_.wavLoadedData.fmt_chunk.bitPerSample == 32) {
-                                    float *dataPtr = (float *)&rawArray[j * offsetSize];
+                                    float* dataPtr = (float*)&rawArray[j * offsetSize];
                                     int16_t data = (int16_t)((*dataPtr) * 32767);
                                     writeData = data;
                                 }
 
                                 // temp to sdram
+                                if (sdramDataCounter >= kWavetableSize)
+                                    break;
                                 if (writeData < minData)
                                     minData = writeData;
                                 if (writeData > maxData)
@@ -9782,22 +10438,50 @@ void Controller::osc_setWavetableLoaded(Osc &osc_, bool view_) {
                                 sdram_write16BitAudio(kRamWavetableAddressLibrary[osc_.number][osc_.writeWavetableSector] + (sdramDataCounter * 2), writeData);
                                 sdramDataCounter += 1;
                             }
+                        } else {
+                            wavetableReadFailed = true;
+                            break;
                         }
+                        // lcd_drawPlay();
                     }
 
-                    minData *= -1;
-                    (minData > maxData) ? limitData = minData : limitData = maxData;
-                    osc_.wavetableSector[osc_.writeWavetableSector].normMultiplier = 32767.0f / limitData;
+                    if (!wavetableReadFailed) {
+                        minData *= -1;
+                        (minData > maxData) ? limitData = minData : limitData = maxData;
+                        osc_.wavetableSector[osc_.writeWavetableSector].normMultiplier = (limitData > 0) ? (32767.0f / limitData) : 1.0f;
 
-                    osc_.playWavetableSector = osc_.writeWavetableSector;
-                    osc_.writeWavetableSector != osc_.writeWavetableSector;
+                        uint32_t primaskDone = __get_PRIMASK();
+                        __disable_irq();
+                        __DMB();
+                        osc_.wavetableSector[osc_.writeWavetableSector].writeMode = false;
+                        osc_.playWavetableSector = osc_.writeWavetableSector;
+                        osc_.writeWavetableSector = (osc_.playWavetableSector == 0) ? 1 : 0;
+                        __set_PRIMASK(primaskDone);
 
-                    osc_.start = kStepDataLibrary[osc_.wavetableLoadedData.step].min;
-                    osc_.end = kStepDataLibrary[osc_.wavetableLoadedData.step].max;
-                    osc_.waveStart = kStepDataLibrary[osc_.wavetableLoadedData.step].data[osc_.start];
-                    osc_.waveEnd = kStepDataLibrary[osc_.wavetableLoadedData.step].data[osc_.end];
+                        osc_.start = kStepDataLibrary[osc_.wavetableLoadedData.step].min;
+                        osc_.end = kStepDataLibrary[osc_.wavetableLoadedData.step].max;
+                        osc_.waveStart = kStepDataLibrary[osc_.wavetableLoadedData.step].data[osc_.start];
+                        osc_.waveEnd = kStepDataLibrary[osc_.wavetableLoadedData.step].data[osc_.end];
 
-                    osc_.wavetablePlay = true;
+                        osc_.wavetablePlay = true;
+                        sdReadFailCount = 0;
+                    } else {
+                        uint32_t primaskFail = __get_PRIMASK();
+                        __disable_irq();
+                        osc_.wavetableSector[osc_.writeWavetableSector].size = 0;
+                        __DMB();
+                        osc_.wavetableSector[osc_.writeWavetableSector].writeMode = false;
+                        osc_.playWavetableSector = osc_.writeWavetableSector;
+                        osc_.writeWavetableSector = (osc_.playWavetableSector == 0) ? 1 : 0;
+                        __set_PRIMASK(primaskFail);
+                        osc_.wavetablePlay = false;
+
+                        if (++sdReadFailCount >= 3) {
+                            sdReadFailCount = 0;
+                            sd_unmount();
+                            sd_mount();
+                        }
+                    }
 
                     /*
                     lcd.setForeColor(WHITE);
@@ -9834,6 +10518,7 @@ void Controller::osc_setWavetableLoaded(Osc &osc_, bool view_) {
         }
     }
 
+    osc_.wavetableLoading = false;
     f_close(&sd.file);
     // enable keyboard
     keyboard_enable();
@@ -9856,7 +10541,7 @@ void Controller::osc_setWavetableLoaded(Osc &osc_, bool view_) {
     }
 }
 
-void Controller::osc_setLevel(Osc &osc_, uint8_t level_) {
+void Controller::osc_setLevel(Osc& osc_, uint8_t level_) {
     if ((level_ >= kMinOscLevel) && (level_ <= kMaxOscLevel)) {
         // update data
         osc_.level = level_;
@@ -9867,7 +10552,7 @@ void Controller::osc_setLevel(Osc &osc_, uint8_t level_) {
     }
 }
 
-void Controller::osc_setTune(Osc &osc_, uint8_t tune_) {
+void Controller::osc_setTune(Osc& osc_, uint8_t tune_) {
     if ((tune_ >= kMinOscTune) && (tune_ <= kMaxOscTune)) {
         // update data
         osc_.tune = tune_;
@@ -9878,7 +10563,7 @@ void Controller::osc_setTune(Osc &osc_, uint8_t tune_) {
     }
 }
 
-void Controller::osc_setPhase(Osc &osc_, uint8_t phase_) {
+void Controller::osc_setPhase(Osc& osc_, uint8_t phase_) {
     if ((phase_ >= kMinOscPhase) && (phase_ <= kMaxOscPhase)) {
         // update data
         osc_.phase = phase_;
@@ -9889,7 +10574,7 @@ void Controller::osc_setPhase(Osc &osc_, uint8_t phase_) {
     }
 }
 
-void Controller::osc_setNormalize(Osc &osc_, bool norm_) {
+void Controller::osc_setNormalize(Osc& osc_, bool norm_) {
     // update data
     osc_.normalize = norm_;
     // update lcd
@@ -9897,7 +10582,7 @@ void Controller::osc_setNormalize(Osc &osc_, bool norm_) {
         lcd_drawOsc_NormalizeData(osc_);
 }
 
-void Controller::osc_setStart(Osc &osc_, uint16_t start_) {
+void Controller::osc_setStart(Osc& osc_, uint16_t start_) {
     if ((start_ >= kStepDataLibrary[osc_.wavetableLoadedData.step].min) && (start_ <= kStepDataLibrary[osc_.wavetableLoadedData.step].max)) {
         // update data
         osc_.start = start_;
@@ -9909,7 +10594,7 @@ void Controller::osc_setStart(Osc &osc_, uint16_t start_) {
     }
 }
 
-void Controller::osc_setEnd(Osc &osc_, uint16_t end_) {
+void Controller::osc_setEnd(Osc& osc_, uint16_t end_) {
     if ((end_ >= kStepDataLibrary[osc_.wavetableLoadedData.step].min) && (end_ <= kStepDataLibrary[osc_.wavetableLoadedData.step].max)) {
         // update data
         osc_.end = end_;
@@ -9921,7 +10606,7 @@ void Controller::osc_setEnd(Osc &osc_, uint16_t end_) {
     }
 }
 
-void Controller::osc_setXFlip(Osc &osc_, bool xFlip_) {
+void Controller::osc_setXFlip(Osc& osc_, bool xFlip_) {
     // update data
     osc_.xFlip = xFlip_;
     // update lcd
@@ -9930,7 +10615,7 @@ void Controller::osc_setXFlip(Osc &osc_, bool xFlip_) {
     lcd_drawInfo_Osc_GraphData(osc_);
 }
 
-void Controller::osc_setYFlip(Osc &osc_, bool yFlip_) {
+void Controller::osc_setYFlip(Osc& osc_, bool yFlip_) {
     // update data
     osc_.yFlip = yFlip_;
     // update lcd
@@ -9939,7 +10624,7 @@ void Controller::osc_setYFlip(Osc &osc_, bool yFlip_) {
     lcd_drawInfo_Osc_GraphData(osc_);
 }
 
-void Controller::osc_lfo_setActive(Osc &osc_, Lfo &lfo_, uint8_t active_) {
+void Controller::osc_lfo_setActive(Osc& osc_, Lfo& lfo_, uint8_t active_) {
     // update data
     lfo_.active = active_;
     // update lcd
@@ -9951,7 +10636,7 @@ void Controller::osc_lfo_setActive(Osc &osc_, Lfo &lfo_, uint8_t active_) {
     lcd_drawInfo_OscLfo_GraphData(osc_, lfo_);
 }
 
-void Controller::osc_lfo_setType(Osc &osc_, Lfo &lfo_, uint8_t type_) {
+void Controller::osc_lfo_setType(Osc& osc_, Lfo& lfo_, uint8_t type_) {
     if ((type_ >= kMinLfoType) && (type_ <= kMaxLfoType)) {
         // update data
         lfo_.type = type_;
@@ -9964,7 +10649,7 @@ void Controller::osc_lfo_setType(Osc &osc_, Lfo &lfo_, uint8_t type_) {
     }
 }
 
-void Controller::osc_lfo_setTarget(Osc &osc_, Lfo &lfo_, uint8_t target_) {
+void Controller::osc_lfo_setTarget(Osc& osc_, Lfo& lfo_, uint8_t target_) {
     if ((target_ >= kMinLfoTarget) && (target_ <= kMaxLfoTarget)) {
         // update data
         lfo_.target = target_;
@@ -9976,7 +10661,7 @@ void Controller::osc_lfo_setTarget(Osc &osc_, Lfo &lfo_, uint8_t target_) {
     }
 }
 
-void Controller::osc_lfo_setRate(Osc &osc_, Lfo &lfo_, uint8_t rate_) {
+void Controller::osc_lfo_setRate(Osc& osc_, Lfo& lfo_, uint8_t rate_) {
     if ((rate_ >= kMinLfoRate) && (rate_ <= kMaxLfoRate)) {
         // update data
         lfo_.rate = rate_;
@@ -9988,7 +10673,7 @@ void Controller::osc_lfo_setRate(Osc &osc_, Lfo &lfo_, uint8_t rate_) {
     }
 }
 
-void Controller::osc_lfo_setDepth(Osc &osc_, Lfo &lfo_, uint8_t depth_) {
+void Controller::osc_lfo_setDepth(Osc& osc_, Lfo& lfo_, uint8_t depth_) {
     if ((depth_ >= kMinLfoDepth) && (depth_ <= kMaxLfoDepth)) {
         // update data
         lfo_.depth = depth_;
@@ -9999,7 +10684,7 @@ void Controller::osc_lfo_setDepth(Osc &osc_, Lfo &lfo_, uint8_t depth_) {
     }
 }
 
-void Controller::osc_lfo_setLoop(Osc &osc_, Lfo &lfo_, bool loop_) {
+void Controller::osc_lfo_setLoop(Osc& osc_, Lfo& lfo_, bool loop_) {
     // update data
     lfo_.loop = loop_;
     // update lcd
@@ -10053,15 +10738,8 @@ void Controller::filter_reset(uint8_t filterNum_) {
     filter_setDry(filterNum_, kInitialFilterDry);
     filter_setWet(filterNum_, kInitialFilterWet);
 
-    Filter &filter_ = filter[filterNum_];
-
-    filter_.dataIn[0] = 0;
-    filter_.dataIn[1] = 0;
-    filter_.dataIn[2] = 0;
-
-    filter_.dataOut[0] = 0;
-    filter_.dataOut[1] = 0;
-    filter_.dataOut[2] = 0;
+    Filter& filter_ = filter[filterNum_];
+    filter_.cleanMemory();
 }
 
 void Controller::filter_menuRight() {
@@ -10085,51 +10763,51 @@ void Controller::filter_menuUp() {
     (menu == FILTER_0_MENU) ? filterNum = 0 : filterNum = 1;
 
     switch (menuTab) {
-    case 0:
-        filter_setActive(filterNum, !filter[filterNum].active);
-        break;
+        case 0:
+            filter_setActive(filterNum, !filter[filterNum].active);
+            break;
 
-    case 2:
-        if (filter[filterNum].type < kMaxFilterType) {
-            filter_setType(filterNum, filter[filterNum].type + 1);
-        } else {
-            filter_setType(filterNum, kMinFilterType);
-        }
-        break;
+        case 2:
+            if (filter[filterNum].type < kMaxFilterType) {
+                filter_setType(filterNum, filter[filterNum].type + 1);
+            } else {
+                filter_setType(filterNum, kMinFilterType);
+            }
+            break;
 
-    case 3:
-        if (filter[filterNum].freq < kMaxFilterFreq) {
-            filter_setFreq(filterNum, filter[filterNum].freq + 1);
-        }
-        break;
+        case 3:
+            if (filter[filterNum].freq < kMaxFilterFreq) {
+                filter_setFreq(filterNum, filter[filterNum].freq + 1);
+            }
+            break;
 
-    case 4:
-        if (filter[filterNum].res < kMaxFilterRes) {
-            filter_setRes(filterNum, filter[filterNum].res + 1);
-        }
-        break;
+        case 4:
+            if (filter[filterNum].res < kMaxFilterRes) {
+                filter_setRes(filterNum, filter[filterNum].res + 1);
+            }
+            break;
 
-    case 5:
-        if (filter[filterNum].slope < kMaxFilterSlope) {
-            filter_setSlope(filterNum, filter[filterNum].slope + 1);
-        }
-        break;
+        case 5:
+            if (filter[filterNum].slope < kMaxFilterSlope) {
+                filter_setSlope(filterNum, filter[filterNum].slope + 1);
+            }
+            break;
 
-    case 6:
-        if (filter[filterNum].dry < kMaxFilterDry) {
-            filter_setDry(filterNum, filter[filterNum].dry + 1);
-        } else if ((filter[filterNum].dry == kMaxFilterDry) && (filter[filterNum].wet > kMinFilterWet)) {
-            filter_setWet(filterNum, filter[filterNum].wet - 1);
-        }
-        break;
+        case 6:
+            if (filter[filterNum].dry < kMaxFilterDry) {
+                filter_setDry(filterNum, filter[filterNum].dry + 1);
+            } else if ((filter[filterNum].dry == kMaxFilterDry) && (filter[filterNum].wet > kMinFilterWet)) {
+                filter_setWet(filterNum, filter[filterNum].wet - 1);
+            }
+            break;
 
-    case 7:
-        if (filter[filterNum].wet < kMaxFilterWet) {
-            filter_setWet(filterNum, filter[filterNum].wet + 1);
-        } else if ((filter[filterNum].wet == kMaxFilterWet) && (filter[filterNum].dry > kMinFilterDry)) {
-            filter_setDry(filterNum, filter[filterNum].dry - 1);
-        }
-        break;
+        case 7:
+            if (filter[filterNum].wet < kMaxFilterWet) {
+                filter_setWet(filterNum, filter[filterNum].wet + 1);
+            } else if ((filter[filterNum].wet == kMaxFilterWet) && (filter[filterNum].dry > kMinFilterDry)) {
+                filter_setDry(filterNum, filter[filterNum].dry - 1);
+            }
+            break;
     }
 }
 
@@ -10138,52 +10816,52 @@ void Controller::filter_menuDown() {
     (menu == FILTER_0_MENU) ? filterNum = 0 : filterNum = 1;
 
     switch (menuTab) {
-    case 0:
-        filter_setActive(filterNum, !filter[filterNum].active);
-        break;
+        case 0:
+            filter_setActive(filterNum, !filter[filterNum].active);
+            break;
 
-    case 2:
-        if (filter[filterNum].type > kMinFilterType) {
-            filter_setType(filterNum, filter[filterNum].type - 1);
-        } else {
-            filter_setType(filterNum, kMaxFilterType);
-        }
-        break;
+        case 2:
+            if (filter[filterNum].type > kMinFilterType) {
+                filter_setType(filterNum, filter[filterNum].type - 1);
+            } else {
+                filter_setType(filterNum, kMaxFilterType);
+            }
+            break;
 
-    case 3:
-        if (filter[filterNum].freq > kMinFilterFreq) {
-            filter_setFreq(filterNum, filter[filterNum].freq - 1);
-        }
-        break;
+        case 3:
+            if (filter[filterNum].freq > kMinFilterFreq) {
+                filter_setFreq(filterNum, filter[filterNum].freq - 1);
+            }
+            break;
 
-    case 4:
-        if (filter[filterNum].res > kMinFilterRes) {
-            filter_setRes(filterNum, filter[filterNum].res - 1);
-        }
-        break;
+        case 4:
+            if (filter[filterNum].res > kMinFilterRes) {
+                filter_setRes(filterNum, filter[filterNum].res - 1);
+            }
+            break;
 
-    case 5:
-        if (filter[filterNum].slope > kMinFilterSlope) {
-            filter_setSlope(filterNum, filter[filterNum].slope - 1);
-        }
-        break;
+        case 5:
+            if (filter[filterNum].slope > kMinFilterSlope) {
+                filter_setSlope(filterNum, filter[filterNum].slope - 1);
+            }
+            break;
 
-    case 6:
-        if (filter[filterNum].dry > kMinFilterDry) {
-            filter_setDry(filterNum, filter[filterNum].dry - 1);
-        }
-        break;
+        case 6:
+            if (filter[filterNum].dry > kMinFilterDry) {
+                filter_setDry(filterNum, filter[filterNum].dry - 1);
+            }
+            break;
 
-    case 7:
-        if (filter[filterNum].wet > kMinFilterWet) {
-            filter_setWet(filterNum, filter[filterNum].wet - 1);
-        }
-        break;
+        case 7:
+            if (filter[filterNum].wet > kMinFilterWet) {
+                filter_setWet(filterNum, filter[filterNum].wet - 1);
+            }
+            break;
     }
 }
 
 void Controller::filter_setActive(uint8_t filterNum_, bool active_) {
-    Filter &filter_ = filter[filterNum_];
+    Filter& filter_ = filter[filterNum_];
 
     if ((((menu == FILTER_0_MENU) && (filterNum_ == 0)) || ((menu == FILTER_1_MENU) && (filterNum_ == 1))) && (!filter_.genTransition.active)) {
         // update data
@@ -10203,20 +10881,20 @@ void Controller::filter_setActive(uint8_t filterNum_, bool active_) {
         // update lcd
         if (menu == MAIN_MENU) {
             switch (filterNum_) {
-            case 0:
-                lcd_drawMain_Filter0Data();
-                break;
+                case 0:
+                    lcd_drawMain_Filter0Data();
+                    break;
 
-            case 1:
-                lcd_drawMain_Filter1Data();
-                break;
+                case 1:
+                    lcd_drawMain_Filter1Data();
+                    break;
             }
         }
     }
 }
 
 void Controller::filter_setType(uint8_t filterNum_, uint8_t type_) {
-    Filter &filter_ = filter[filterNum_];
+    Filter& filter_ = filter[filterNum_];
 
     if ((((menu == FILTER_0_MENU) && (filterNum_ == 0)) || ((menu == FILTER_1_MENU) && (filterNum_ == 1))) && (!filter_.genTransition.active)) {
         // update data
@@ -10239,13 +10917,13 @@ void Controller::filter_setType(uint8_t filterNum_, uint8_t type_) {
         // update lcd
         if (menu == MAIN_MENU) {
             switch (filterNum_) {
-            case 0:
-                lcd_drawMain_Filter0Data();
-                break;
+                case 0:
+                    lcd_drawMain_Filter0Data();
+                    break;
 
-            case 1:
-                lcd_drawMain_Filter1Data();
-                break;
+                case 1:
+                    lcd_drawMain_Filter1Data();
+                    break;
             }
         }
     }
@@ -10290,7 +10968,7 @@ void Controller::filter_setSlope(uint8_t filterNum_, uint8_t slope_) {
 }
 
 void Controller::filter_setDry(uint8_t filterNum_, uint8_t dry_) {
-    Filter &filter_ = filter[filterNum_];
+    Filter& filter_ = filter[filterNum_];
 
     if ((dry_ >= kMinFilterDry) && (dry_ <= kMaxFilterDry) && (!filter_.mixTransition.active)) {
         // update data
@@ -10324,7 +11002,7 @@ void Controller::filter_setDry(uint8_t filterNum_, uint8_t dry_) {
 }
 
 void Controller::filter_setWet(uint8_t filterNum_, uint8_t wet_) {
-    Filter &filter_ = filter[filterNum_];
+    Filter& filter_ = filter[filterNum_];
 
     if ((wet_ >= kMinFilterWet) && (wet_ <= kMaxFilterWet) && (!filter_.mixTransition.active)) {
         // update data
@@ -10358,8 +11036,8 @@ void Controller::filter_setWet(uint8_t filterNum_, uint8_t wet_) {
 }
 
 void Controller::filter_genTransition(uint8_t filterNum_, FilterTransitionMode mode_, bool activeActive_, bool targetActive_, uint8_t activeType_, uint8_t targetType_) {
-    Filter &filter_ = filter[filterNum_];
-    FilterGenTransition &gTransition = filter_.genTransition;
+    Filter& filter_ = filter[filterNum_];
+    FilterGenTransition& gTransition = filter_.genTransition;
 
     gTransition.mode = mode_;
     gTransition.phase = FIL_PHASE_A;
@@ -10371,24 +11049,36 @@ void Controller::filter_genTransition(uint8_t filterNum_, FilterTransitionMode m
     gTransition.targetType = targetType_;
 
     switch (mode_) {
-    case FIL_MODE_NONE:
-        break;
-
-    case FIL_MODE_ACTIVE:
-        switch (targetActive_) {
-        case true:
-            gTransition.activeDry = 1.0;
-            gTransition.targetDry = 0.0;
-
-            gTransition.activeWet = 0.0;
-            gTransition.targetWet = 1.0;
-
-            filter_.calculateCoef();
-
-            transitionShowFlag = 2;
+        case FIL_MODE_NONE:
             break;
 
-        case false:
+        case FIL_MODE_ACTIVE:
+            switch (targetActive_) {
+                case true:
+                    gTransition.activeDry = 1.0;
+                    gTransition.targetDry = 0.0;
+
+                    gTransition.activeWet = 0.0;
+                    gTransition.targetWet = 1.0;
+
+                    filter_.calculateCoef();
+
+                    transitionShowFlag = 2;
+                    break;
+
+                case false:
+                    gTransition.activeDry = 0.0;
+                    gTransition.targetDry = 1.0;
+
+                    gTransition.activeWet = 1.0;
+                    gTransition.targetWet = 0.0;
+
+                    transitionShowFlag = 1;
+                    break;
+            }
+            break;
+
+        case FIL_MODE_TYPE:
             gTransition.activeDry = 0.0;
             gTransition.targetDry = 1.0;
 
@@ -10397,18 +11087,6 @@ void Controller::filter_genTransition(uint8_t filterNum_, FilterTransitionMode m
 
             transitionShowFlag = 1;
             break;
-        }
-        break;
-
-    case FIL_MODE_TYPE:
-        gTransition.activeDry = 0.0;
-        gTransition.targetDry = 1.0;
-
-        gTransition.activeWet = 1.0;
-        gTransition.targetWet = 0.0;
-
-        transitionShowFlag = 1;
-        break;
     }
 
     filter_calculateGenTransition(filterNum_);
@@ -10416,8 +11094,8 @@ void Controller::filter_genTransition(uint8_t filterNum_, FilterTransitionMode m
 }
 
 void Controller::filter_mixTransition(uint8_t filterNum_, float dryFloat_, float wetFloat_) {
-    Filter &filter_ = filter[filterNum_];
-    FilterMixTransition &mTransition = filter_.mixTransition;
+    Filter& filter_ = filter[filterNum_];
+    FilterMixTransition& mTransition = filter_.mixTransition;
 
     mTransition.targetDry = dryFloat_;
     mTransition.targetWet = wetFloat_;
@@ -10427,8 +11105,8 @@ void Controller::filter_mixTransition(uint8_t filterNum_, float dryFloat_, float
 }
 
 void Controller::filter_calculateGenTransition(uint8_t filterNum_) {
-    Filter &filter_ = filter[filterNum_];
-    FilterGenTransition &gTransition = filter_.genTransition;
+    Filter& filter_ = filter[filterNum_];
+    FilterGenTransition& gTransition = filter_.genTransition;
 
     if (gTransition.activeDry == gTransition.targetDry) {
         gTransition.actionDry = FIL_ACTION_NONE;
@@ -10448,8 +11126,8 @@ void Controller::filter_calculateGenTransition(uint8_t filterNum_) {
 }
 
 void Controller::filter_calculateMixTransition(uint8_t filterNum_) {
-    Filter &filter_ = filter[filterNum_];
-    FilterMixTransition &mTransition = filter_.mixTransition;
+    Filter& filter_ = filter[filterNum_];
+    FilterMixTransition& mTransition = filter_.mixTransition;
 
     if (filter_.dryFloat == mTransition.targetDry) {
         mTransition.actionDry = FIL_ACTION_NONE;
@@ -10512,57 +11190,57 @@ void Controller::envelope_menuLeft() {
 
 void Controller::envelope_menuUp() {
     switch (menuTab) {
-    case 0:
-        envelope_setActive(!envelope.active);
-        break;
+        case 0:
+            envelope_setActive(!envelope.active);
+            break;
 
-    case 2:
-        if (envelope.type < kMaxEnvelopeType) {
-            envelope_setType(envelope.type + 1);
-        } else {
-            envelope_setType(kMinEnvelopeType);
-        }
-        break;
-
-    case 3:
-        if (envelope.curve < kMaxEnvelopeCurve) {
-            envelope_setCurve(envelope.curve + 1);
-        } else {
-            envelope_setCurve(kMinEnvelopeCurve);
-        }
-        break;
-
-    case 4:
-        if ((envelope.type == ENV_ADSR) || (envelope.type == ENV_ASR) || (envelope.type == ENV_AD)) {
-            if (envelope.attackTime < kMaxEnvelopeTime) {
-                envelope_setAttackTime(envelope.attackTime + 1);
+        case 2:
+            if (envelope.type < kMaxEnvelopeType) {
+                envelope_setType(envelope.type + 1);
+            } else {
+                envelope_setType(kMinEnvelopeType);
             }
-        }
-        break;
+            break;
 
-    case 5:
-        if ((envelope.type == ENV_ADSR) || (envelope.type == ENV_AD)) {
-            if (envelope.decayTime < kMaxEnvelopeTime) {
-                envelope_setDecayTime(envelope.decayTime + 1);
+        case 3:
+            if (envelope.curve < kMaxEnvelopeCurve) {
+                envelope_setCurve(envelope.curve + 1);
+            } else {
+                envelope_setCurve(kMinEnvelopeCurve);
             }
-        }
-        break;
+            break;
 
-    case 6:
-        if (envelope.type == ENV_ADSR) {
-            if (envelope.sustainLevel < kMaxEnvelopeLevel) {
-                envelope_setSustainLevel(envelope.sustainLevel + 1);
+        case 4:
+            if ((envelope.type == ENV_ADSR) || (envelope.type == ENV_ASR) || (envelope.type == ENV_AD)) {
+                if (envelope.attackTime < kMaxEnvelopeTime) {
+                    envelope_setAttackTime(envelope.attackTime + 1);
+                }
             }
-        }
-        break;
+            break;
 
-    case 7:
-        if ((envelope.type == ENV_ADSR) || (envelope.type == ENV_ASR)) {
-            if (envelope.releaseTime < kMaxEnvelopeTime) {
-                envelope_setReleaseTime(envelope.releaseTime + 1);
+        case 5:
+            if ((envelope.type == ENV_ADSR) || (envelope.type == ENV_AD)) {
+                if (envelope.decayTime < kMaxEnvelopeTime) {
+                    envelope_setDecayTime(envelope.decayTime + 1);
+                }
             }
-        }
-        break;
+            break;
+
+        case 6:
+            if (envelope.type == ENV_ADSR) {
+                if (envelope.sustainLevel < kMaxEnvelopeLevel) {
+                    envelope_setSustainLevel(envelope.sustainLevel + 1);
+                }
+            }
+            break;
+
+        case 7:
+            if ((envelope.type == ENV_ADSR) || (envelope.type == ENV_ASR)) {
+                if (envelope.releaseTime < kMaxEnvelopeTime) {
+                    envelope_setReleaseTime(envelope.releaseTime + 1);
+                }
+            }
+            break;
     }
 }
 
@@ -10571,57 +11249,57 @@ void Controller::envelope_menuDown() {
     (menu == FILTER_0_MENU) ? filterNum = 0 : filterNum = 1;
 
     switch (menuTab) {
-    case 0:
-        envelope_setActive(!envelope.active);
-        break;
+        case 0:
+            envelope_setActive(!envelope.active);
+            break;
 
-    case 2:
-        if (envelope.type > kMinEnvelopeType) {
-            envelope_setType(envelope.type - 1);
-        } else {
-            envelope_setType(kMaxEnvelopeType);
-        }
-        break;
-
-    case 3:
-        if (envelope.curve > kMinEnvelopeCurve) {
-            envelope_setCurve(envelope.curve - 1);
-        } else {
-            envelope_setCurve(kMaxEnvelopeCurve);
-        }
-        break;
-
-    case 4:
-        if ((envelope.type == ENV_ADSR) || (envelope.type == ENV_ASR) || (envelope.type == ENV_AD)) {
-            if (envelope.attackTime > kMinEnvelopeTime) {
-                envelope_setAttackTime(envelope.attackTime - 1);
+        case 2:
+            if (envelope.type > kMinEnvelopeType) {
+                envelope_setType(envelope.type - 1);
+            } else {
+                envelope_setType(kMaxEnvelopeType);
             }
-        }
-        break;
+            break;
 
-    case 5:
-        if ((envelope.type == ENV_ADSR) || (envelope.type == ENV_AD)) {
-            if (envelope.decayTime > kMinEnvelopeTime) {
-                envelope_setDecayTime(envelope.decayTime - 1);
+        case 3:
+            if (envelope.curve > kMinEnvelopeCurve) {
+                envelope_setCurve(envelope.curve - 1);
+            } else {
+                envelope_setCurve(kMaxEnvelopeCurve);
             }
-        }
-        break;
+            break;
 
-    case 6:
-        if (envelope.type == ENV_ADSR) {
-            if (envelope.sustainLevel > kMinEnvelopeLevel) {
-                envelope_setSustainLevel(envelope.sustainLevel - 1);
+        case 4:
+            if ((envelope.type == ENV_ADSR) || (envelope.type == ENV_ASR) || (envelope.type == ENV_AD)) {
+                if (envelope.attackTime > kMinEnvelopeTime) {
+                    envelope_setAttackTime(envelope.attackTime - 1);
+                }
             }
-        }
-        break;
+            break;
 
-    case 7:
-        if ((envelope.type == ENV_ADSR) || (envelope.type == ENV_ASR)) {
-            if (envelope.releaseTime > kMinEnvelopeTime) {
-                envelope_setReleaseTime(envelope.releaseTime - 1);
+        case 5:
+            if ((envelope.type == ENV_ADSR) || (envelope.type == ENV_AD)) {
+                if (envelope.decayTime > kMinEnvelopeTime) {
+                    envelope_setDecayTime(envelope.decayTime - 1);
+                }
             }
-        }
-        break;
+            break;
+
+        case 6:
+            if (envelope.type == ENV_ADSR) {
+                if (envelope.sustainLevel > kMinEnvelopeLevel) {
+                    envelope_setSustainLevel(envelope.sustainLevel - 1);
+                }
+            }
+            break;
+
+        case 7:
+            if ((envelope.type == ENV_ADSR) || (envelope.type == ENV_ASR)) {
+                if (envelope.releaseTime > kMinEnvelopeTime) {
+                    envelope_setReleaseTime(envelope.releaseTime - 1);
+                }
+            }
+            break;
     }
 }
 
@@ -10785,113 +11463,113 @@ void Controller::effect_menuLeft() {
 void Controller::effect_menuUp() {
     uint8_t effectNum_;
     (menu == EFFECT_0_MENU) ? effectNum_ = 0 : effectNum_ = 1;
-    Effect &effect_ = effect[effectNum_];
+    Effect& effect_ = effect[effectNum_];
     uint8_t type_ = effect[effectNum_].type;
-    SubEffect &subEffect_ = effect[effectNum_].subEffect[type_];
+    SubEffect& subEffect_ = effect[effectNum_].subEffect[type_];
 
     switch (menuTab) {
-    case 0:
-        effect_setActive(effectNum_, !effect[effectNum_].active);
-        break;
+        case 0:
+            effect_setActive(effectNum_, !effect[effectNum_].active);
+            break;
 
-    case 2:
-        if (effect[effectNum_].type < kMaxEffectType) {
-            effect_setType(effectNum_, effect[effectNum_].type + 1);
-        } else {
-            effect_setType(effectNum_, kMinEffectType);
-        }
-        break;
+        case 2:
+            if (effect[effectNum_].type < kMaxEffectType) {
+                effect_setType(effectNum_, effect[effectNum_].type + 1);
+            } else {
+                effect_setType(effectNum_, kMinEffectType);
+            }
+            break;
 
-    case 3:
-        if (subEffect_.aData < subEffect_.kMaxAData) {
-            effect_setAData(effectNum_, type_, subEffect_.aData + 1);
-        }
-        break;
+        case 3:
+            if (subEffect_.aData < subEffect_.kMaxAData) {
+                effect_setAData(effectNum_, type_, subEffect_.aData + 1);
+            }
+            break;
 
-    case 4:
-        if (subEffect_.bData < subEffect_.kMaxBData) {
-            effect_setBData(effectNum_, type_, subEffect_.bData + 1);
-        }
-        break;
+        case 4:
+            if (subEffect_.bData < subEffect_.kMaxBData) {
+                effect_setBData(effectNum_, type_, subEffect_.bData + 1);
+            }
+            break;
 
-    case 5:
-        if (subEffect_.cData < subEffect_.kMaxCData) {
-            effect_setCData(effectNum_, type_, subEffect_.cData + 1);
-        }
-        break;
+        case 5:
+            if (subEffect_.cData < subEffect_.kMaxCData) {
+                effect_setCData(effectNum_, type_, subEffect_.cData + 1);
+            }
+            break;
 
-    case 6:
-        if (subEffect_.dData < subEffect_.kMaxDData) {
-            effect_setDData(effectNum_, type_, subEffect_.dData + 1);
-        } else if ((type_ != EF_COMPRESSOR) && (type_ != EF_EXPANDER) && (subEffect_.dData == subEffect_.kMaxDData) && (subEffect_.eData > subEffect_.kMinEData)) {
-            effect_setEData(effectNum_, type_, subEffect_.eData - 1);
-        }
-        break;
+        case 6:
+            if (subEffect_.dData < subEffect_.kMaxDData) {
+                effect_setDData(effectNum_, type_, subEffect_.dData + 1);
+            } else if ((type_ != EF_COMPRESSOR) && (type_ != EF_EXPANDER) && (subEffect_.dData == subEffect_.kMaxDData) && (subEffect_.eData > subEffect_.kMinEData)) {
+                effect_setEData(effectNum_, type_, subEffect_.eData - 1);
+            }
+            break;
 
-    case 7:
-        if (subEffect_.eData < subEffect_.kMaxEData) {
-            effect_setEData(effectNum_, type_, subEffect_.eData + 1);
-        } else if ((type_ != EF_COMPRESSOR) && (type_ != EF_EXPANDER) && (subEffect_.eData == subEffect_.kMaxEData) && (subEffect_.dData > subEffect_.kMinDData)) {
-            effect_setDData(effectNum_, type_, subEffect_.dData - 1);
-        }
-        break;
+        case 7:
+            if (subEffect_.eData < subEffect_.kMaxEData) {
+                effect_setEData(effectNum_, type_, subEffect_.eData + 1);
+            } else if ((type_ != EF_COMPRESSOR) && (type_ != EF_EXPANDER) && (subEffect_.eData == subEffect_.kMaxEData) && (subEffect_.dData > subEffect_.kMinDData)) {
+                effect_setDData(effectNum_, type_, subEffect_.dData - 1);
+            }
+            break;
     }
 }
 
 void Controller::effect_menuDown() {
     uint8_t effectNum_;
     (menu == EFFECT_0_MENU) ? effectNum_ = 0 : effectNum_ = 1;
-    Effect &effect_ = effect[effectNum_];
+    Effect& effect_ = effect[effectNum_];
     uint8_t type_ = effect[effectNum_].type;
-    SubEffect &subEffect_ = effect[effectNum_].subEffect[type_];
+    SubEffect& subEffect_ = effect[effectNum_].subEffect[type_];
 
     switch (menuTab) {
-    case 0:
-        effect_setActive(effectNum_, !effect[effectNum_].active);
-        break;
+        case 0:
+            effect_setActive(effectNum_, !effect[effectNum_].active);
+            break;
 
-    case 2:
-        if (effect[effectNum_].type > kMinEffectType) {
-            effect_setType(effectNum_, effect[effectNum_].type - 1);
-        } else {
-            effect_setType(effectNum_, kMaxEffectType);
-        }
-        break;
+        case 2:
+            if (effect[effectNum_].type > kMinEffectType) {
+                effect_setType(effectNum_, effect[effectNum_].type - 1);
+            } else {
+                effect_setType(effectNum_, kMaxEffectType);
+            }
+            break;
 
-    case 3:
-        if (subEffect_.aData > subEffect_.kMinAData) {
-            effect_setAData(effectNum_, type_, subEffect_.aData - 1);
-        }
-        break;
+        case 3:
+            if (subEffect_.aData > subEffect_.kMinAData) {
+                effect_setAData(effectNum_, type_, subEffect_.aData - 1);
+            }
+            break;
 
-    case 4:
-        if (subEffect_.bData > subEffect_.kMinBData) {
-            effect_setBData(effectNum_, type_, subEffect_.bData - 1);
-        }
-        break;
+        case 4:
+            if (subEffect_.bData > subEffect_.kMinBData) {
+                effect_setBData(effectNum_, type_, subEffect_.bData - 1);
+            }
+            break;
 
-    case 5:
-        if (subEffect_.cData > subEffect_.kMinCData) {
-            effect_setCData(effectNum_, type_, subEffect_.cData - 1);
-        }
-        break;
+        case 5:
+            if (subEffect_.cData > subEffect_.kMinCData) {
+                effect_setCData(effectNum_, type_, subEffect_.cData - 1);
+            }
+            break;
 
-    case 6:
-        if (subEffect_.dData > subEffect_.kMinDData) {
-            effect_setDData(effectNum_, type_, subEffect_.dData - 1);
-        }
-        break;
+        case 6:
+            if (subEffect_.dData > subEffect_.kMinDData) {
+                effect_setDData(effectNum_, type_, subEffect_.dData - 1);
+            }
+            break;
 
-    case 7:
-        if (subEffect_.eData > subEffect_.kMinEData) {
-            effect_setEData(effectNum_, type_, subEffect_.eData - 1);
-        }
-        break;
+        case 7:
+            if (subEffect_.eData > subEffect_.kMinEData) {
+                effect_setEData(effectNum_, type_, subEffect_.eData - 1);
+            }
+            break;
     }
 }
 
 void Controller::effect_setActive(uint8_t effectNum_, bool active_) {
-    Effect &effect_ = effect[effectNum_];
+    Effect& effect_ = effect[effectNum_];
 
     if ((((menu == EFFECT_0_MENU) && (effectNum_ == 0)) || ((menu == EFFECT_1_MENU) && (effectNum_ == 1))) && (!effect_.genTransition.active)) {
         // update data
@@ -10907,20 +11585,20 @@ void Controller::effect_setActive(uint8_t effectNum_, bool active_) {
         // update lcd
         if (menu == MAIN_MENU) {
             switch (effectNum_) {
-            case 0:
-                lcd_drawMain_Effect0Data();
-                break;
+                case 0:
+                    lcd_drawMain_Effect0Data();
+                    break;
 
-            case 1:
-                lcd_drawMain_Effect1Data();
-                break;
+                case 1:
+                    lcd_drawMain_Effect1Data();
+                    break;
             }
         }
     }
 }
 
 void Controller::effect_setType(uint8_t effectNum_, uint8_t type_) {
-    Effect &effect_ = effect[effectNum_];
+    Effect& effect_ = effect[effectNum_];
 
     if ((((menu == EFFECT_0_MENU) && (effectNum_ == 0)) || ((menu == EFFECT_1_MENU) && (effectNum_ == 1))) && (!effect_.genTransition.active)) {
         // update data
@@ -10930,6 +11608,7 @@ void Controller::effect_setType(uint8_t effectNum_, uint8_t type_) {
             effect_.type = type_;
         } else {
             effect_.type = type_;
+            effect_updateMixFloats(effectNum_);
         }
         // update lcd
         lcd_drawEffect_TypeData(effectNum_);
@@ -10942,120 +11621,121 @@ void Controller::effect_setType(uint8_t effectNum_, uint8_t type_) {
         // update data
         effect_cleanMemory(effectNum_, type_);
         effect_.type = type_;
+        effect_updateMixFloats(effectNum_);
         // update lcd
         if (menu == MAIN_MENU) {
             switch (effectNum_) {
-            case 0:
-                lcd_drawMain_Effect0Data();
-                break;
+                case 0:
+                    lcd_drawMain_Effect0Data();
+                    break;
 
-            case 1:
-                lcd_drawMain_Effect1Data();
-                break;
+                case 1:
+                    lcd_drawMain_Effect1Data();
+                    break;
             }
         }
     }
 }
 
 void Controller::effect_setAData(uint8_t effectNum_, uint8_t subEffectNum_, uint8_t aData_) {
-    Effect &effect_ = effect[effectNum_];
-    SubEffect &subEffect_ = effect[effectNum_].subEffect[subEffectNum_];
+    Effect& effect_ = effect[effectNum_];
+    SubEffect& subEffect_ = effect[effectNum_].subEffect[subEffectNum_];
 
-    Delay &delay = effect_.delay;
-    Chorus &chorus = effect_.chorus;
-    Flanger &flanger = effect_.flanger;
-    Phaser &phaser = effect_.phaser;
-    Compressor &compressor = effect_.compressor;
-    Expander &expander = effect_.expander;
-    Overdrive &overdrive = effect_.overdrive;
-    Distortion &distortion = effect_.distortion;
-    Bitcrusher &bitcrusher = effect_.bitcrusher;
+    Delay& delay = effect_.delay;
+    Chorus& chorus = effect_.chorus;
+    Flanger& flanger = effect_.flanger;
+    Phaser& phaser = effect_.phaser;
+    Compressor& compressor = effect_.compressor;
+    Expander& expander = effect_.expander;
+    Overdrive& overdrive = effect_.overdrive;
+    Distortion& distortion = effect_.distortion;
+    Bitcrusher& bitcrusher = effect_.bitcrusher;
 
     if ((aData_ >= subEffect_.kMinAData) && (aData_ <= subEffect_.kMaxAData)) {
         // update data
         switch (subEffectNum_) {
-        case EF_DELAY: // time
-            if ((((menu == EFFECT_0_MENU) && (effectNum_ == 0)) || ((menu == EFFECT_1_MENU) && (effectNum_ == 1))) && (effect_.active) && (!effect_.genTransition.active)) {
-                effect_genTransition(effectNum_, EF_MODE_TIME, effect_.active, effect_.active, effect_.type, effect_.type);
+            case EF_DELAY:  // time
+                if ((((menu == EFFECT_0_MENU) && (effectNum_ == 0)) || ((menu == EFFECT_1_MENU) && (effectNum_ == 1))) && (effect_.active) && (!effect_.genTransition.active)) {
+                    effect_genTransition(effectNum_, EF_MODE_TIME, effect_.active, effect_.active, effect_.type, effect_.type);
+                    subEffect_.aData = aData_;
+                    delay.aTime = aData_;
+                } else if (!effect[effectNum_].genTransition.active) {
+                    subEffect_.aData = aData_;
+                    delay.aTime = aData_;
+                    delay.time = kDelayTimeDataLibrary[aData_].data;
+                    delay.update(rhythm.tempo);
+                }
+                break;
+
+            case EF_CHORUS:  // time
+                if ((((menu == EFFECT_0_MENU) && (effectNum_ == 0)) || ((menu == EFFECT_1_MENU) && (effectNum_ == 1))) && (effect_.active) && (!effect_.genTransition.active)) {
+                    effect_genTransition(effectNum_, EF_MODE_TIME, effect_.active, effect_.active, effect_.type, effect_.type);
+                    subEffect_.aData = aData_;
+                    chorus.aTime = aData_;
+                } else if (!effect[effectNum_].genTransition.active) {
+                    subEffect_.aData = aData_;
+                    chorus.aTime = aData_;
+                    chorus.time = kChorusTimeDataLibrary[aData_].data;
+                    chorus.update();
+                }
+                break;
+
+            case EF_FLANGER:  // time
+                if ((((menu == EFFECT_0_MENU) && (effectNum_ == 0)) || ((menu == EFFECT_1_MENU) && (effectNum_ == 1))) && (effect_.active) && (!effect_.genTransition.active)) {
+                    effect_genTransition(effectNum_, EF_MODE_TIME, effect_.active, effect_.active, effect_.type, effect_.type);
+                    subEffect_.aData = aData_;
+                    flanger.aTime = aData_;
+                } else if (!effect[effectNum_].genTransition.active) {
+                    subEffect_.aData = aData_;
+                    flanger.aTime = aData_;
+                    flanger.time = kFlangerTimeDataLibrary[aData_].data;
+                    flanger.update();
+                }
+                break;
+
+            case EF_PHASER:  // startFreq
+                if (aData_ <= phaser.bEndFreq) {
+                    subEffect_.aData = aData_;
+                    phaser.aStartFreq = aData_;
+                    phaser.startFreq = kPhaserFreqDataLibrary[aData_].data;
+                    phaser.update();
+                }
+                break;
+
+            case EF_COMPRESSOR:  // threshold
                 subEffect_.aData = aData_;
-                delay.aTime = aData_;
-            } else if (!effect[effectNum_].genTransition.active) {
+                compressor.aThreshold = aData_;
+                compressor.threshold = kCompressorThresholdDataLibrary[aData_].data;
+                compressor.update();
+                break;
+
+            case EF_EXPANDER:  // threshold
                 subEffect_.aData = aData_;
-                delay.aTime = aData_;
-                delay.time = kDelayTimeDataLibrary[aData_].data;
-                delay.update(rhythm.tempo);
-            }
-            break;
+                expander.aThreshold = aData_;
+                expander.threshold = kExpanderThresholdDataLibrary[aData_].data;
+                expander.update();
+                break;
 
-        case EF_CHORUS: // time
-            if ((((menu == EFFECT_0_MENU) && (effectNum_ == 0)) || ((menu == EFFECT_1_MENU) && (effectNum_ == 1))) && (effect_.active) && (!effect_.genTransition.active)) {
-                effect_genTransition(effectNum_, EF_MODE_TIME, effect_.active, effect_.active, effect_.type, effect_.type);
+            case EF_OVERDRIVE:  // gain
                 subEffect_.aData = aData_;
-                chorus.aTime = aData_;
-            } else if (!effect[effectNum_].genTransition.active) {
+                overdrive.aGain = aData_;
+                overdrive.gaindB = kOverdriveGainDataLibrary[aData_].data;
+                overdrive.update();
+                break;
+
+            case EF_DISTORTION:  // gain
                 subEffect_.aData = aData_;
-                chorus.aTime = aData_;
-                chorus.time = kChorusTimeDataLibrary[aData_].data;
-                chorus.update();
-            }
-            break;
+                distortion.aGain = aData_;
+                distortion.gaindB = kDistortionGainDataLibrary[aData_].data;
+                distortion.update();
+                break;
 
-        case EF_FLANGER: // time
-            if ((((menu == EFFECT_0_MENU) && (effectNum_ == 0)) || ((menu == EFFECT_1_MENU) && (effectNum_ == 1))) && (effect_.active) && (!effect_.genTransition.active)) {
-                effect_genTransition(effectNum_, EF_MODE_TIME, effect_.active, effect_.active, effect_.type, effect_.type);
+            case EF_BITCRUSHER:  // resolution
                 subEffect_.aData = aData_;
-                flanger.aTime = aData_;
-            } else if (!effect[effectNum_].genTransition.active) {
-                subEffect_.aData = aData_;
-                flanger.aTime = aData_;
-                flanger.time = kFlangerTimeDataLibrary[aData_].data;
-                flanger.update();
-            }
-            break;
-
-        case EF_PHASER: // startFreq
-            if (aData_ <= phaser.bEndFreq) {
-                subEffect_.aData = aData_;
-                phaser.aStartFreq = aData_;
-                phaser.startFreq = kPhaserFreqDataLibrary[aData_].data;
-                phaser.update();
-            }
-            break;
-
-        case EF_COMPRESSOR: // threshold
-            subEffect_.aData = aData_;
-            compressor.aThreshold = aData_;
-            compressor.threshold = kCompressorThresholdDataLibrary[aData_].data;
-            compressor.update();
-            break;
-
-        case EF_EXPANDER: // threshold
-            subEffect_.aData = aData_;
-            expander.aThreshold = aData_;
-            expander.threshold = kExpanderThresholdDataLibrary[aData_].data;
-            expander.update();
-            break;
-
-        case EF_OVERDRIVE: // gain
-            subEffect_.aData = aData_;
-            overdrive.aGain = aData_;
-            overdrive.gaindB = kOverdriveGainDataLibrary[aData_].data;
-            overdrive.update();
-            break;
-
-        case EF_DISTORTION: // gain
-            subEffect_.aData = aData_;
-            distortion.aGain = aData_;
-            distortion.gaindB = kDistortionGainDataLibrary[aData_].data;
-            distortion.update();
-            break;
-
-        case EF_BITCRUSHER: // resolution
-            subEffect_.aData = aData_;
-            bitcrusher.aResolution = aData_;
-            bitcrusher.resolution = kBitcrusherResolutionDataLibrary[aData_].data;
-            bitcrusher.update();
-            break;
+                bitcrusher.aResolution = aData_;
+                bitcrusher.resolution = kBitcrusherResolutionDataLibrary[aData_].data;
+                bitcrusher.update();
+                break;
         }
         // update lcd
         if ((((menu == EFFECT_0_MENU) && (effectNum_ == 0)) || ((menu == EFFECT_1_MENU) && (effectNum_ == 1))) && (effect_.type == subEffectNum_)) {
@@ -11065,97 +11745,97 @@ void Controller::effect_setAData(uint8_t effectNum_, uint8_t subEffectNum_, uint
 }
 
 void Controller::effect_setBData(uint8_t effectNum_, uint8_t subEffectNum_, uint8_t bData_) {
-    Effect &effect_ = effect[effectNum_];
-    SubEffect &subEffect_ = effect[effectNum_].subEffect[subEffectNum_];
+    Effect& effect_ = effect[effectNum_];
+    SubEffect& subEffect_ = effect[effectNum_].subEffect[subEffectNum_];
 
-    Delay &delay = effect_.delay;
-    Chorus &chorus = effect_.chorus;
-    Flanger &flanger = effect_.flanger;
-    Phaser &phaser = effect_.phaser;
-    Compressor &compressor = effect_.compressor;
-    Expander &expander = effect_.expander;
-    Overdrive &overdrive = effect_.overdrive;
-    Distortion &distortion = effect_.distortion;
-    Bitcrusher &bitcrusher = effect_.bitcrusher;
+    Delay& delay = effect_.delay;
+    Chorus& chorus = effect_.chorus;
+    Flanger& flanger = effect_.flanger;
+    Phaser& phaser = effect_.phaser;
+    Compressor& compressor = effect_.compressor;
+    Expander& expander = effect_.expander;
+    Overdrive& overdrive = effect_.overdrive;
+    Distortion& distortion = effect_.distortion;
+    Bitcrusher& bitcrusher = effect_.bitcrusher;
 
     if ((bData_ >= subEffect_.kMinBData) && (bData_ <= subEffect_.kMaxBData)) {
         // update data
         switch (subEffectNum_) {
-        case EF_DELAY: // level
-            subEffect_.bData = bData_;
-            delay.bLevel = bData_;
-            delay.level = kDelayLevelDataLibrary[bData_].data;
-            break;
-
-        case EF_CHORUS: // feedback
-            if ((((menu == EFFECT_0_MENU) && (effectNum_ == 0)) || ((menu == EFFECT_1_MENU) && (effectNum_ == 1))) && (effect_.active) && (!effect_.genTransition.active)) {
-                effect_genTransition(effectNum_, EF_MODE_FEEDBACK, effect_.active, effect_.active, effect_.type, effect_.type);
+            case EF_DELAY:  // level
                 subEffect_.bData = bData_;
-                chorus.bFeedback = bData_;
-            } else if (!effect[effectNum_].genTransition.active) {
+                delay.bLevel = bData_;
+                delay.level = kDelayLevelDataLibrary[bData_].data;
+                break;
+
+            case EF_CHORUS:  // feedback
+                if ((((menu == EFFECT_0_MENU) && (effectNum_ == 0)) || ((menu == EFFECT_1_MENU) && (effectNum_ == 1))) && (effect_.active) && (!effect_.genTransition.active)) {
+                    effect_genTransition(effectNum_, EF_MODE_FEEDBACK, effect_.active, effect_.active, effect_.type, effect_.type);
+                    subEffect_.bData = bData_;
+                    chorus.bFeedback = bData_;
+                } else if (!effect[effectNum_].genTransition.active) {
+                    subEffect_.bData = bData_;
+                    chorus.bFeedback = bData_;
+                    chorus.feedback = kChorusFeedbackDataLibrary[bData_].data;
+                    chorus.update();
+                }
+                break;
+
+            case EF_FLANGER:  // feedback
+                if ((((menu == EFFECT_0_MENU) && (effectNum_ == 0)) || ((menu == EFFECT_1_MENU) && (effectNum_ == 1))) && (effect_.active) && (!effect_.genTransition.active)) {
+                    effect_genTransition(effectNum_, EF_MODE_FEEDBACK, effect_.active, effect_.active, effect_.type, effect_.type);
+                    subEffect_.bData = bData_;
+                    flanger.bFeedback = bData_;
+                } else if (!effect[effectNum_].genTransition.active) {
+                    subEffect_.bData = bData_;
+                    flanger.bFeedback = bData_;
+                    flanger.feedback = kFlangerFeedbackDataLibrary[bData_].data;
+                    flanger.update();
+                }
+                break;
+
+            case EF_PHASER:  // endFreq
+                if (bData_ >= phaser.aStartFreq) {
+                    subEffect_.bData = bData_;
+                    phaser.bEndFreq = bData_;
+                    phaser.endFreq = kPhaserFreqDataLibrary[bData_].data;
+                    phaser.update();
+                }
+                break;
+
+            case EF_COMPRESSOR:  // rate
                 subEffect_.bData = bData_;
-                chorus.bFeedback = bData_;
-                chorus.feedback = kChorusFeedbackDataLibrary[bData_].data;
-                chorus.update();
-            }
-            break;
+                compressor.bRate = bData_;
+                compressor.rate = kCompressorRateDataLibrary[bData_].data;
+                compressor.update();
+                break;
 
-        case EF_FLANGER: // feedback
-            if ((((menu == EFFECT_0_MENU) && (effectNum_ == 0)) || ((menu == EFFECT_1_MENU) && (effectNum_ == 1))) && (effect_.active) && (!effect_.genTransition.active)) {
-                effect_genTransition(effectNum_, EF_MODE_FEEDBACK, effect_.active, effect_.active, effect_.type, effect_.type);
+            case EF_EXPANDER:  // rate
                 subEffect_.bData = bData_;
-                flanger.bFeedback = bData_;
-            } else if (!effect[effectNum_].genTransition.active) {
+                expander.bRate = bData_;
+                expander.rate = kExpanderRateDataLibrary[bData_].data;
+                expander.update();
+                break;
+
+            case EF_OVERDRIVE:  // threshold
                 subEffect_.bData = bData_;
-                flanger.bFeedback = bData_;
-                flanger.feedback = kFlangerFeedbackDataLibrary[bData_].data;
-                flanger.update();
-            }
-            break;
+                overdrive.bThreshold = bData_;
+                overdrive.thresholddB = kOverdriveThresholdDataLibrary[bData_].data;
+                overdrive.update();
+                break;
 
-        case EF_PHASER: // endFreq
-            if (bData_ >= phaser.aStartFreq) {
+            case EF_DISTORTION:  // threshold
                 subEffect_.bData = bData_;
-                phaser.bEndFreq = bData_;
-                phaser.endFreq = kPhaserFreqDataLibrary[bData_].data;
-                phaser.update();
-            }
-            break;
+                distortion.bThreshold = bData_;
+                distortion.thresholddB = kDistortionThresholdDataLibrary[bData_].data;
+                distortion.update();
+                break;
 
-        case EF_COMPRESSOR: // rate
-            subEffect_.bData = bData_;
-            compressor.bRate = bData_;
-            compressor.rate = kCompressorRateDataLibrary[bData_].data;
-            compressor.update();
-            break;
-
-        case EF_EXPANDER: // rate
-            subEffect_.bData = bData_;
-            expander.bRate = bData_;
-            expander.rate = kExpanderRateDataLibrary[bData_].data;
-            expander.update();
-            break;
-
-        case EF_OVERDRIVE: // threshold
-            subEffect_.bData = bData_;
-            overdrive.bThreshold = bData_;
-            overdrive.thresholddB = kOverdriveThresholdDataLibrary[bData_].data;
-            overdrive.update();
-            break;
-
-        case EF_DISTORTION: // threshold
-            subEffect_.bData = bData_;
-            distortion.bThreshold = bData_;
-            distortion.thresholddB = kDistortionThresholdDataLibrary[bData_].data;
-            distortion.update();
-            break;
-
-        case EF_BITCRUSHER: // sampleRate
-            subEffect_.bData = bData_;
-            bitcrusher.bSampleRate = bData_;
-            bitcrusher.sampleRate = kBitcrusherSampleRateDataLibrary[bData_].data;
-            bitcrusher.update();
-            break;
+            case EF_BITCRUSHER:  // sampleRate
+                subEffect_.bData = bData_;
+                bitcrusher.bSampleRate = bData_;
+                bitcrusher.sampleRate = kBitcrusherSampleRateDataLibrary[bData_].data;
+                bitcrusher.update();
+                break;
         }
         // update lcd
         if ((((menu == EFFECT_0_MENU) && (effectNum_ == 0)) ||
@@ -11167,83 +11847,83 @@ void Controller::effect_setBData(uint8_t effectNum_, uint8_t subEffectNum_, uint
 }
 
 void Controller::effect_setCData(uint8_t effectNum_, uint8_t subEffectNum_, uint8_t cData_) {
-    Effect &effect_ = effect[effectNum_];
-    SubEffect &subEffect_ = effect[effectNum_].subEffect[subEffectNum_];
+    Effect& effect_ = effect[effectNum_];
+    SubEffect& subEffect_ = effect[effectNum_].subEffect[subEffectNum_];
 
-    Delay &delay = effect_.delay;
-    Chorus &chorus = effect_.chorus;
-    Flanger &flanger = effect_.flanger;
-    Phaser &phaser = effect_.phaser;
-    Compressor &compressor = effect_.compressor;
-    Expander &expander = effect_.expander;
-    Overdrive &overdrive = effect_.overdrive;
-    Distortion &distortion = effect_.distortion;
-    Bitcrusher &bitcrusher = effect_.bitcrusher;
+    Delay& delay = effect_.delay;
+    Chorus& chorus = effect_.chorus;
+    Flanger& flanger = effect_.flanger;
+    Phaser& phaser = effect_.phaser;
+    Compressor& compressor = effect_.compressor;
+    Expander& expander = effect_.expander;
+    Overdrive& overdrive = effect_.overdrive;
+    Distortion& distortion = effect_.distortion;
+    Bitcrusher& bitcrusher = effect_.bitcrusher;
 
     if ((cData_ >= subEffect_.kMinCData) && (cData_ <= subEffect_.kMaxCData)) {
         // update data
         switch (subEffectNum_) {
-        case EF_DELAY: // feedback
-            subEffect_.cData = cData_;
-            delay.cFeedback = cData_;
-            delay.feedback = kDelayFeedbackDataLibrary[cData_].data;
-            break;
+            case EF_DELAY:  // feedback
+                subEffect_.cData = cData_;
+                delay.cFeedback = cData_;
+                delay.feedback = kDelayFeedbackDataLibrary[cData_].data;
+                break;
 
-        case EF_CHORUS: // rate
-            subEffect_.cData = cData_;
-            chorus.cRate = cData_;
-            chorus.rate = kChorusRateDataLibrary[cData_].data;
-            chorus.update();
-            break;
+            case EF_CHORUS:  // rate
+                subEffect_.cData = cData_;
+                chorus.cRate = cData_;
+                chorus.rate = kChorusRateDataLibrary[cData_].data;
+                chorus.update();
+                break;
 
-        case EF_FLANGER: // rate
-            subEffect_.cData = cData_;
-            flanger.cRate = cData_;
-            flanger.rate = kFlangerRateDataLibrary[cData_].data;
-            flanger.update();
-            break;
+            case EF_FLANGER:  // rate
+                subEffect_.cData = cData_;
+                flanger.cRate = cData_;
+                flanger.rate = kFlangerRateDataLibrary[cData_].data;
+                flanger.update();
+                break;
 
-        case EF_PHASER: // rate
-            subEffect_.cData = cData_;
-            phaser.cRate = cData_;
-            phaser.rate = kPhaserRateDataLibrary[cData_].data;
-            phaser.update();
-            break;
+            case EF_PHASER:  // rate
+                subEffect_.cData = cData_;
+                phaser.cRate = cData_;
+                phaser.rate = kPhaserRateDataLibrary[cData_].data;
+                phaser.update();
+                break;
 
-        case EF_COMPRESSOR: // time
-            subEffect_.cData = cData_;
-            compressor.cAttackTime = cData_;
-            compressor.attackTime = kCompressorAttackTimeDataLibrary[cData_].data;
-            compressor.update();
-            break;
+            case EF_COMPRESSOR:  // time
+                subEffect_.cData = cData_;
+                compressor.cAttackTime = cData_;
+                compressor.attackTime = kCompressorAttackTimeDataLibrary[cData_].data;
+                compressor.update();
+                break;
 
-        case EF_EXPANDER: // time
-            subEffect_.cData = cData_;
-            expander.cAttackTime = cData_;
-            expander.attackTime = kExpanderAttackTimeDataLibrary[cData_].data;
-            expander.update();
-            break;
+            case EF_EXPANDER:  // time
+                subEffect_.cData = cData_;
+                expander.cAttackTime = cData_;
+                expander.attackTime = kExpanderAttackTimeDataLibrary[cData_].data;
+                expander.update();
+                break;
 
-        case EF_OVERDRIVE: // tone
-            subEffect_.cData = cData_;
-            overdrive.cTone = cData_;
-            overdrive.tone = kOverdriveToneDataLibrary[cData_].data;
-            overdrive.update();
-            break;
+            case EF_OVERDRIVE:  // tone
+                subEffect_.cData = cData_;
+                overdrive.cTone = cData_;
+                overdrive.tone = kOverdriveToneDataLibrary[cData_].data;
+                overdrive.update();
+                break;
 
-        case EF_DISTORTION: // tone
-            subEffect_.cData = cData_;
-            distortion.cTone = cData_;
-            distortion.tone = kDistortionToneDataLibrary[cData_].data;
-            distortion.update();
-            break;
+            case EF_DISTORTION:  // tone
+                subEffect_.cData = cData_;
+                distortion.cTone = cData_;
+                distortion.tone = kDistortionToneDataLibrary[cData_].data;
+                distortion.update();
+                break;
 
-        case EF_BITCRUSHER: // clipThreshold
-            subEffect_.cData = cData_;
-            bitcrusher.cThreshold = cData_;
-            bitcrusher.threshold = kBitcrusherThresholdDataLibrary[cData_].data;
-            bitcrusher.update();
-            break;
+            case EF_BITCRUSHER:  // clipThreshold
+                subEffect_.cData = cData_;
+                bitcrusher.cThreshold = cData_;
+                bitcrusher.threshold = kBitcrusherThresholdDataLibrary[cData_].data;
+                bitcrusher.update();
+                break;
         }
         // update lcd
         if ((((menu == EFFECT_0_MENU) && (effectNum_ == 0)) ||
@@ -11255,18 +11935,18 @@ void Controller::effect_setCData(uint8_t effectNum_, uint8_t subEffectNum_, uint
 }
 
 void Controller::effect_setDData(uint8_t effectNum_, uint8_t subEffectNum_, uint8_t dData_) {
-    Effect &effect_ = effect[effectNum_];
-    SubEffect &subEffect_ = effect[effectNum_].subEffect[subEffectNum_];
+    Effect& effect_ = effect[effectNum_];
+    SubEffect& subEffect_ = effect[effectNum_].subEffect[subEffectNum_];
 
-    Delay &delay = effect_.delay;
-    Chorus &chorus = effect_.chorus;
-    Flanger &flanger = effect_.flanger;
-    Phaser &phaser = effect_.phaser;
-    Compressor &compressor = effect_.compressor;
-    Expander &expander = effect_.expander;
-    Overdrive &overdrive = effect_.overdrive;
-    Distortion &distortion = effect_.distortion;
-    Bitcrusher &bitcrusher = effect_.bitcrusher;
+    Delay& delay = effect_.delay;
+    Chorus& chorus = effect_.chorus;
+    Flanger& flanger = effect_.flanger;
+    Phaser& phaser = effect_.phaser;
+    Compressor& compressor = effect_.compressor;
+    Expander& expander = effect_.expander;
+    Overdrive& overdrive = effect_.overdrive;
+    Distortion& distortion = effect_.distortion;
+    Bitcrusher& bitcrusher = effect_.bitcrusher;
 
     if ((dData_ >= subEffect_.kMinDData) && (dData_ <= subEffect_.kMaxDData) && (!effect_.mixTransition.active)) {
         // update data
@@ -11277,145 +11957,149 @@ void Controller::effect_setDData(uint8_t effectNum_, uint8_t subEffectNum_, uint
         float targetWetFloat;
 
         switch (subEffectNum_) {
-        case EF_DELAY:
-            targetDry = dData_;
-            targetWet = delay.eWet;
+            case EF_DELAY:
+                targetDry = dData_;
+                targetWet = delay.eWet;
 
-            if ((delay.limitMix) && ((targetDry + targetWet) > delay.limitMixData)) {
-                targetWet = delay.limitMixData - targetDry;
-            }
+                if ((delay.limitMix) && ((targetDry + targetWet) > delay.limitMixData)) {
+                    targetWet = delay.limitMixData - targetDry;
+                }
 
-            subEffect_.dData = targetDry;
-            subEffect_.eData = targetWet;
+                subEffect_.dData = targetDry;
+                subEffect_.eData = targetWet;
 
-            delay.dDry = targetDry;
-            delay.eWet = targetWet;
+                delay.dDry = targetDry;
+                delay.eWet = targetWet;
 
-            targetDryFloat = kEffectMixDataLibrary[delay.dDry].data;
-            targetWetFloat = kEffectMixDataLibrary[delay.eWet].data;
-            break;
+                targetDryFloat = kEffectMixDataLibrary[delay.dDry].data;
+                targetWetFloat = kEffectMixDataLibrary[delay.eWet].data;
+                break;
 
-        case EF_CHORUS:
-            targetDry = dData_;
-            targetWet = chorus.eWet;
+            case EF_CHORUS:
+                targetDry = dData_;
+                targetWet = chorus.eWet;
 
-            if ((chorus.limitMix) && ((targetDry + targetWet) > chorus.limitMixData)) {
-                targetWet = chorus.limitMixData - targetDry;
-            }
+                if ((chorus.limitMix) && ((targetDry + targetWet) > chorus.limitMixData)) {
+                    targetWet = chorus.limitMixData - targetDry;
+                }
 
-            subEffect_.dData = targetDry;
-            subEffect_.eData = targetWet;
+                subEffect_.dData = targetDry;
+                subEffect_.eData = targetWet;
 
-            chorus.dDry = targetDry;
-            chorus.eWet = targetWet;
+                chorus.dDry = targetDry;
+                chorus.eWet = targetWet;
 
-            targetDryFloat = kEffectMixDataLibrary[chorus.dDry].data;
-            targetWetFloat = kEffectMixDataLibrary[chorus.eWet].data;
-            break;
+                targetDryFloat = kEffectMixDataLibrary[chorus.dDry].data;
+                targetWetFloat = kEffectMixDataLibrary[chorus.eWet].data;
+                break;
 
-        case EF_FLANGER:
-            targetDry = dData_;
-            targetWet = flanger.eWet;
+            case EF_FLANGER:
+                targetDry = dData_;
+                targetWet = flanger.eWet;
 
-            if ((flanger.limitMix) && ((targetDry + targetWet) > flanger.limitMixData)) {
-                targetWet = flanger.limitMixData - targetDry;
-            }
+                if ((flanger.limitMix) && ((targetDry + targetWet) > flanger.limitMixData)) {
+                    targetWet = flanger.limitMixData - targetDry;
+                }
 
-            subEffect_.dData = targetDry;
-            subEffect_.eData = targetWet;
+                subEffect_.dData = targetDry;
+                subEffect_.eData = targetWet;
 
-            flanger.dDry = targetDry;
-            flanger.eWet = targetWet;
+                flanger.dDry = targetDry;
+                flanger.eWet = targetWet;
 
-            targetDryFloat = kEffectMixDataLibrary[flanger.dDry].data;
-            targetWetFloat = kEffectMixDataLibrary[flanger.eWet].data;
-            break;
+                targetDryFloat = kEffectMixDataLibrary[flanger.dDry].data;
+                targetWetFloat = kEffectMixDataLibrary[flanger.eWet].data;
+                break;
 
-        case EF_PHASER:
-            targetDry = dData_;
-            targetWet = phaser.eWet;
+            case EF_PHASER:
+                targetDry = dData_;
+                targetWet = phaser.eWet;
 
-            if ((phaser.limitMix) && ((targetDry + targetWet) > phaser.limitMixData)) {
-                targetWet = phaser.limitMixData - targetDry;
-            }
+                if ((phaser.limitMix) && ((targetDry + targetWet) > phaser.limitMixData)) {
+                    targetWet = phaser.limitMixData - targetDry;
+                }
 
-            subEffect_.dData = targetDry;
-            subEffect_.eData = targetWet;
+                subEffect_.dData = targetDry;
+                subEffect_.eData = targetWet;
 
-            phaser.dDry = targetDry;
-            phaser.eWet = targetWet;
+                phaser.dDry = targetDry;
+                phaser.eWet = targetWet;
 
-            targetDryFloat = kEffectMixDataLibrary[phaser.dDry].data;
-            targetWetFloat = kEffectMixDataLibrary[phaser.eWet].data;
-            break;
+                targetDryFloat = kEffectMixDataLibrary[phaser.dDry].data;
+                targetWetFloat = kEffectMixDataLibrary[phaser.eWet].data;
+                break;
 
-        case EF_COMPRESSOR:
-            subEffect_.dData = dData_;
-            compressor.dReleaseTime = dData_;
-            compressor.releaseTime = kCompressorReleaseTimeDataLibrary[compressor.dReleaseTime].data;
-            compressor.update();
-            break;
+            case EF_COMPRESSOR:
+                subEffect_.dData = dData_;
+                compressor.dReleaseTime = dData_;
+                compressor.releaseTime = kCompressorReleaseTimeDataLibrary[compressor.dReleaseTime].data;
+                compressor.update();
+                targetDryFloat = effect_.dryFloat;
+                targetWetFloat = effect_.wetFloat;
+                break;
 
-        case EF_EXPANDER:
-            subEffect_.dData = dData_;
-            expander.dReleaseTime = dData_;
-            expander.releaseTime = kExpanderReleaseTimeDataLibrary[expander.dReleaseTime].data;
-            expander.update();
-            break;
+            case EF_EXPANDER:
+                subEffect_.dData = dData_;
+                expander.dReleaseTime = dData_;
+                expander.releaseTime = kExpanderReleaseTimeDataLibrary[expander.dReleaseTime].data;
+                expander.update();
+                targetDryFloat = effect_.dryFloat;
+                targetWetFloat = effect_.wetFloat;
+                break;
 
-        case EF_OVERDRIVE:
-            targetDry = dData_;
-            targetWet = overdrive.eWet;
+            case EF_OVERDRIVE:
+                targetDry = dData_;
+                targetWet = overdrive.eWet;
 
-            if ((overdrive.limitMix) && ((targetDry + targetWet) > overdrive.limitMixData)) {
-                targetWet = overdrive.limitMixData - targetDry;
-            }
+                if ((overdrive.limitMix) && ((targetDry + targetWet) > overdrive.limitMixData)) {
+                    targetWet = overdrive.limitMixData - targetDry;
+                }
 
-            subEffect_.dData = targetDry;
-            subEffect_.eData = targetWet;
+                subEffect_.dData = targetDry;
+                subEffect_.eData = targetWet;
 
-            overdrive.dDry = targetDry;
-            overdrive.eWet = targetWet;
+                overdrive.dDry = targetDry;
+                overdrive.eWet = targetWet;
 
-            targetDryFloat = kEffectMixDataLibrary[overdrive.dDry].data;
-            targetWetFloat = kEffectMixDataLibrary[overdrive.eWet].data;
-            break;
+                targetDryFloat = kEffectMixDataLibrary[overdrive.dDry].data;
+                targetWetFloat = kEffectMixDataLibrary[overdrive.eWet].data;
+                break;
 
-        case EF_DISTORTION:
-            targetDry = dData_;
-            targetWet = distortion.eWet;
+            case EF_DISTORTION:
+                targetDry = dData_;
+                targetWet = distortion.eWet;
 
-            if ((distortion.limitMix) && ((targetDry + targetWet) > distortion.limitMixData)) {
-                targetWet = distortion.limitMixData - targetDry;
-            }
+                if ((distortion.limitMix) && ((targetDry + targetWet) > distortion.limitMixData)) {
+                    targetWet = distortion.limitMixData - targetDry;
+                }
 
-            subEffect_.dData = targetDry;
-            subEffect_.eData = targetWet;
+                subEffect_.dData = targetDry;
+                subEffect_.eData = targetWet;
 
-            distortion.dDry = targetDry;
-            distortion.eWet = targetWet;
+                distortion.dDry = targetDry;
+                distortion.eWet = targetWet;
 
-            targetDryFloat = kEffectMixDataLibrary[distortion.dDry].data;
-            targetWetFloat = kEffectMixDataLibrary[distortion.eWet].data;
-            break;
+                targetDryFloat = kEffectMixDataLibrary[distortion.dDry].data;
+                targetWetFloat = kEffectMixDataLibrary[distortion.eWet].data;
+                break;
 
-        case EF_BITCRUSHER:
-            targetDry = dData_;
-            targetWet = bitcrusher.eWet;
+            case EF_BITCRUSHER:
+                targetDry = dData_;
+                targetWet = bitcrusher.eWet;
 
-            if ((bitcrusher.limitMix) && ((targetDry + targetWet) > bitcrusher.limitMixData)) {
-                targetWet = bitcrusher.limitMixData - targetDry;
-            }
+                if ((bitcrusher.limitMix) && ((targetDry + targetWet) > bitcrusher.limitMixData)) {
+                    targetWet = bitcrusher.limitMixData - targetDry;
+                }
 
-            subEffect_.dData = targetDry;
-            subEffect_.eData = targetWet;
+                subEffect_.dData = targetDry;
+                subEffect_.eData = targetWet;
 
-            bitcrusher.dDry = targetDry;
-            bitcrusher.eWet = targetWet;
+                bitcrusher.dDry = targetDry;
+                bitcrusher.eWet = targetWet;
 
-            targetDryFloat = kEffectMixDataLibrary[bitcrusher.dDry].data;
-            targetWetFloat = kEffectMixDataLibrary[bitcrusher.eWet].data;
-            break;
+                targetDryFloat = kEffectMixDataLibrary[bitcrusher.dDry].data;
+                targetWetFloat = kEffectMixDataLibrary[bitcrusher.eWet].data;
+                break;
         }
 
         if (effect_.active) {
@@ -11433,18 +12117,18 @@ void Controller::effect_setDData(uint8_t effectNum_, uint8_t subEffectNum_, uint
 }
 
 void Controller::effect_setEData(uint8_t effectNum_, uint8_t subEffectNum_, uint8_t eData_) {
-    Effect &effect_ = effect[effectNum_];
-    SubEffect &subEffect_ = effect[effectNum_].subEffect[subEffectNum_];
+    Effect& effect_ = effect[effectNum_];
+    SubEffect& subEffect_ = effect[effectNum_].subEffect[subEffectNum_];
 
-    Delay &delay = effect_.delay;
-    Chorus &chorus = effect_.chorus;
-    Flanger &flanger = effect_.flanger;
-    Phaser &phaser = effect_.phaser;
-    Compressor &compressor = effect_.compressor;
-    Expander &expander = effect_.expander;
-    Overdrive &overdrive = effect_.overdrive;
-    Distortion &distortion = effect_.distortion;
-    Bitcrusher &bitcrusher = effect_.bitcrusher;
+    Delay& delay = effect_.delay;
+    Chorus& chorus = effect_.chorus;
+    Flanger& flanger = effect_.flanger;
+    Phaser& phaser = effect_.phaser;
+    Compressor& compressor = effect_.compressor;
+    Expander& expander = effect_.expander;
+    Overdrive& overdrive = effect_.overdrive;
+    Distortion& distortion = effect_.distortion;
+    Bitcrusher& bitcrusher = effect_.bitcrusher;
 
     if ((eData_ >= subEffect_.kMinEData) && (eData_ <= subEffect_.kMaxEData)) {
         // update data
@@ -11455,147 +12139,147 @@ void Controller::effect_setEData(uint8_t effectNum_, uint8_t subEffectNum_, uint
         float targetWetFloat;
 
         switch (subEffectNum_) {
-        case EF_DELAY:
-            targetDry = delay.dDry;
-            targetWet = eData_;
+            case EF_DELAY:
+                targetDry = delay.dDry;
+                targetWet = eData_;
 
-            if ((delay.limitMix) && ((targetDry + targetWet) > delay.limitMixData)) {
-                targetDry = delay.limitMixData - targetWet;
-            }
+                if ((delay.limitMix) && ((targetDry + targetWet) > delay.limitMixData)) {
+                    targetDry = delay.limitMixData - targetWet;
+                }
 
-            subEffect_.dData = targetDry;
-            subEffect_.eData = targetWet;
+                subEffect_.dData = targetDry;
+                subEffect_.eData = targetWet;
 
-            delay.dDry = targetDry;
-            delay.eWet = targetWet;
+                delay.dDry = targetDry;
+                delay.eWet = targetWet;
 
-            targetDryFloat = kEffectMixDataLibrary[delay.dDry].data;
-            targetWetFloat = kEffectMixDataLibrary[delay.eWet].data;
-            break;
+                targetDryFloat = kEffectMixDataLibrary[delay.dDry].data;
+                targetWetFloat = kEffectMixDataLibrary[delay.eWet].data;
+                break;
 
-        case EF_CHORUS:
-            targetDry = chorus.dDry;
-            targetWet = eData_;
+            case EF_CHORUS:
+                targetDry = chorus.dDry;
+                targetWet = eData_;
 
-            if ((chorus.limitMix) && ((targetDry + targetWet) > chorus.limitMixData)) {
-                targetDry = chorus.limitMixData - targetWet;
-            }
+                if ((chorus.limitMix) && ((targetDry + targetWet) > chorus.limitMixData)) {
+                    targetDry = chorus.limitMixData - targetWet;
+                }
 
-            subEffect_.dData = targetDry;
-            subEffect_.eData = targetWet;
+                subEffect_.dData = targetDry;
+                subEffect_.eData = targetWet;
 
-            chorus.dDry = targetDry;
-            chorus.eWet = targetWet;
+                chorus.dDry = targetDry;
+                chorus.eWet = targetWet;
 
-            targetDryFloat = kEffectMixDataLibrary[chorus.dDry].data;
-            targetWetFloat = kEffectMixDataLibrary[chorus.eWet].data;
-            break;
+                targetDryFloat = kEffectMixDataLibrary[chorus.dDry].data;
+                targetWetFloat = kEffectMixDataLibrary[chorus.eWet].data;
+                break;
 
-        case EF_FLANGER:
-            targetDry = flanger.dDry;
-            targetWet = eData_;
+            case EF_FLANGER:
+                targetDry = flanger.dDry;
+                targetWet = eData_;
 
-            if ((flanger.limitMix) && ((targetDry + targetWet) > flanger.limitMixData)) {
-                targetDry = flanger.limitMixData - targetWet;
-            }
+                if ((flanger.limitMix) && ((targetDry + targetWet) > flanger.limitMixData)) {
+                    targetDry = flanger.limitMixData - targetWet;
+                }
 
-            subEffect_.dData = targetDry;
-            subEffect_.eData = targetWet;
+                subEffect_.dData = targetDry;
+                subEffect_.eData = targetWet;
 
-            flanger.dDry = targetDry;
-            flanger.eWet = targetWet;
+                flanger.dDry = targetDry;
+                flanger.eWet = targetWet;
 
-            targetDryFloat = kEffectMixDataLibrary[flanger.dDry].data;
-            targetWetFloat = kEffectMixDataLibrary[flanger.eWet].data;
-            break;
+                targetDryFloat = kEffectMixDataLibrary[flanger.dDry].data;
+                targetWetFloat = kEffectMixDataLibrary[flanger.eWet].data;
+                break;
 
-        case EF_PHASER:
-            targetDry = phaser.dDry;
-            targetWet = eData_;
+            case EF_PHASER:
+                targetDry = phaser.dDry;
+                targetWet = eData_;
 
-            if ((phaser.limitMix) && ((targetDry + targetWet) > phaser.limitMixData)) {
-                targetDry = phaser.limitMixData - targetWet;
-            }
+                if ((phaser.limitMix) && ((targetDry + targetWet) > phaser.limitMixData)) {
+                    targetDry = phaser.limitMixData - targetWet;
+                }
 
-            subEffect_.dData = targetDry;
-            subEffect_.eData = targetWet;
+                subEffect_.dData = targetDry;
+                subEffect_.eData = targetWet;
 
-            phaser.dDry = targetDry;
-            phaser.eWet = targetWet;
+                phaser.dDry = targetDry;
+                phaser.eWet = targetWet;
 
-            targetDryFloat = kEffectMixDataLibrary[phaser.dDry].data;
-            targetWetFloat = kEffectMixDataLibrary[phaser.eWet].data;
-            break;
+                targetDryFloat = kEffectMixDataLibrary[phaser.dDry].data;
+                targetWetFloat = kEffectMixDataLibrary[phaser.eWet].data;
+                break;
 
-        case EF_COMPRESSOR:
-            subEffect_.eData = eData_;
-            compressor.eMix = eData_;
+            case EF_COMPRESSOR:
+                subEffect_.eData = eData_;
+                compressor.eMix = eData_;
 
-            targetDryFloat = kEffectMixDataLibrary[20 - compressor.eMix].data;
-            targetWetFloat = kEffectMixDataLibrary[compressor.eMix].data;
-            break;
+                targetDryFloat = kEffectMixDataLibrary[20 - compressor.eMix].data;
+                targetWetFloat = kEffectMixDataLibrary[compressor.eMix].data;
+                break;
 
-        case EF_EXPANDER:
-            subEffect_.eData = eData_;
-            expander.eMix = eData_;
+            case EF_EXPANDER:
+                subEffect_.eData = eData_;
+                expander.eMix = eData_;
 
-            targetDryFloat = kEffectMixDataLibrary[20 - expander.eMix].data;
-            targetWetFloat = kEffectMixDataLibrary[expander.eMix].data;
-            break;
+                targetDryFloat = kEffectMixDataLibrary[20 - expander.eMix].data;
+                targetWetFloat = kEffectMixDataLibrary[expander.eMix].data;
+                break;
 
-        case EF_OVERDRIVE:
-            targetDry = overdrive.dDry;
-            targetWet = eData_;
+            case EF_OVERDRIVE:
+                targetDry = overdrive.dDry;
+                targetWet = eData_;
 
-            if ((overdrive.limitMix) && ((targetDry + targetWet) > overdrive.limitMixData)) {
-                targetDry = overdrive.limitMixData - targetWet;
-            }
+                if ((overdrive.limitMix) && ((targetDry + targetWet) > overdrive.limitMixData)) {
+                    targetDry = overdrive.limitMixData - targetWet;
+                }
 
-            subEffect_.dData = targetDry;
-            subEffect_.eData = targetWet;
+                subEffect_.dData = targetDry;
+                subEffect_.eData = targetWet;
 
-            overdrive.dDry = targetDry;
-            overdrive.eWet = targetWet;
+                overdrive.dDry = targetDry;
+                overdrive.eWet = targetWet;
 
-            targetDryFloat = kEffectMixDataLibrary[overdrive.dDry].data;
-            targetWetFloat = kEffectMixDataLibrary[overdrive.eWet].data;
-            break;
+                targetDryFloat = kEffectMixDataLibrary[overdrive.dDry].data;
+                targetWetFloat = kEffectMixDataLibrary[overdrive.eWet].data;
+                break;
 
-        case EF_DISTORTION:
-            targetDry = distortion.dDry;
-            targetWet = eData_;
+            case EF_DISTORTION:
+                targetDry = distortion.dDry;
+                targetWet = eData_;
 
-            if ((distortion.limitMix) && ((targetDry + targetWet) > distortion.limitMixData)) {
-                targetDry = distortion.limitMixData - targetWet;
-            }
+                if ((distortion.limitMix) && ((targetDry + targetWet) > distortion.limitMixData)) {
+                    targetDry = distortion.limitMixData - targetWet;
+                }
 
-            subEffect_.dData = targetDry;
-            subEffect_.eData = targetWet;
+                subEffect_.dData = targetDry;
+                subEffect_.eData = targetWet;
 
-            distortion.dDry = targetDry;
-            distortion.eWet = targetWet;
+                distortion.dDry = targetDry;
+                distortion.eWet = targetWet;
 
-            targetDryFloat = kEffectMixDataLibrary[distortion.dDry].data;
-            targetWetFloat = kEffectMixDataLibrary[distortion.eWet].data;
-            break;
+                targetDryFloat = kEffectMixDataLibrary[distortion.dDry].data;
+                targetWetFloat = kEffectMixDataLibrary[distortion.eWet].data;
+                break;
 
-        case EF_BITCRUSHER:
-            targetDry = bitcrusher.dDry;
-            targetWet = eData_;
+            case EF_BITCRUSHER:
+                targetDry = bitcrusher.dDry;
+                targetWet = eData_;
 
-            if ((bitcrusher.limitMix) && ((targetDry + targetWet) > bitcrusher.limitMixData)) {
-                targetDry = bitcrusher.limitMixData - targetWet;
-            }
+                if ((bitcrusher.limitMix) && ((targetDry + targetWet) > bitcrusher.limitMixData)) {
+                    targetDry = bitcrusher.limitMixData - targetWet;
+                }
 
-            subEffect_.dData = targetDry;
-            subEffect_.eData = targetWet;
+                subEffect_.dData = targetDry;
+                subEffect_.eData = targetWet;
 
-            bitcrusher.dDry = targetDry;
-            bitcrusher.eWet = targetWet;
+                bitcrusher.dDry = targetDry;
+                bitcrusher.eWet = targetWet;
 
-            targetDryFloat = kEffectMixDataLibrary[bitcrusher.dDry].data;
-            targetWetFloat = kEffectMixDataLibrary[bitcrusher.eWet].data;
-            break;
+                targetDryFloat = kEffectMixDataLibrary[bitcrusher.dDry].data;
+                targetWetFloat = kEffectMixDataLibrary[bitcrusher.eWet].data;
+                break;
         }
 
         if (effect_.active) {
@@ -11614,8 +12298,8 @@ void Controller::effect_setEData(uint8_t effectNum_, uint8_t subEffectNum_, uint
 }
 
 void Controller::effect_genTransition(uint8_t effectNum_, EffectTransitionMode mode_, bool activeActive_, bool targetActive_, uint8_t activeType_, uint8_t targetType_) {
-    Effect &effect_ = effect[effectNum_];
-    EffectGenTransition &gTransition = effect_.genTransition;
+    Effect& effect_ = effect[effectNum_];
+    EffectGenTransition& gTransition = effect_.genTransition;
 
     gTransition.mode = mode_;
     gTransition.phase = EF_PHASE_A;
@@ -11627,26 +12311,44 @@ void Controller::effect_genTransition(uint8_t effectNum_, EffectTransitionMode m
     gTransition.targetType = targetType_;
 
     switch (mode_) {
-    case EF_MODE_NONE:
-        break;
-
-    case EF_MODE_ACTIVE:
-        switch (targetActive_) {
-        case true:
-            gTransition.activeDry = 1.0;
-            gTransition.targetDry = 0.0;
-
-            gTransition.activeWet = 0.0;
-            gTransition.targetWet = 1.0;
-
-            if ((activeType_ == EF_DELAY) || (activeType_ == EF_CHORUS) || (activeType_ == EF_FLANGER)) {
-                gTransition.activeRecordWet = 0.0;
-                gTransition.targetRecordWet = 1.0;
-            }
-            transitionShowFlag = 2;
+        case EF_MODE_NONE:
             break;
 
-        case false:
+        case EF_MODE_ACTIVE:
+            switch (targetActive_) {
+                case true:
+                    gTransition.activeDry = 1.0;
+                    gTransition.targetDry = 0.0;
+
+                    gTransition.activeWet = 0.0;
+                    gTransition.targetWet = 1.0;
+
+                    if ((activeType_ == EF_DELAY) || (activeType_ == EF_CHORUS) || (activeType_ == EF_FLANGER)) {
+                        gTransition.activeRecordWet = 0.0;
+                        gTransition.targetRecordWet = 1.0;
+                    }
+                    transitionShowFlag = 2;
+                    break;
+
+                case false:
+                    gTransition.activeDry = 0.0;
+                    gTransition.targetDry = 1.0;
+
+                    gTransition.activeWet = 1.0;
+                    gTransition.targetWet = 0.0;
+
+                    if ((activeType_ == EF_DELAY) || (activeType_ == EF_CHORUS) || (activeType_ == EF_FLANGER)) {
+                        gTransition.activeRecordWet = 1.0;
+                        gTransition.targetRecordWet = 0.0;
+                    }
+                    transitionShowFlag = 1;
+                    break;
+            }
+            break;
+
+        case EF_MODE_TYPE:
+        case EF_MODE_TIME:
+        case EF_MODE_FEEDBACK:
             gTransition.activeDry = 0.0;
             gTransition.targetDry = 1.0;
 
@@ -11657,27 +12359,9 @@ void Controller::effect_genTransition(uint8_t effectNum_, EffectTransitionMode m
                 gTransition.activeRecordWet = 1.0;
                 gTransition.targetRecordWet = 0.0;
             }
+
             transitionShowFlag = 1;
             break;
-        }
-        break;
-
-    case EF_MODE_TYPE:
-    case EF_MODE_TIME:
-    case EF_MODE_FEEDBACK:
-        gTransition.activeDry = 0.0;
-        gTransition.targetDry = 1.0;
-
-        gTransition.activeWet = 1.0;
-        gTransition.targetWet = 0.0;
-
-        if ((activeType_ == EF_DELAY) || (activeType_ == EF_CHORUS) || (activeType_ == EF_FLANGER)) {
-            gTransition.activeRecordWet = 1.0;
-            gTransition.targetRecordWet = 0.0;
-        }
-
-        transitionShowFlag = 1;
-        break;
     }
 
     effect_calculateGenTransition(effectNum_);
@@ -11685,8 +12369,8 @@ void Controller::effect_genTransition(uint8_t effectNum_, EffectTransitionMode m
 }
 
 void Controller::effect_mixTransition(uint8_t effectNum_, float dryFloat_, float wetFloat_) {
-    Effect &effect_ = effect[effectNum_];
-    EffectMixTransition &mTransition = effect_.mixTransition;
+    Effect& effect_ = effect[effectNum_];
+    EffectMixTransition& mTransition = effect_.mixTransition;
 
     mTransition.targetDry = dryFloat_;
     mTransition.targetWet = wetFloat_;
@@ -11696,8 +12380,8 @@ void Controller::effect_mixTransition(uint8_t effectNum_, float dryFloat_, float
 }
 
 void Controller::effect_calculateGenTransition(uint8_t effectNum_) {
-    Effect &effect_ = effect[effectNum_];
-    EffectGenTransition &gTransition = effect_.genTransition;
+    Effect& effect_ = effect[effectNum_];
+    EffectGenTransition& gTransition = effect_.genTransition;
 
     if (gTransition.activeDry == gTransition.targetDry) {
         gTransition.actionDry = EF_ACTION_NONE;
@@ -11725,8 +12409,8 @@ void Controller::effect_calculateGenTransition(uint8_t effectNum_) {
 }
 
 void Controller::effect_calculateMixTransition(uint8_t effectNum_) {
-    Effect &effect_ = effect[effectNum_];
-    EffectMixTransition &mTransition = effect_.mixTransition;
+    Effect& effect_ = effect[effectNum_];
+    EffectMixTransition& mTransition = effect_.mixTransition;
 
     if (effect_.dryFloat == mTransition.targetDry) {
         mTransition.actionDry = EF_ACTION_NONE;
@@ -11745,50 +12429,101 @@ void Controller::effect_calculateMixTransition(uint8_t effectNum_) {
     }
 }
 
+void Controller::effect_updateMixFloats(uint8_t effectNum_) {
+    Effect& effect_ = effect[effectNum_];
+
+    switch (effect_.type) {
+        case EF_DELAY:
+            effect_.dryFloat = kEffectMixDataLibrary[effect_.delay.dDry].data;
+            effect_.wetFloat = kEffectMixDataLibrary[effect_.delay.eWet].data;
+            break;
+
+        case EF_CHORUS:
+            effect_.dryFloat = kEffectMixDataLibrary[effect_.chorus.dDry].data;
+            effect_.wetFloat = kEffectMixDataLibrary[effect_.chorus.eWet].data;
+            break;
+
+        case EF_FLANGER:
+            effect_.dryFloat = kEffectMixDataLibrary[effect_.flanger.dDry].data;
+            effect_.wetFloat = kEffectMixDataLibrary[effect_.flanger.eWet].data;
+            break;
+
+        case EF_PHASER:
+            effect_.dryFloat = kEffectMixDataLibrary[effect_.phaser.dDry].data;
+            effect_.wetFloat = kEffectMixDataLibrary[effect_.phaser.eWet].data;
+            break;
+
+        case EF_COMPRESSOR:
+            effect_.dryFloat = kEffectMixDataLibrary[20 - effect_.compressor.eMix].data;
+            effect_.wetFloat = kEffectMixDataLibrary[effect_.compressor.eMix].data;
+            break;
+
+        case EF_EXPANDER:
+            effect_.dryFloat = kEffectMixDataLibrary[20 - effect_.expander.eMix].data;
+            effect_.wetFloat = kEffectMixDataLibrary[effect_.expander.eMix].data;
+            break;
+
+        case EF_OVERDRIVE:
+            effect_.dryFloat = kEffectMixDataLibrary[effect_.overdrive.dDry].data;
+            effect_.wetFloat = kEffectMixDataLibrary[effect_.overdrive.eWet].data;
+            break;
+
+        case EF_DISTORTION:
+            effect_.dryFloat = kEffectMixDataLibrary[effect_.distortion.dDry].data;
+            effect_.wetFloat = kEffectMixDataLibrary[effect_.distortion.eWet].data;
+            break;
+
+        case EF_BITCRUSHER:
+            effect_.dryFloat = kEffectMixDataLibrary[effect_.bitcrusher.dDry].data;
+            effect_.wetFloat = kEffectMixDataLibrary[effect_.bitcrusher.eWet].data;
+            break;
+    }
+}
+
 void Controller::effect_cleanMemory(uint8_t effectNum_, uint8_t type_) {
-    Effect &effect_ = effect[effectNum_];
+    Effect& effect_ = effect[effectNum_];
 
     switch (type_) {
-    case EF_DELAY:
-        effect_.delay.cleanMemory();
-        memset((uint8_t *)effect_.delayAddress, 0x00, kDelayByteSize);
-        break;
+        case EF_DELAY:
+            effect_.delay.cleanMemory();
+            memset((uint8_t*)effect_.delayAddress, 0x00, kDelayByteSize);
+            break;
 
-    case EF_CHORUS:
-        effect_.chorus.cleanMemory();
-        memset((uint8_t *)effect_.chorusAddress, 0x00, kChorusByteSize);
-        break;
+        case EF_CHORUS:
+            effect_.chorus.cleanMemory();
+            memset((uint8_t*)effect_.chorusAddress, 0x00, kChorusByteSize);
+            break;
 
-    case EF_FLANGER:
-        effect_.flanger.cleanMemory();
-        memset(effect_.flangerBuffer, 0x00, sizeof(effect_.flangerBuffer));
-        break;
+        case EF_FLANGER:
+            effect_.flanger.cleanMemory();
+            memset(effect_.flangerBuffer, 0x00, sizeof(effect_.flangerBuffer));
+            break;
 
-    case EF_PHASER:
-        effect_.phaser.cleanMemory();
-        memset(effect_.phaser.ff, 0x00, sizeof(effect_.phaser.ff));
-        memset(effect_.phaser.fb, 0x00, sizeof(effect_.phaser.fb));
-        break;
+        case EF_PHASER:
+            effect_.phaser.cleanMemory();
+            memset(effect_.phaser.ff, 0x00, sizeof(effect_.phaser.ff));
+            memset(effect_.phaser.fb, 0x00, sizeof(effect_.phaser.fb));
+            break;
 
-    case EF_COMPRESSOR:
-        effect_.compressor.cleanMemory();
-        break;
+        case EF_COMPRESSOR:
+            effect_.compressor.cleanMemory();
+            break;
 
-    case EF_EXPANDER:
-        effect_.expander.cleanMemory();
-        break;
+        case EF_EXPANDER:
+            effect_.expander.cleanMemory();
+            break;
 
-    case EF_OVERDRIVE:
-        effect_.overdrive.cleanMemory();
-        break;
+        case EF_OVERDRIVE:
+            effect_.overdrive.cleanMemory();
+            break;
 
-    case EF_DISTORTION:
-        effect_.distortion.cleanMemory();
-        break;
+        case EF_DISTORTION:
+            effect_.distortion.cleanMemory();
+            break;
 
-    case EF_BITCRUSHER:
-        effect_.bitcrusher.cleanMemory();
-        break;
+        case EF_BITCRUSHER:
+            effect_.bitcrusher.cleanMemory();
+            break;
     }
 }
 
@@ -11836,93 +12571,93 @@ void Controller::reverb_menuLeft() {
 
 void Controller::reverb_menuUp() {
     switch (menuTab) {
-    case 0:
-        reverb_setActive(!reverb.active);
-        break;
+        case 0:
+            reverb_setActive(!reverb.active);
+            break;
 
-    case 2:
-        if (reverb.size < kMaxReverbSize) {
-            reverb_setSize(reverb.size + 1);
-        }
-        break;
+        case 2:
+            if (reverb.size < kMaxReverbSize) {
+                reverb_setSize(reverb.size + 1);
+            }
+            break;
 
-    case 3:
-        if (reverb.decay < kMaxReverbDecay) {
-            reverb_setDecay(reverb.decay + 1);
-        }
-        break;
+        case 3:
+            if (reverb.decay < kMaxReverbDecay) {
+                reverb_setDecay(reverb.decay + 1);
+            }
+            break;
 
-    case 4:
-        if (reverb.preDelay < kMaxReverbPreDelay) {
-            reverb_setPreDelay(reverb.preDelay + 1);
-        }
-        break;
+        case 4:
+            if (reverb.preDelay < kMaxReverbPreDelay) {
+                reverb_setPreDelay(reverb.preDelay + 1);
+            }
+            break;
 
-    case 5:
-        if (reverb.surround < kMaxReverbSurround) {
-            reverb_setSurround(reverb.surround + 1);
-        }
-        break;
+        case 5:
+            if (reverb.surround < kMaxReverbSurround) {
+                reverb_setSurround(reverb.surround + 1);
+            }
+            break;
 
-    case 6:
-        if (reverb.dry < kMaxReverbDry) {
-            reverb_setDry(reverb.dry + 1);
-        } else if ((reverb.dry == kMaxReverbDry) && (reverb.wet > kMinReverbWet)) {
-            reverb_setWet(reverb.wet - 1);
-        }
-        break;
+        case 6:
+            if (reverb.dry < kMaxReverbDry) {
+                reverb_setDry(reverb.dry + 1);
+            } else if ((reverb.dry == kMaxReverbDry) && (reverb.wet > kMinReverbWet)) {
+                reverb_setWet(reverb.wet - 1);
+            }
+            break;
 
-    case 7:
-        if (reverb.wet < kMaxReverbWet) {
-            reverb_setWet(reverb.wet + 1);
-        } else if ((reverb.wet == kMaxReverbWet) && (reverb.dry > kMinReverbDry)) {
-            reverb_setDry(reverb.dry - 1);
-        }
-        break;
+        case 7:
+            if (reverb.wet < kMaxReverbWet) {
+                reverb_setWet(reverb.wet + 1);
+            } else if ((reverb.wet == kMaxReverbWet) && (reverb.dry > kMinReverbDry)) {
+                reverb_setDry(reverb.dry - 1);
+            }
+            break;
     }
 }
 
 void Controller::reverb_menuDown() {
     switch (menuTab) {
-    case 0:
-        reverb_setActive(!reverb.active);
-        break;
+        case 0:
+            reverb_setActive(!reverb.active);
+            break;
 
-    case 2:
-        if (reverb.size > kMinReverbSize) {
-            reverb_setSize(reverb.size - 1);
-        }
-        break;
+        case 2:
+            if (reverb.size > kMinReverbSize) {
+                reverb_setSize(reverb.size - 1);
+            }
+            break;
 
-    case 3:
-        if (reverb.decay > kMinReverbDecay) {
-            reverb_setDecay(reverb.decay - 1);
-        }
-        break;
+        case 3:
+            if (reverb.decay > kMinReverbDecay) {
+                reverb_setDecay(reverb.decay - 1);
+            }
+            break;
 
-    case 4:
-        if (reverb.preDelay > kMinReverbPreDelay) {
-            reverb_setPreDelay(reverb.preDelay - 1);
-        }
-        break;
+        case 4:
+            if (reverb.preDelay > kMinReverbPreDelay) {
+                reverb_setPreDelay(reverb.preDelay - 1);
+            }
+            break;
 
-    case 5:
-        if (reverb.surround > kMinReverbSurround) {
-            reverb_setSurround(reverb.surround - 1);
-        }
-        break;
+        case 5:
+            if (reverb.surround > kMinReverbSurround) {
+                reverb_setSurround(reverb.surround - 1);
+            }
+            break;
 
-    case 6:
-        if (reverb.dry > kMinReverbDry) {
-            reverb_setDry(reverb.dry - 1);
-        }
-        break;
+        case 6:
+            if (reverb.dry > kMinReverbDry) {
+                reverb_setDry(reverb.dry - 1);
+            }
+            break;
 
-    case 7:
-        if (reverb.wet > kMinReverbWet) {
-            reverb_setWet(reverb.wet - 1);
-        }
-        break;
+        case 7:
+            if (reverb.wet > kMinReverbWet) {
+                reverb_setWet(reverb.wet - 1);
+            }
+            break;
     }
 }
 
@@ -12069,7 +12804,7 @@ void Controller::reverb_setWet(uint8_t wet_) {
 }
 
 void Controller::reverb_genTransition(ReverbTransitionMode mode_, bool activeActive_, bool targetActive_) {
-    ReverbGenTransition &gTransition = reverb.genTransition;
+    ReverbGenTransition& gTransition = reverb.genTransition;
 
     gTransition.mode = mode_;
     gTransition.phase = REV_PHASE_A;
@@ -12078,22 +12813,35 @@ void Controller::reverb_genTransition(ReverbTransitionMode mode_, bool activeAct
     gTransition.targetActive = targetActive_;
 
     switch (mode_) {
-    case REV_MODE_NONE:
-        break;
-
-    case REV_MODE_ACTIVE:
-        switch (targetActive_) {
-        case true:
-            gTransition.activeDry = 1.0;
-            gTransition.targetDry = 0.0;
-
-            gTransition.activeWet = 0.0;
-            gTransition.targetWet = 1.0;
-
-            transitionShowFlag = 2;
+        case REV_MODE_NONE:
             break;
 
-        case false:
+        case REV_MODE_ACTIVE:
+            switch (targetActive_) {
+                case true:
+                    gTransition.activeDry = 1.0;
+                    gTransition.targetDry = 0.0;
+
+                    gTransition.activeWet = 0.0;
+                    gTransition.targetWet = 1.0;
+
+                    transitionShowFlag = 2;
+                    break;
+
+                case false:
+                    gTransition.activeDry = 0.0;
+                    gTransition.targetDry = 1.0;
+
+                    gTransition.activeWet = 1.0;
+                    gTransition.targetWet = 0.0;
+
+                    transitionShowFlag = 1;
+                    break;
+            }
+            break;
+
+        case REV_MODE_PREDELAY:
+        case REV_MODE_SURROUND:
             gTransition.activeDry = 0.0;
             gTransition.targetDry = 1.0;
 
@@ -12102,19 +12850,6 @@ void Controller::reverb_genTransition(ReverbTransitionMode mode_, bool activeAct
 
             transitionShowFlag = 1;
             break;
-        }
-        break;
-
-    case REV_MODE_PREDELAY:
-    case REV_MODE_SURROUND:
-        gTransition.activeDry = 0.0;
-        gTransition.targetDry = 1.0;
-
-        gTransition.activeWet = 1.0;
-        gTransition.targetWet = 0.0;
-
-        transitionShowFlag = 1;
-        break;
     }
 
     reverb_calculateGenTransition();
@@ -12122,7 +12857,7 @@ void Controller::reverb_genTransition(ReverbTransitionMode mode_, bool activeAct
 }
 
 void Controller::reverb_mixTransition(float dryFloat_, float wetFloat_) {
-    ReverbMixTransition &mTransition = reverb.mixTransition;
+    ReverbMixTransition& mTransition = reverb.mixTransition;
 
     mTransition.targetDry = dryFloat_;
     mTransition.targetWet = wetFloat_;
@@ -12132,7 +12867,7 @@ void Controller::reverb_mixTransition(float dryFloat_, float wetFloat_) {
 }
 
 void Controller::reverb_calculateGenTransition() {
-    ReverbGenTransition &gTransition = reverb.genTransition;
+    ReverbGenTransition& gTransition = reverb.genTransition;
 
     if (gTransition.activeDry == gTransition.targetDry) {
         gTransition.actionDry = REV_ACTION_NONE;
@@ -12152,7 +12887,7 @@ void Controller::reverb_calculateGenTransition() {
 }
 
 void Controller::reverb_calculateMixTransition() {
-    ReverbMixTransition &mTransition = reverb.mixTransition;
+    ReverbMixTransition& mTransition = reverb.mixTransition;
 
     if (reverb.dryFloat == mTransition.targetDry) {
         mTransition.actionDry = REV_ACTION_NONE;
@@ -12215,84 +12950,84 @@ void Controller::key_menuLeft() {
 
 void Controller::key_menuUp() {
     switch (menuTab) {
-    case 0:
-        (key.note < kMaxKeyNote) ? key_setNote(key.note + 1) : key_setNote(kMinKeyNote);
-        break;
-
-    case 2:
-        key_setArpeg(!key.arpeg);
-        break;
-
-    case 3:
-        if (key.rate < kMaxKeyRate)
-            key_setRate(key.rate + 1);
-        break;
-
-    case 4:
-        (key.osc < kMaxKeyOsc) ? key_setOsc(key.osc + 1) : key_setOsc(kMinKeyOsc);
-        break;
-
-    case 5:
-        switch (key.chordType) {
-        case CHORD_3:
-            (key.chord < kMaxKeyChord3) ? key_setChord(key.chord + 1) : key_setChord(kMinKeyChord3);
+        case 0:
+            (key.note < kMaxKeyNote) ? key_setNote(key.note + 1) : key_setNote(kMinKeyNote);
             break;
 
-        case CHORD_4:
-            (key.chord < kMaxKeyChord4) ? key_setChord(key.chord + 1) : key_setChord(kMinKeyChord4);
+        case 2:
+            key_setArpeg(!key.arpeg);
             break;
-        }
-        break;
 
-    case 6:
-        (key.order < kMaxKeyOrder) ? key_setOrder(key.order + 1) : key_setOrder(kMinKeyOrder);
-        break;
+        case 3:
+            if (key.rate < kMaxKeyRate)
+                key_setRate(key.rate + 1);
+            break;
 
-    case 7:
-        (key.octave < kMaxKeyOctave) ? key_setOctave(key.octave + 1) : key_setOctave(kMinKeyOctave);
-        break;
+        case 4:
+            (key.osc < kMaxKeyOsc) ? key_setOsc(key.osc + 1) : key_setOsc(kMinKeyOsc);
+            break;
+
+        case 5:
+            switch (key.chordType) {
+                case CHORD_3:
+                    (key.chord < kMaxKeyChord3) ? key_setChord(key.chord + 1) : key_setChord(kMinKeyChord3);
+                    break;
+
+                case CHORD_4:
+                    (key.chord < kMaxKeyChord4) ? key_setChord(key.chord + 1) : key_setChord(kMinKeyChord4);
+                    break;
+            }
+            break;
+
+        case 6:
+            (key.order < kMaxKeyOrder) ? key_setOrder(key.order + 1) : key_setOrder(kMinKeyOrder);
+            break;
+
+        case 7:
+            (key.octave < kMaxKeyOctave) ? key_setOctave(key.octave + 1) : key_setOctave(kMinKeyOctave);
+            break;
     }
 }
 
 void Controller::key_menuDown() {
     switch (menuTab) {
-    case 0:
-        (key.note > kMinKeyNote) ? key_setNote(key.note - 1) : key_setNote(kMaxKeyNote);
-        break;
-
-    case 2:
-        key_setArpeg(!key.arpeg);
-        break;
-
-    case 3:
-        if (key.rate > kMinKeyRate)
-            key_setRate(key.rate - 1);
-        break;
-
-    case 4:
-        (key.osc > kMinKeyOsc) ? key_setOsc(key.osc - 1) : key_setOsc(kMaxKeyOsc);
-        break;
-
-    case 5:
-        switch (key.chordType) {
-        case CHORD_3:
-            (key.chord > kMinKeyChord3) ? key_setChord(key.chord - 1) : key_setChord(kMaxKeyChord3);
+        case 0:
+            (key.note > kMinKeyNote) ? key_setNote(key.note - 1) : key_setNote(kMaxKeyNote);
             break;
 
-        case CHORD_4:
-            (key.chord > kMinKeyChord4) ? key_setChord(key.chord - 1) : key_setChord(kMaxKeyChord4);
+        case 2:
+            key_setArpeg(!key.arpeg);
             break;
-        }
 
-        break;
+        case 3:
+            if (key.rate > kMinKeyRate)
+                key_setRate(key.rate - 1);
+            break;
 
-    case 6:
-        (key.order > kMinKeyOrder) ? key_setOrder(key.order - 1) : key_setOrder(kMaxKeyOrder);
-        break;
+        case 4:
+            (key.osc > kMinKeyOsc) ? key_setOsc(key.osc - 1) : key_setOsc(kMaxKeyOsc);
+            break;
 
-    case 7:
-        (key.octave > kMinKeyOctave) ? key_setOctave(key.octave - 1) : key_setOctave(kMaxKeyOctave);
-        break;
+        case 5:
+            switch (key.chordType) {
+                case CHORD_3:
+                    (key.chord > kMinKeyChord3) ? key_setChord(key.chord - 1) : key_setChord(kMaxKeyChord3);
+                    break;
+
+                case CHORD_4:
+                    (key.chord > kMinKeyChord4) ? key_setChord(key.chord - 1) : key_setChord(kMaxKeyChord4);
+                    break;
+            }
+
+            break;
+
+        case 6:
+            (key.order > kMinKeyOrder) ? key_setOrder(key.order - 1) : key_setOrder(kMaxKeyOrder);
+            break;
+
+        case 7:
+            (key.octave > kMinKeyOctave) ? key_setOctave(key.octave - 1) : key_setOctave(kMaxKeyOctave);
+            break;
     }
 }
 
@@ -12323,25 +13058,25 @@ void Controller::key_setRate(uint8_t rate_) {
         // update data
         key.rate = rate_;
         switch (key.rate) {
-        case 1: // 1/12
-        case 3: // 1/6
-        case 5: // 1/3
-            if (key.chordType != CHORD_3) {
-                key.chordType = CHORD_3;
-                key_setChord(0);
-            }
-            break;
+            case 1:  // 1/12
+            case 3:  // 1/6
+            case 5:  // 1/3
+                if (key.chordType != CHORD_3) {
+                    key.chordType = CHORD_3;
+                    key_setChord(0);
+                }
+                break;
 
-        case 0: // 1/16
-        case 2: // 1/8
-        case 4: // 1/4
-        case 6: // 1/2
-        case 7: // 1/1
-            if (key.chordType != CHORD_4) {
-                key.chordType = CHORD_4;
-                key_setChord(0);
-            }
-            break;
+            case 0:  // 1/16
+            case 2:  // 1/8
+            case 4:  // 1/4
+            case 6:  // 1/2
+            case 7:  // 1/1
+                if (key.chordType != CHORD_4) {
+                    key.chordType = CHORD_4;
+                    key_setChord(0);
+                }
+                break;
         }
 
         key_calculateArpeg();
@@ -12358,20 +13093,20 @@ void Controller::key_setOsc(uint8_t osc_) {
         // update data
         key.osc = osc_;
         switch (key.osc) {
-        case 0:
-            key.oscActive[0] = true;
-            key.oscActive[1] = true;
-            break;
+            case 0:
+                key.oscActive[0] = true;
+                key.oscActive[1] = true;
+                break;
 
-        case 1:
-            key.oscActive[0] = true;
-            key.oscActive[1] = false;
-            break;
+            case 1:
+                key.oscActive[0] = true;
+                key.oscActive[1] = false;
+                break;
 
-        case 2:
-            key.oscActive[0] = false;
-            key.oscActive[1] = true;
-            break;
+            case 2:
+                key.oscActive[0] = false;
+                key.oscActive[1] = true;
+                break;
         }
         // update lcd
         if (menu == KEY_MENU) {
@@ -12422,149 +13157,149 @@ void Controller::key_setOctave(uint8_t octaveRange_) {
 
 void Controller::key_calculateArpeg() {
     switch (key.chordType) {
-    case CHORD_3:
-        switch (key.octave) {
-        case 0: // single
-            switch (key.order) {
-            case 0: // up
-                key.chordPattern = 1;
-                key.stepSize = 3;
-                key.chordPointer = (uint8_t *)kKeyArpeg3DataLibrary[key.chord][0][0];
-                break;
+        case CHORD_3:
+            switch (key.octave) {
+                case 0:  // single
+                    switch (key.order) {
+                        case 0:  // up
+                            key.chordPattern = 1;
+                            key.stepSize = 3;
+                            key.chordPointer = (uint8_t*)kKeyArpeg3DataLibrary[key.chord][0][0];
+                            break;
 
-            case 1: // down
-                key.chordPattern = 1;
-                key.stepSize = 3;
-                key.chordPointer = (uint8_t *)kKeyArpeg3DataLibrary[key.chord][1][0];
-                break;
+                        case 1:  // down
+                            key.chordPattern = 1;
+                            key.stepSize = 3;
+                            key.chordPointer = (uint8_t*)kKeyArpeg3DataLibrary[key.chord][1][0];
+                            break;
 
-            case 2: // up-down
-                key.chordPattern = 2;
-                key.stepSize = 6;
-                key.chordPointer = (uint8_t *)kKeyArpeg3DataLibrary[key.chord][2][0];
-                break;
+                        case 2:  // up-down
+                            key.chordPattern = 2;
+                            key.stepSize = 6;
+                            key.chordPointer = (uint8_t*)kKeyArpeg3DataLibrary[key.chord][2][0];
+                            break;
 
-            case 3: // down-up
-                key.chordPattern = 2;
-                key.stepSize = 6;
-                key.chordPointer = (uint8_t *)kKeyArpeg3DataLibrary[key.chord][3][0];
-                break;
+                        case 3:  // down-up
+                            key.chordPattern = 2;
+                            key.stepSize = 6;
+                            key.chordPointer = (uint8_t*)kKeyArpeg3DataLibrary[key.chord][3][0];
+                            break;
 
-            case 4: // random
-                key.chordPattern = 1;
-                key.stepSize = 3;
-                key.chordPointer = (uint8_t *)kKeyArpeg3DataLibrary[key.chord][0][0];
-                break;
+                        case 4:  // random
+                            key.chordPattern = 1;
+                            key.stepSize = 3;
+                            key.chordPointer = (uint8_t*)kKeyArpeg3DataLibrary[key.chord][0][0];
+                            break;
+                    }
+                    break;
+
+                case 1:  // double
+                    switch (key.order) {
+                        case 0:  // up
+                            key.chordPattern = 3;
+                            key.stepSize = 6;
+                            key.chordPointer = (uint8_t*)kKeyArpeg3DataLibrary[key.chord][0][1];
+                            break;
+
+                        case 1:  // down
+                            key.chordPattern = 3;
+                            key.stepSize = 6;
+                            key.chordPointer = (uint8_t*)kKeyArpeg3DataLibrary[key.chord][1][1];
+                            break;
+
+                        case 2:  // up-down
+                            key.chordPattern = 4;
+                            key.stepSize = 12;
+                            key.chordPointer = (uint8_t*)kKeyArpeg3DataLibrary[key.chord][2][1];
+                            break;
+
+                        case 3:  // down-up
+                            key.chordPattern = 4;
+                            key.stepSize = 12;
+                            key.chordPointer = (uint8_t*)kKeyArpeg3DataLibrary[key.chord][3][1];
+                            break;
+
+                        case 4:  // random
+                            key.chordPattern = 3;
+                            key.stepSize = 6;
+                            key.chordPointer = (uint8_t*)kKeyArpeg3DataLibrary[key.chord][0][1];
+                            break;
+                    }
+                    break;
             }
             break;
 
-        case 1: // double
-            switch (key.order) {
-            case 0: // up
-                key.chordPattern = 3;
-                key.stepSize = 6;
-                key.chordPointer = (uint8_t *)kKeyArpeg3DataLibrary[key.chord][0][1];
-                break;
+        case CHORD_4:
+            switch (key.octave) {
+                case 0:  // single
+                    switch (key.order) {
+                        case 0:  // up
+                            key.chordPattern = 5;
+                            key.stepSize = 4;
+                            key.chordPointer = (uint8_t*)kKeyArpeg4DataLibrary[key.chord][0][0];
+                            break;
 
-            case 1: // down
-                key.chordPattern = 3;
-                key.stepSize = 6;
-                key.chordPointer = (uint8_t *)kKeyArpeg3DataLibrary[key.chord][1][1];
-                break;
+                        case 1:  // down
+                            key.chordPattern = 5;
+                            key.stepSize = 4;
+                            key.chordPointer = (uint8_t*)kKeyArpeg4DataLibrary[key.chord][1][0];
+                            break;
 
-            case 2: // up-down
-                key.chordPattern = 4;
-                key.stepSize = 12;
-                key.chordPointer = (uint8_t *)kKeyArpeg3DataLibrary[key.chord][2][1];
-                break;
+                        case 2:  // up-down
+                            key.chordPattern = 6;
+                            key.stepSize = 8;
+                            key.chordPointer = (uint8_t*)kKeyArpeg4DataLibrary[key.chord][2][0];
+                            break;
 
-            case 3: // down-up
-                key.chordPattern = 4;
-                key.stepSize = 12;
-                key.chordPointer = (uint8_t *)kKeyArpeg3DataLibrary[key.chord][3][1];
-                break;
+                        case 3:  // down-up
+                            key.chordPattern = 6;
+                            key.stepSize = 8;
+                            key.chordPointer = (uint8_t*)kKeyArpeg4DataLibrary[key.chord][3][0];
+                            break;
 
-            case 4: // random
-                key.chordPattern = 3;
-                key.stepSize = 6;
-                key.chordPointer = (uint8_t *)kKeyArpeg3DataLibrary[key.chord][0][1];
-                break;
+                        case 4:  // random
+                            key.chordPattern = 5;
+                            key.stepSize = 4;
+                            key.chordPointer = (uint8_t*)kKeyArpeg4DataLibrary[key.chord][0][0];
+                            break;
+                    }
+                    break;
+
+                case 1:  // double
+                    switch (key.order) {
+                        case 0:  // up
+                            key.chordPattern = 7;
+                            key.stepSize = 8;
+                            key.chordPointer = (uint8_t*)kKeyArpeg4DataLibrary[key.chord][0][1];
+                            break;
+
+                        case 1:  // down
+                            key.chordPattern = 7;
+                            key.stepSize = 8;
+                            key.chordPointer = (uint8_t*)kKeyArpeg4DataLibrary[key.chord][1][1];
+                            break;
+
+                        case 2:  // up-down
+                            key.chordPattern = 8;
+                            key.stepSize = 16;
+                            key.chordPointer = (uint8_t*)kKeyArpeg4DataLibrary[key.chord][2][1];
+                            break;
+
+                        case 3:  // down-up
+                            key.chordPattern = 8;
+                            key.stepSize = 16;
+                            key.chordPointer = (uint8_t*)kKeyArpeg4DataLibrary[key.chord][3][1];
+                            break;
+
+                        case 4:  // random
+                            key.chordPattern = 7;
+                            key.stepSize = 8;
+                            key.chordPointer = (uint8_t*)kKeyArpeg4DataLibrary[key.chord][0][1];
+                            break;
+                    }
+                    break;
             }
             break;
-        }
-        break;
-
-    case CHORD_4:
-        switch (key.octave) {
-        case 0: // single
-            switch (key.order) {
-            case 0: // up
-                key.chordPattern = 5;
-                key.stepSize = 4;
-                key.chordPointer = (uint8_t *)kKeyArpeg4DataLibrary[key.chord][0][0];
-                break;
-
-            case 1: // down
-                key.chordPattern = 5;
-                key.stepSize = 4;
-                key.chordPointer = (uint8_t *)kKeyArpeg4DataLibrary[key.chord][1][0];
-                break;
-
-            case 2: // up-down
-                key.chordPattern = 6;
-                key.stepSize = 8;
-                key.chordPointer = (uint8_t *)kKeyArpeg4DataLibrary[key.chord][2][0];
-                break;
-
-            case 3: // down-up
-                key.chordPattern = 6;
-                key.stepSize = 8;
-                key.chordPointer = (uint8_t *)kKeyArpeg4DataLibrary[key.chord][3][0];
-                break;
-
-            case 4: // random
-                key.chordPattern = 5;
-                key.stepSize = 4;
-                key.chordPointer = (uint8_t *)kKeyArpeg4DataLibrary[key.chord][0][0];
-                break;
-            }
-            break;
-
-        case 1: // double
-            switch (key.order) {
-            case 0: // up
-                key.chordPattern = 7;
-                key.stepSize = 8;
-                key.chordPointer = (uint8_t *)kKeyArpeg4DataLibrary[key.chord][0][1];
-                break;
-
-            case 1: // down
-                key.chordPattern = 7;
-                key.stepSize = 8;
-                key.chordPointer = (uint8_t *)kKeyArpeg4DataLibrary[key.chord][1][1];
-                break;
-
-            case 2: // up-down
-                key.chordPattern = 8;
-                key.stepSize = 16;
-                key.chordPointer = (uint8_t *)kKeyArpeg4DataLibrary[key.chord][2][1];
-                break;
-
-            case 3: // down-up
-                key.chordPattern = 8;
-                key.stepSize = 16;
-                key.chordPointer = (uint8_t *)kKeyArpeg4DataLibrary[key.chord][3][1];
-                break;
-
-            case 4: // random
-                key.chordPattern = 7;
-                key.stepSize = 8;
-                key.chordPointer = (uint8_t *)kKeyArpeg4DataLibrary[key.chord][0][1];
-                break;
-            }
-            break;
-        }
-        break;
     }
 }
 
@@ -12592,7 +13327,7 @@ void Controller::song_reset() {
 }
 
 void Controller::song_menuRight() {
-    Bank &bank = song.bankLibrary[activeBankNum];
+    Bank& bank = song.bankLibrary[activeBankNum];
 
     if (bank.lastActiveBeatNum > 0) {
         lcd_drawBeat(activeBankNum, selectedBeatNum, false);
@@ -12606,7 +13341,7 @@ void Controller::song_menuRight() {
 }
 
 void Controller::song_menuLeft() {
-    Bank &bank = song.bankLibrary[activeBankNum];
+    Bank& bank = song.bankLibrary[activeBankNum];
 
     if (bank.lastActiveBeatNum > 0) {
         lcd_drawBeat(activeBankNum, selectedBeatNum, false);
@@ -12620,9 +13355,9 @@ void Controller::song_menuLeft() {
 }
 
 void Controller::song_menuUp() {
-    Bank &bank = song.bankLibrary[activeBankNum];
+    Bank& bank = song.bankLibrary[activeBankNum];
     if (bank.lastActiveBeatNum > 0) {
-        Beat &beat = bank.beatLibrary[selectedBeatNum];
+        Beat& beat = bank.beatLibrary[selectedBeatNum];
         if (beat.note < 11) {
             song_setBeatNoteOctave(beat.note + 1, beat.octave);
         } else if (beat.octave < kMaxOctave) {
@@ -12632,9 +13367,9 @@ void Controller::song_menuUp() {
 }
 
 void Controller::song_menuDown() {
-    Bank &bank = song.bankLibrary[activeBankNum];
+    Bank& bank = song.bankLibrary[activeBankNum];
     if (bank.lastActiveBeatNum > 0) {
-        Beat &beat = bank.beatLibrary[selectedBeatNum];
+        Beat& beat = bank.beatLibrary[selectedBeatNum];
         if (beat.note > 0) {
             song_setBeatNoteOctave(beat.note - 1, beat.octave);
         } else if (beat.octave > kMinOctave) {
@@ -12643,8 +13378,66 @@ void Controller::song_menuDown() {
     }
 }
 
+void Controller::song_shiftSelectedBeat(bool direction_) {
+    Bank& bank = song.bankLibrary[activeBankNum];
+
+    if ((bank.lastActiveBeatNum == -1) || (selectedBeatNum == -1)) {
+        return;
+    }
+
+    uint16_t quantizeInterval = kQuantizeInterval[rhythm.quantize];
+    if (quantizeInterval == 0) {
+        return;
+    }
+
+    Beat& beat = bank.beatLibrary[selectedBeatNum];
+    uint16_t oldStart = beat.startInterval;
+    uint16_t newStart = oldStart;
+
+    uint16_t lowerBound = 0;
+    if (selectedBeatNum > 0) {
+        lowerBound = bank.beatLibrary[selectedBeatNum - 1].endInterval;
+    }
+
+    if (direction_) {
+        if (beat.endInterval <= quantizeInterval) {
+            return;
+        }
+        uint16_t upperBound = beat.endInterval - quantizeInterval;
+        if (oldStart < upperBound) {
+            newStart = oldStart + quantizeInterval;
+            if (newStart > upperBound) {
+                newStart = upperBound;
+            }
+        }
+    } else {
+        if (oldStart > lowerBound) {
+            if (oldStart > quantizeInterval) {
+                newStart = oldStart - quantizeInterval;
+            } else {
+                newStart = lowerBound;
+            }
+            if (newStart < lowerBound) {
+                newStart = lowerBound;
+            }
+        }
+    }
+
+    if (newStart == oldStart) {
+        return;
+    }
+
+    lcd_clearBeat(activeBankNum, selectedBeatNum);
+    beat.startInterval = newStart;
+    lcd_drawBeat(activeBankNum, selectedBeatNum, true);
+    lcd_drawSong_BeatData();
+    lcd_drawSong_BeatGraph();
+
+    song_calculateNextBeatNum(activeBankNum, playInterval);
+}
+
 void Controller::song_startRecordBeat(uint8_t bankNum_, uint16_t interval_, uint8_t octaveNum_, uint8_t noteNum_) {
-    Bank &bank = song.bankLibrary[bankNum_];
+    Bank& bank = song.bankLibrary[bankNum_];
     // end pre-record beat
     if ((recordBeatNum != -1) && (noteNum_ != recordNoteNum)) {
         song_endRecordBeat(bankNum_, interval_);
@@ -12659,7 +13452,7 @@ void Controller::song_startRecordBeat(uint8_t bankNum_, uint16_t interval_, uint
             // limit previous beat's interval
             if (bank.lastActiveBeatNum != -1) {
                 for (int8_t i = 0; i <= bank.lastActiveBeatNum; i++) {
-                    Beat &beat = bank.beatLibrary[i];
+                    Beat& beat = bank.beatLibrary[i];
                     if ((beat.startInterval < startInterval) && (beat.endInterval > startInterval)) {
                         lcd_clearBeatInterval(bankNum_, i, startInterval, beat.endInterval);
                         beat.endInterval = startInterval;
@@ -12735,7 +13528,7 @@ void Controller::song_startRecordBeat(uint8_t bankNum_, uint16_t interval_, uint
 }
 
 void Controller::song_endRecordBeat(uint8_t bankNum_, uint16_t interval_) {
-    Bank &bank = song.bankLibrary[bankNum_];
+    Bank& bank = song.bankLibrary[bankNum_];
     // end record beat
     if (recordBeatNum != -1) {
         uint8_t beatNum = recordBeatNum;
@@ -12750,7 +13543,7 @@ void Controller::song_endRecordBeat(uint8_t bankNum_, uint16_t interval_) {
 
         // limit next beat's interval
         for (uint8_t i = beatNum; i <= bank.lastActiveBeatNum; i++) {
-            Beat &beat = bank.beatLibrary[i];
+            Beat& beat = bank.beatLibrary[i];
             if ((beat.startInterval > startInterval) && (beat.startInterval < endInterval)) {
                 if (beat.endInterval > endInterval) {
                     lcd_clearBeatInterval(bankNum_, i, beat.startInterval, endInterval);
@@ -12792,7 +13585,7 @@ void Controller::song_setBeat(uint8_t bankNum_, uint16_t startInterval_, uint16_
 
 void Controller::song_setBeatNoteOctave(uint8_t note_, uint8_t octave_) {
     if ((note_ >= 0) && (note_ <= 12) && (octave_ >= kMinOctave) && (octave_ <= kMaxOctave)) {
-        Beat &beat = song.bankLibrary[activeBankNum].beatLibrary[selectedBeatNum];
+        Beat& beat = song.bankLibrary[activeBankNum].beatLibrary[selectedBeatNum];
         lcd_clearBeat(activeBankNum, selectedBeatNum);
         beat.note = note_;
         beat.octave = octave_;
@@ -12805,31 +13598,31 @@ void Controller::song_generateBeat(uint8_t type) {
     uint16_t startInterval;
     uint16_t endInterval;
     switch (type) {
-    case 0:
-        for (uint8_t i = 0; i < rhythm.bar; i++) {
-            startInterval = i * barInterval;
-            endInterval = (i + 1) * barInterval;
-            song_setBeat(activeBankNum, startInterval, endInterval, activeOctaveNum, 0);
-        }
-        break;
-
-    case 1:
-        for (uint8_t i = 0; i < rhythm.bar; i++) {
-            startInterval = i * barInterval + (barInterval / 2);
-            endInterval = (i + 1) * barInterval;
-            song_setBeat(activeBankNum, startInterval, endInterval, activeOctaveNum, 0);
-        }
-        break;
-
-    case 2:
-        for (uint8_t i = 0; i < rhythm.measureTotal; i++) {
-            startInterval = i * measureInterval;
-            endInterval = (i + 1) * measureInterval;
-            if (startInterval % (barInterval / 2) != 0) {
+        case 0:
+            for (uint8_t i = 0; i < rhythm.bar; i++) {
+                startInterval = i * barInterval;
+                endInterval = (i + 1) * barInterval;
                 song_setBeat(activeBankNum, startInterval, endInterval, activeOctaveNum, 0);
             }
-        }
-        break;
+            break;
+
+        case 1:
+            for (uint8_t i = 0; i < rhythm.bar; i++) {
+                startInterval = i * barInterval + (barInterval / 2);
+                endInterval = (i + 1) * barInterval;
+                song_setBeat(activeBankNum, startInterval, endInterval, activeOctaveNum, 0);
+            }
+            break;
+
+        case 2:
+            for (uint8_t i = 0; i < rhythm.measureTotal; i++) {
+                startInterval = i * measureInterval;
+                endInterval = (i + 1) * measureInterval;
+                if (startInterval % (barInterval / 2) != 0) {
+                    song_setBeat(activeBankNum, startInterval, endInterval, activeOctaveNum, 0);
+                }
+            }
+            break;
     }
 
     if (menu == SONG_MENU) {
@@ -12844,12 +13637,13 @@ void Controller::song_generateBeat(uint8_t type) {
 }
 
 void Controller::song_resetSelectedBeat() {
-    Bank &bank = song.bankLibrary[activeBankNum];
+    Bank& bank = song.bankLibrary[activeBankNum];
     if ((bank.lastActiveBeatNum != -1) && (selectedBeatNum != -1)) {
         // stop play beat
         if ((playActive) && (bank.playBeatNum == selectedBeatNum)) {
-            sD.releaseData.active = true;
             sD.releaseData.beatNum = sD.activeBeatNum;
+            __DMB();
+            sD.releaseData.active = true;
         }
         // reset beat
         lcd_clearBeat(activeBankNum, selectedBeatNum);
@@ -12878,7 +13672,7 @@ void Controller::song_resetBeat(uint8_t bankNum_, uint8_t beatNum_) {
     if ((bankNum_ == activeBankNum) && (beatNum_ == selectedBeatNum)) {
         song_resetSelectedBeat();
     } else {
-        Bank &bank = song.bankLibrary[bankNum_];
+        Bank& bank = song.bankLibrary[bankNum_];
         if ((bank.lastActiveBeatNum != -1) && (beatNum_ != -1)) {
             // reset beat
             lcd_clearBeat(bankNum_, beatNum_);
@@ -12890,11 +13684,11 @@ void Controller::song_resetBeat(uint8_t bankNum_, uint8_t beatNum_) {
 }
 
 void Controller::song_resetBeats(uint8_t bankNum_, uint16_t startInterval_) {
-    Bank &bank = song.bankLibrary[bankNum_];
+    Bank& bank = song.bankLibrary[bankNum_];
     if (bank.lastActiveBeatNum != -1) {
         bool reorder = false;
         for (uint8_t i = 0; i <= bank.lastActiveBeatNum; i++) {
-            Beat &beat = bank.beatLibrary[i];
+            Beat& beat = bank.beatLibrary[i];
             uint16_t beatStartInterval = beat.startInterval;
             uint16_t beatEndInterval = beat.endInterval;
             if (beatStartInterval >= startInterval_) {
@@ -12912,12 +13706,13 @@ void Controller::song_resetBeats(uint8_t bankNum_, uint16_t startInterval_) {
 }
 
 void Controller::song_resetAllBeats(uint8_t bankNum_) {
-    Bank &bank = song.bankLibrary[bankNum_];
+    Bank& bank = song.bankLibrary[bankNum_];
     if (bank.lastActiveBeatNum != -1) {
         // stop play beat
         if (playActive) {
-            sD.releaseData.active = true;
             sD.releaseData.beatNum = sD.activeBeatNum;
+            __DMB();
+            sD.releaseData.active = true;
         }
         // reset beats
         for (uint16_t i = 0; i < kBeatLibrarySize; i++) {
@@ -12938,11 +13733,11 @@ void Controller::song_resetAllBeats(uint8_t bankNum_) {
 }
 
 void Controller::song_quantizeActiveBeats(uint8_t bankNum_) {
-    Bank &bank = song.bankLibrary[bankNum_];
+    Bank& bank = song.bankLibrary[bankNum_];
     uint16_t quantizeInterval = kQuantizeInterval[rhythm.quantize];
     if (bank.lastActiveBeatNum != -1) {
         for (uint8_t i = 0; i < kBeatLibrarySize; i++) {
-            Beat &beat = bank.beatLibrary[i];
+            Beat& beat = bank.beatLibrary[i];
             if (beat.active) {
                 uint16_t startInterval = beat.startInterval;
                 uint16_t endInterval = beat.endInterval;
@@ -12970,16 +13765,16 @@ void Controller::song_quantizeActiveBeats(uint8_t bankNum_) {
 }
 
 void Controller::song_arrangeActiveBeats(uint8_t bankNum_, bool duplicate_, bool collect_, bool sort_) {
-    Bank &bank = song.bankLibrary[bankNum_];
+    Bank& bank = song.bankLibrary[bankNum_];
     if (bank.lastActiveBeatNum != -1) {
         // phase 01: reset duplicate active beats
         if (duplicate_) {
             for (uint8_t i = 0; i < kBeatLibrarySize; i++) {
-                Beat &beat = bank.beatLibrary[i];
+                Beat& beat = bank.beatLibrary[i];
                 if (beat.active) {
                     uint16_t beatStartInterval = beat.startInterval;
                     for (uint8_t j = i + 1; j < kBeatLibrarySize; j++) {
-                        Beat &nextBeat = bank.beatLibrary[j];
+                        Beat& nextBeat = bank.beatLibrary[j];
                         if (nextBeat.active) {
                             uint16_t nextStartInterval = nextBeat.startInterval;
                             if (nextStartInterval == beatStartInterval) {
@@ -13041,7 +13836,7 @@ void Controller::song_arrangeActiveBeats(uint8_t bankNum_, bool duplicate_, bool
 }
 
 void Controller::song_calculateLastActiveBeatNum(uint8_t bankNum_) {
-    Bank &bank = song.bankLibrary[bankNum_];
+    Bank& bank = song.bankLibrary[bankNum_];
     int8_t lastActiveBeatNum = -1;
     for (uint16_t i = 0; i < kBeatLibrarySize; i++) {
         if (bank.beatLibrary[i].active) {
@@ -13054,13 +13849,18 @@ void Controller::song_calculateLastActiveBeatNum(uint8_t bankNum_) {
 }
 
 void Controller::song_calculateNextBeatNum(uint8_t bankNum_, uint16_t playInterval_) {
-    Bank &bank = song.bankLibrary[bankNum_];
+    Bank& bank = song.bankLibrary[bankNum_];
     if (bank.lastActiveBeatNum != -1) {
+        bool found = false;
         for (uint8_t i = 0; i <= bank.lastActiveBeatNum; i++) {
             if ((bank.beatLibrary[i].active) && (bank.beatLibrary[i].startInterval >= playInterval)) {
                 bank.nextBeatNum = i;
+                found = true;
                 break;
             }
+        }
+        if (!found) {
+            bank.nextBeatNum = 0;
         }
     } else {
         bank.nextBeatNum = -1;
@@ -13108,26 +13908,27 @@ void Controller::pressNote(uint8_t octaveNum_, uint8_t noteNum_) {
 
     // play note
     switch (sD.activeBeatNum) {
-    case -1:
-        sD.startData.active = true;
-        sD.startData.beatNum = 0;
-        break;
+        case -1:
+            sD.startData.beatNum = 0;
+            __DMB();
+            sD.startData.active = true;
+            break;
 
-    case 0:
-        sD.startData.active = true;
-        sD.startData.beatNum = 1;
+        case 0:
+            sD.startData.beatNum = 1;
+            sD.endData.beatNum = 0;
+            __DMB();
+            sD.startData.active = true;
+            sD.endData.active = true;
+            break;
 
-        sD.endData.active = true;
-        sD.endData.beatNum = 0;
-        break;
-
-    case 1:
-        sD.startData.active = true;
-        sD.startData.beatNum = 0;
-
-        sD.endData.active = true;
-        sD.endData.beatNum = 1;
-        break;
+        case 1:
+            sD.startData.beatNum = 0;
+            sD.endData.beatNum = 1;
+            __DMB();
+            sD.startData.active = true;
+            sD.endData.active = true;
+            break;
     }
 
     notePressed = true;
@@ -13142,8 +13943,9 @@ void Controller::pressNote(uint8_t octaveNum_, uint8_t noteNum_) {
 void Controller::releaseNote() {
     if ((notePressedBeatNum != -1) && (sD.beatPlayData[notePressedBeatNum].active)) {
         // release note
-        sD.releaseData.active = true;
         sD.releaseData.beatNum = notePressedBeatNum;
+        __DMB();
+        sD.releaseData.active = true;
     }
 
     notePressed = false;
@@ -13175,13 +13977,29 @@ void Controller::setOctave(uint8_t octave_) {
 
 /* Play functions ------------------------------------------------------------*/
 
-void Controller::record() {
+void Controller::record(bool bypassPrecount) {
     if (system.sync.syncOutPlay)
         sendSyncCommand(SYNC_RECORD);
 
+    if (system.midi.txSync) {
+        static const uint8_t kMidiTrigRecordSysEx[5] = {
+            kMidiSysExStart,
+            kMidiSysExManufacturerNonCommercial,
+            kMidiSysExTransportFamily,
+            kMidiSysExTrigRecord,
+            kMidiSysExEnd};
+        enqueueMidiTx(kMidiTrigRecordSysEx, 5);
+    }
+
+    if (system.midi.txSync) {
+        static const uint8_t kMidiStart = 0xFA;
+        enqueueMidiTx(&kMidiStart, 1);
+    }
+
     // start play & record
     if ((!playActive) && (!recordActive)) {
-        if ((metronome.active) && (metronome.precount)) {
+        bool usePrecount = !bypassPrecount && (metronome.active) && (metronome.precount);
+        if (usePrecount) {
             metronome.precountState = true;
             metronome.precounter = 0;
             metronome.countDown = rhythm.measure;
@@ -13194,6 +14012,8 @@ void Controller::record() {
         stopFlag = false;
         resetFlag = false;
         playActive = true;
+        midiClockTickAccumulator = 0;
+        syncOutPulseTickAccumulator = 0;
 
         resetIcon.flag = true;
         resetIcon.mode = false;
@@ -13235,12 +14055,25 @@ void Controller::record() {
 }
 
 void Controller::play() {
+    if (system.midi.txSync) {
+        static const uint8_t kMidiStart = 0xFA;
+        enqueueMidiTx(&kMidiStart, 1);
+    }
+
     if (system.sync.syncOutPlay)
         sendSyncCommand(SYNC_PLAY);
 
+    syncInPlayArmed = false;
+    syncInRecordArmed = false;
     stopFlag = false;
     resetFlag = false;
     playActive = true;
+    midiClockTickAccumulator = 0;
+    syncOutPulseTickAccumulator = 0;
+
+    if (system.syncOut == 2) {
+        HAL_GPIO_WritePin(SYNC_OUT_GATE_GPIO_Port, SYNC_OUT_GATE_Pin, GPIO_PIN_SET);
+    }
 
     resetIcon.flag = true;
     resetIcon.mode = false;
@@ -13255,6 +14088,11 @@ void Controller::play() {
 }
 
 void Controller::stop() {
+    if (system.midi.txSync) {
+        static const uint8_t kMidiStop = 0xFC;
+        enqueueMidiTx(&kMidiStop, 1);
+    }
+
     if ((system.sync.syncOutPlay) && (!stopFlag))
         sendSyncCommand(SYNC_STOP);
 
@@ -13273,15 +14111,24 @@ void Controller::stop() {
     }
 
     if (sD.activeBeatNum != -1) {
-        sD.releaseData.active = true;
         sD.releaseData.beatNum = sD.activeBeatNum;
+        __DMB();
+        sD.releaseData.active = true;
     }
 
     stopFlag = false;
     resetFlag = false;
+    syncInPlayArmed = false;
+    syncInRecordArmed = false;
 
     playActive = false;
     recordActive = false;
+    midiClockTickAccumulator = 0;
+    syncOutPulseTickAccumulator = 0;
+
+    if (system.syncOut == 2) {
+        HAL_GPIO_WritePin(SYNC_OUT_GATE_GPIO_Port, SYNC_OUT_GATE_Pin, GPIO_PIN_RESET);
+    }
 
     resetIcon.flag = true;
     resetIcon.mode = false;
@@ -13295,10 +14142,29 @@ void Controller::stop() {
     recordIcon.flag = true;
     recordIcon.mode = false;
 
+    applyMidiSyncStopRewind();
+
     stopPlayTimer();
 }
 
 void Controller::reset() {
+    if (system.midi.txSync) {
+        if (!resetFlag) {
+            static const uint8_t kMidiTrigResetSysEx[5] = {
+                kMidiSysExStart,
+                kMidiSysExManufacturerNonCommercial,
+                kMidiSysExTransportFamily,
+                kMidiSysExTrigReset,
+                kMidiSysExEnd};
+            enqueueMidiTx(kMidiTrigResetSysEx, 5);
+        }
+
+        static const uint8_t kMidiStop = 0xFC;
+        static const uint8_t kMidiSpp[3] = {0xF2, 0x00, 0x00};
+        enqueueMidiTx(&kMidiStop, 1);
+        enqueueMidiTx(kMidiSpp, 3);
+    }
+
     if ((system.sync.syncOutPlay) && (!resetFlag))
         sendSyncCommand(SYNC_RESET);
 
@@ -13318,15 +14184,24 @@ void Controller::reset() {
         }
 
         if (sD.activeBeatNum != -1) {
-            sD.releaseData.active = true;
             sD.releaseData.beatNum = sD.activeBeatNum;
+            __DMB();
+            sD.releaseData.active = true;
         }
 
         stopFlag = false;
         resetFlag = false;
+        syncInPlayArmed = false;
+        syncInRecordArmed = false;
 
         playActive = false;
         recordActive = false;
+        midiClockTickAccumulator = 0;
+        syncOutPulseTickAccumulator = 0;
+
+        if (system.syncOut == 2) {
+            HAL_GPIO_WritePin(SYNC_OUT_GATE_GPIO_Port, SYNC_OUT_GATE_Pin, GPIO_PIN_RESET);
+        }
 
         resetIcon.flag = true;
         resetIcon.mode = true;
@@ -13351,6 +14226,16 @@ void Controller::reset() {
 }
 
 void Controller::triggerStop() {
+    if (system.midi.txSync) {
+        static const uint8_t kMidiTrigStopSysEx[5] = {
+            kMidiSysExStart,
+            kMidiSysExManufacturerNonCommercial,
+            kMidiSysExTransportFamily,
+            kMidiSysExTrigStop,
+            kMidiSysExEnd};
+        enqueueMidiTx(kMidiTrigStopSysEx, 5);
+    }
+
     if (system.sync.syncOutPlay)
         sendSyncCommand(SYNC_TRIG_STOP);
 
@@ -13370,6 +14255,16 @@ void Controller::triggerStop() {
 }
 
 void Controller::triggerReset() {
+    if (system.midi.txSync) {
+        static const uint8_t kMidiTrigResetSysEx[5] = {
+            kMidiSysExStart,
+            kMidiSysExManufacturerNonCommercial,
+            kMidiSysExTransportFamily,
+            kMidiSysExTrigReset,
+            kMidiSysExEnd};
+        enqueueMidiTx(kMidiTrigResetSysEx, 5);
+    }
+
     if (system.sync.syncOutPlay)
         sendSyncCommand(SYNC_TRIG_RESET);
 
@@ -13391,7 +14286,7 @@ void Controller::triggerReset() {
 /* PlayData functions --------------------------------------------------------*/
 
 void Controller::startBeatPlayData(uint8_t beatNum_) {
-    BeatPlayData &bD = sD.beatPlayData[beatNum_];
+    BeatPlayData& bD = sD.beatPlayData[beatNum_];
 
     sD.active = true;
     sD.activeBeatNum = beatNum_;
@@ -13406,10 +14301,17 @@ void Controller::startBeatPlayData(uint8_t beatNum_) {
     /* OscPlayData */
 
     for (uint8_t i = 0; i < kOscLibrarySize; i++) {
-        Osc &osc_ = osc[i];
-        OscPlayData &oD = bD.oscPlayData[i];
-        ArpegPlayData &aD = bD.arpegPlayData[i];
-        if ((osc_.active) && (osc_.wavetableLoaded != kInitialOscWavetable)) {
+        Osc& osc_ = osc[i];
+        OscPlayData& oD = bD.oscPlayData[i];
+        ArpegPlayData& aD = bD.arpegPlayData[i];
+        // Snapshot the play sector once so address and normMultiplier come from the
+        // same wavetable sector (the main-loop swap can switch it between reads), and
+        // gate triggering on the sector being loaded and not mid-write by the load
+        // routine -- reading a sector while it's being overwritten caused a noise loop.
+        uint8_t playSector = osc_.playWavetableSector;
+        WavetableSector& wavetableSector = osc_.wavetableSector[playSector];
+        if ((osc_.active) && (osc_.wavetableLoaded != kInitialOscWavetable) && (!osc_.wavetableLoading) &&
+            (wavetableSector.size != 0) && (wavetableSector.size < kWavetableSize) && (!wavetableSector.writeMode)) {
             if ((key.arpeg) && (key.oscActive[i])) {
                 aD.active = true;
                 aD.trigger = false;
@@ -13430,14 +14332,13 @@ void Controller::startBeatPlayData(uint8_t beatNum_) {
                 aD.active = false;
             }
 
-            oD.active = true;
-            oD.address = kRamWavetableAddressLibrary[i][osc_.playWavetableSector];
+            oD.address = kRamWavetableAddressLibrary[i][playSector];
             oD.phaseShift = 512 * osc_.phase;
-            oD.normalize = osc_.normalize;
+            oD.normalize = (osc_.normalize && system.normalize);
             oD.xFlip = osc_.xFlip;
             oD.yFlip = osc_.yFlip;
 
-            oD.normMultiplier = osc_.wavetableSector[osc_.writeWavetableSector].normMultiplier;
+            oD.normMultiplier = wavetableSector.normMultiplier;
 
             oD.endFlag = false;
             oD.endReadMode = false;
@@ -13456,7 +14357,7 @@ void Controller::startBeatPlayData(uint8_t beatNum_) {
             }
             oD.freqCurrent = oD.freqBase;
 
-            oD.levelBase = kFloatDataLibrary[osc_.level / 5].pow2Multiplier;
+            oD.levelBase = kFloatDataLibrary[osc_.level / 5].stdMultiplier * kFloatDataLibrary[osc_.level / 5].pow2Multiplier;
             oD.levelRange = 1.0;
             oD.levelGround = 0.0;
             oD.levelCurrent = oD.levelBase;
@@ -13475,23 +14376,23 @@ void Controller::startBeatPlayData(uint8_t beatNum_) {
             oD.arrayInc = 2048.0f / oD.sampleSize;
 
             switch (osc_.phase) {
-            case 0:
-                break;
+                case 0:
+                    break;
 
-            case 1:
-                oD.sampleCounter += oD.sampleSize / 4;
-                oD.arrayCounter += oD.sampleCounter * oD.arrayInc;
-                break;
+                case 1:
+                    oD.sampleCounter += oD.sampleSize / 4;
+                    oD.arrayCounter += oD.sampleCounter * oD.arrayInc;
+                    break;
 
-            case 2:
-                oD.sampleCounter += (oD.sampleSize / 4) * 2;
-                oD.arrayCounter += oD.sampleCounter * oD.arrayInc;
-                break;
+                case 2:
+                    oD.sampleCounter += (oD.sampleSize / 4) * 2;
+                    oD.arrayCounter += oD.sampleCounter * oD.arrayInc;
+                    break;
 
-            case 3:
-                oD.sampleCounter += (oD.sampleSize / 4) * 3;
-                oD.arrayCounter += oD.sampleCounter * oD.arrayInc;
-                break;
+                case 3:
+                    oD.sampleCounter += (oD.sampleSize / 4) * 3;
+                    oD.arrayCounter += oD.sampleCounter * oD.arrayInc;
+                    break;
             }
 
             oD.lfoTrigger = false;
@@ -13505,8 +14406,8 @@ void Controller::startBeatPlayData(uint8_t beatNum_) {
             oD.waveLfoNum = -1;
 
             for (uint8_t j = 0; j < kOscLfoLibrarySize; j++) {
-                Lfo &lfo_ = osc[i].lfo[j];
-                OscLfoPlayData &lD = bD.oscLfoPlayData[i][j];
+                Lfo& lfo_ = osc[i].lfo[j];
+                OscLfoPlayData& lD = bD.oscLfoPlayData[i][j];
                 if (lfo_.active) {
                     lD.active = lfo_.active;
                     lD.type = lfo_.type;
@@ -13523,20 +14424,20 @@ void Controller::startBeatPlayData(uint8_t beatNum_) {
                     lD.arrayInc = 2048.0f / lD.sampleSize;
 
                     switch (lfo_.target) {
-                    case 0: // wave
-                        oD.waveLfoActive = true;
-                        oD.waveLfoNum = j;
-                        break;
+                        case 0:  // wave
+                            oD.waveLfoActive = true;
+                            oD.waveLfoNum = j;
+                            break;
 
-                    case 1: // level
-                        oD.levelLfoActive = true;
-                        oD.levelLfoNum = j;
-                        break;
+                        case 1:  // level
+                            oD.levelLfoActive = true;
+                            oD.levelLfoNum = j;
+                            break;
 
-                    case 2: // freq
-                        oD.freqLfoActive = true;
-                        oD.freqLfoNum = j;
-                        break;
+                        case 2:  // freq
+                            oD.freqLfoActive = true;
+                            oD.freqLfoNum = j;
+                            break;
                     }
                 } else {
                     lD.active = lfo_.active;
@@ -13556,7 +14457,7 @@ void Controller::startBeatPlayData(uint8_t beatNum_) {
             if (oD.levelLfoActive) {
                 float data = kLfoDataLibrary[bD.oscLfoPlayData[i][oD.levelLfoNum].type][0];
                 oD.levelRange = bD.oscLfoPlayData[i][oD.levelLfoNum].depth;
-                oD.levelGround = 1.0 - oD.levelRange;
+                oD.levelGround = (1.0 - oD.levelRange) * oD.levelBase;
 
                 oD.levelCurrent = oD.levelGround + (data * bD.oscLfoPlayData[i][oD.levelLfoNum].depth * oD.levelBase);
                 oD.levelInc = 0.0;
@@ -13567,6 +14468,11 @@ void Controller::startBeatPlayData(uint8_t beatNum_) {
                 oD.waveCurrent = oD.waveBase + (data * bD.oscLfoPlayData[i][oD.waveLfoNum].depth * (oD.waveRange));
                 oD.waveInc = 0.0;
             }
+
+            // Publish the fully-initialized voice last so the audio ISR never observes
+            // active == true alongside stale oscillator fields.
+            __DMB();
+            oD.active = true;
         } else {
             oD.active = false;
             oD.sdramReadActive = false;
@@ -13575,7 +14481,7 @@ void Controller::startBeatPlayData(uint8_t beatNum_) {
 
     /* EnvelopePlayData */
 
-    EnvelopePlayData &eD = bD.envelopePlayData;
+    EnvelopePlayData& eD = bD.envelopePlayData;
     eD.active = envelope.active;
     eD.active ? eD.type = envelope.type : eD.type = ENV_OFF;
     eD.active ? eD.curve = envelope.curve : eD.curve = 0x00;
@@ -13604,21 +14510,21 @@ void Controller::startBeatPlayData(uint8_t beatNum_) {
         eD.decay.sampleInc = 1;
         eD.decay.curve = eD.curve;
         switch (eD.type) {
-        case ENV_OFF:
-            break;
+            case ENV_OFF:
+                break;
 
-        case ENV_ADSR:
-            eD.decay.dataStart = 1.0;
-            eD.decay.dataEnd = kEnvelopeLevelDataLibrary[envelope.sustainLevel].level;
-            break;
+            case ENV_ADSR:
+                eD.decay.dataStart = 1.0;
+                eD.decay.dataEnd = kEnvelopeLevelDataLibrary[envelope.sustainLevel].level;
+                break;
 
-        case ENV_ASR:
-            break;
+            case ENV_ASR:
+                break;
 
-        case ENV_AD:
-            eD.decay.dataStart = 1.0;
-            eD.decay.dataEnd = 0.0;
-            break;
+            case ENV_AD:
+                eD.decay.dataStart = 1.0;
+                eD.decay.dataEnd = 0.0;
+                break;
         }
         eD.decay.dataInc = (float)(eD.decay.dataEnd - eD.decay.dataStart) / eD.decay.sampleSize;
         eD.decay.dataCurrent = eD.decay.dataStart;
@@ -13630,17 +14536,17 @@ void Controller::startBeatPlayData(uint8_t beatNum_) {
     if (kEnvelopeTypeDataLibrary[eD.type].stage[2]) {
         eD.sustain.active = true;
         switch (eD.type) {
-        case ENV_ADSR:
-            eD.sustain.dataCurrent = kEnvelopeLevelDataLibrary[envelope.sustainLevel].level;
-            break;
+            case ENV_ADSR:
+                eD.sustain.dataCurrent = kEnvelopeLevelDataLibrary[envelope.sustainLevel].level;
+                break;
 
-        case ENV_ASR:
-        case ENV_OFF:
-            eD.sustain.dataCurrent = 1.0;
-            break;
+            case ENV_ASR:
+            case ENV_OFF:
+                eD.sustain.dataCurrent = 1.0;
+                break;
 
-        case ENV_AD:
-            break;
+            case ENV_AD:
+                break;
         }
     } else {
         eD.sustain.active = false;
@@ -13656,21 +14562,21 @@ void Controller::startBeatPlayData(uint8_t beatNum_) {
         eD.release.sampleInc = 1;
         eD.release.curve = envelope.curve;
         switch (eD.type) {
-        case ENV_ADSR:
-            eD.release.dataStart = kEnvelopeLevelDataLibrary[envelope.sustainLevel].level;
-            eD.release.dataEnd = 0.0;
-            break;
+            case ENV_ADSR:
+                eD.release.dataStart = kEnvelopeLevelDataLibrary[envelope.sustainLevel].level;
+                eD.release.dataEnd = 0.0;
+                break;
 
-        case ENV_ASR:
-        case ENV_OFF:
-            eD.release.dataStart = 1.0;
-            eD.release.dataEnd = 0.0;
-            break;
+            case ENV_ASR:
+            case ENV_OFF:
+                eD.release.dataStart = 1.0;
+                eD.release.dataEnd = 0.0;
+                break;
 
-        case ENV_AD:
-            eD.release.dataStart = 1.0;
-            eD.release.dataEnd = 0.0;
-            break;
+            case ENV_AD:
+                eD.release.dataStart = 1.0;
+                eD.release.dataEnd = 0.0;
+                break;
         }
         eD.release.dataInc = (float)(eD.release.dataEnd - eD.release.dataStart) / eD.release.sampleSize;
         eD.release.dataCurrent = eD.release.dataStart;
@@ -13681,88 +14587,88 @@ void Controller::startBeatPlayData(uint8_t beatNum_) {
 }
 
 void Controller::releaseBeatPlayData(uint8_t beatNum_) {
-    BeatPlayData &bD = sD.beatPlayData[beatNum_];
-    EnvelopePlayData &eD = bD.envelopePlayData;
+    BeatPlayData& bD = sD.beatPlayData[beatNum_];
+    EnvelopePlayData& eD = bD.envelopePlayData;
 
     system.midi.txTriggerNoteOff[beatNum_] = true;
     system.midi.txDataNoteOff[beatNum_] = bD.noteData;
 
     if ((bD.active) && (eD.activeStage != ENV_END)) {
         switch (eD.activeStage) {
-        case ENV_NONE:
-            break;
-
-        case ENV_ATTACK:
-            switch (eD.type) {
-            case ENV_ADSR:
-            case ENV_ASR:
-            case ENV_OFF:
-                eD.activeStage = ENV_RELEASE;
-                eD.release.dataStart = eD.level;
-                eD.release.dataInc = (float)(eD.release.dataEnd - eD.release.dataStart) / eD.release.sampleSize;
-                eD.release.dataCurrent = eD.release.dataStart;
+            case ENV_NONE:
                 break;
 
-            case ENV_AD:
-                eD.activeStage = ENV_DECAY;
-                eD.decay.dataStart = eD.level;
-                eD.decay.dataInc = (float)(eD.decay.dataEnd - eD.decay.dataStart) / eD.decay.sampleSize;
-                eD.decay.dataCurrent = eD.decay.dataStart;
-                break;
-            }
-            break;
+            case ENV_ATTACK:
+                switch (eD.type) {
+                    case ENV_ADSR:
+                    case ENV_ASR:
+                    case ENV_OFF:
+                        eD.activeStage = ENV_RELEASE;
+                        eD.release.dataStart = eD.level;
+                        eD.release.dataInc = (float)(eD.release.dataEnd - eD.release.dataStart) / eD.release.sampleSize;
+                        eD.release.dataCurrent = eD.release.dataStart;
+                        break;
 
-        case ENV_DECAY:
-            switch (eD.type) {
-            case ENV_ADSR:
-                eD.activeStage = ENV_RELEASE;
-                eD.release.dataStart = eD.level;
-                eD.release.dataInc = (float)(eD.release.dataEnd - eD.release.dataStart) / eD.release.sampleSize;
-                eD.release.dataCurrent = eD.release.dataStart;
-                break;
-
-            case ENV_ASR:
-            case ENV_OFF:
-            case ENV_AD:
-                break;
-            }
-            break;
-
-        case ENV_SUSTAIN:
-            switch (eD.type) {
-            case ENV_ADSR:
-            case ENV_ASR:
-            case ENV_OFF:
-                eD.activeStage = ENV_RELEASE;
-                eD.release.dataStart = eD.level;
-                eD.release.dataInc = (float)(eD.release.dataEnd - eD.release.dataStart) / eD.release.sampleSize;
-                eD.release.dataCurrent = eD.release.dataStart;
+                    case ENV_AD:
+                        eD.activeStage = ENV_DECAY;
+                        eD.decay.dataStart = eD.level;
+                        eD.decay.dataInc = (float)(eD.decay.dataEnd - eD.decay.dataStart) / eD.decay.sampleSize;
+                        eD.decay.dataCurrent = eD.decay.dataStart;
+                        break;
+                }
                 break;
 
-            case ENV_AD:
-                break;
-            }
-            break;
+            case ENV_DECAY:
+                switch (eD.type) {
+                    case ENV_ADSR:
+                        eD.activeStage = ENV_RELEASE;
+                        eD.release.dataStart = eD.level;
+                        eD.release.dataInc = (float)(eD.release.dataEnd - eD.release.dataStart) / eD.release.sampleSize;
+                        eD.release.dataCurrent = eD.release.dataStart;
+                        break;
 
-        case ENV_RELEASE:
-            switch (eD.type) {
-            case ENV_ADSR:
-            case ENV_ASR:
-            case ENV_OFF:
-            case ENV_AD:
+                    case ENV_ASR:
+                    case ENV_OFF:
+                    case ENV_AD:
+                        break;
+                }
                 break;
-            }
-            break;
 
-        case ENV_END:
-            break;
+            case ENV_SUSTAIN:
+                switch (eD.type) {
+                    case ENV_ADSR:
+                    case ENV_ASR:
+                    case ENV_OFF:
+                        eD.activeStage = ENV_RELEASE;
+                        eD.release.dataStart = eD.level;
+                        eD.release.dataInc = (float)(eD.release.dataEnd - eD.release.dataStart) / eD.release.sampleSize;
+                        eD.release.dataCurrent = eD.release.dataStart;
+                        break;
+
+                    case ENV_AD:
+                        break;
+                }
+                break;
+
+            case ENV_RELEASE:
+                switch (eD.type) {
+                    case ENV_ADSR:
+                    case ENV_ASR:
+                    case ENV_OFF:
+                    case ENV_AD:
+                        break;
+                }
+                break;
+
+            case ENV_END:
+                break;
         }
     }
 }
 
 void Controller::endBeatPlayData(uint8_t beatNum_) {
-    BeatPlayData &bD = sD.beatPlayData[beatNum_];
-    EnvelopePlayData &eD = bD.envelopePlayData;
+    BeatPlayData& bD = sD.beatPlayData[beatNum_];
+    EnvelopePlayData& eD = bD.envelopePlayData;
 
     if ((bD.active) && (eD.activeStage != ENV_END)) {
         eD.activeStage = ENV_END;
@@ -13780,18 +14686,18 @@ void Controller::endBeatPlayData(uint8_t beatNum_) {
 }
 
 void Controller::calculateBeatPlayData(uint8_t beatNum_) {
-    BeatPlayData &bD = sD.beatPlayData[beatNum_];
-    EnvelopePlayData &eD = bD.envelopePlayData;
+    BeatPlayData& bD = sD.beatPlayData[beatNum_];
+    EnvelopePlayData& eD = bD.envelopePlayData;
 
     if (bD.active) {
         /* OscPlayData */
         for (uint8_t i = 0; i < kOscLibrarySize; i++) {
-            OscPlayData &oD = bD.oscPlayData[i];
-            ArpegPlayData &aD = bD.arpegPlayData[i];
+            OscPlayData& oD = bD.oscPlayData[i];
+            ArpegPlayData& aD = bD.arpegPlayData[i];
             if (oD.active) {
                 if (oD.lfoTrigger) {
                     for (uint8_t j = 0; j < kOscLfoLibrarySize; j++) {
-                        OscLfoPlayData &lD = bD.oscLfoPlayData[i][j];
+                        OscLfoPlayData& lD = bD.oscLfoPlayData[i][j];
                         if (lD.active) {
                             uint16_t arrayCounterLo = (uint16_t)lD.arrayCounter;
                             uint16_t arrayCounterHi = (uint16_t)lD.arrayCounter + 1;
@@ -13869,7 +14775,12 @@ void Controller::calculateBeatPlayData(uint8_t beatNum_) {
                 }
 
                 if (oD.endLoopMode) {
-                    oD.outputData = (oD.data[oD.sampleCounter]) * oD.levelCurrent;
+                    float gain = oD.levelCurrent;
+                    if (oD.normalize)
+                        gain *= oD.normMultiplier;
+                    if (oD.xFlip)
+                        gain *= -1.0f;
+                    oD.outputData = oD.data[oD.sampleCounter] * gain;
                     oD.sampleCounter += oD.sampleInc;
                     if (oD.sampleCounter == oD.sampleSize) {
                         oD.sampleCounter = 0;
@@ -13889,20 +14800,21 @@ void Controller::calculateBeatPlayData(uint8_t beatNum_) {
                             arrayCounterHi = 0;
                         float arrayCounterDiff = arrayCounter - arrayCounterLo;
 
-                        int16_t *dataLoLo = (int16_t *)(oD.address + ((waveCounterLo * 4096) + (arrayCounterLo * 2)));
-                        int16_t *dataLoHi = (int16_t *)(oD.address + ((waveCounterLo * 4096) + (arrayCounterHi * 2)));
+                        int16_t* dataLoLo = (int16_t*)(oD.address + ((waveCounterLo * 4096) + (arrayCounterLo * 2)));
+                        int16_t* dataLoHi = (int16_t*)(oD.address + ((waveCounterLo * 4096) + (arrayCounterHi * 2)));
                         int16_t dataLo = *dataLoLo + ((*dataLoHi - *dataLoLo) * arrayCounterDiff);
 
-                        int16_t *dataHiLo = (int16_t *)(oD.address + ((waveCounterHi * 4096) + (arrayCounterLo * 2)));
-                        int16_t *dataHiHi = (int16_t *)(oD.address + ((waveCounterHi * 4096) + (arrayCounterHi * 2)));
+                        int16_t* dataHiLo = (int16_t*)(oD.address + ((waveCounterHi * 4096) + (arrayCounterLo * 2)));
+                        int16_t* dataHiHi = (int16_t*)(oD.address + ((waveCounterHi * 4096) + (arrayCounterHi * 2)));
                         int16_t dataHi = *dataHiLo + ((*dataHiHi - *dataHiLo) * arrayCounterDiff);
 
                         oD.data[oD.sampleCounter] = dataLo + ((dataHi - dataLo) * waveCounterDiff);
+                        float gain = oD.levelCurrent;
                         if (oD.normalize)
-                            oD.data[oD.sampleCounter] *= oD.normMultiplier;
+                            gain *= oD.normMultiplier;
                         if (oD.xFlip)
-                            oD.data[oD.sampleCounter] *= -1;
-                        oD.outputData = (oD.data[oD.sampleCounter]) * oD.levelCurrent;
+                            gain *= -1.0f;
+                        oD.outputData = oD.data[oD.sampleCounter] * gain;
                     } else {
                         float arrayCounter;
                         (oD.yFlip) ? arrayCounter = 2047 - oD.arrayCounter : arrayCounter = oD.arrayCounter;
@@ -13915,15 +14827,16 @@ void Controller::calculateBeatPlayData(uint8_t beatNum_) {
 
                         uint16_t waveCounter = (uint16_t)oD.waveCurrent;
 
-                        int16_t *dataLo = (int16_t *)(oD.address + ((waveCounter * 4096) + (arrayCounterLo * 2)));
-                        int16_t *dataHi = (int16_t *)(oD.address + ((waveCounter * 4096) + (arrayCounterHi * 2)));
+                        int16_t* dataLo = (int16_t*)(oD.address + ((waveCounter * 4096) + (arrayCounterLo * 2)));
+                        int16_t* dataHi = (int16_t*)(oD.address + ((waveCounter * 4096) + (arrayCounterHi * 2)));
                         oD.data[oD.sampleCounter] =
                             *dataLo + ((*dataHi - *dataLo) * arrayCounterDiff);
+                        float gain = oD.levelCurrent;
                         if (oD.normalize)
-                            oD.data[oD.sampleCounter] *= oD.normMultiplier;
+                            gain *= oD.normMultiplier;
                         if (oD.xFlip)
-                            oD.data[oD.sampleCounter] *= -1;
-                        oD.outputData = (oD.data[oD.sampleCounter]) * oD.levelCurrent;
+                            gain *= -1.0f;
+                        oD.outputData = oD.data[oD.sampleCounter] * gain;
                     }
 
                     if (oD.levelSmooth)
@@ -13955,7 +14868,7 @@ void Controller::calculateBeatPlayData(uint8_t beatNum_) {
                     }
 
                     for (uint8_t j = 0; j < kOscLfoLibrarySize; j++) {
-                        OscLfoPlayData &lD = bD.oscLfoPlayData[i][j];
+                        OscLfoPlayData& lD = bD.oscLfoPlayData[i][j];
                         if (lD.active) {
                             lD.sampleCounter += 1;
                             if (lD.sampleCounter == lD.sampleSize) {
@@ -13970,141 +14883,789 @@ void Controller::calculateBeatPlayData(uint8_t beatNum_) {
                     }
                 }
             } else {
-                oD.outputData = 0;
+                oD.outputData = 0.0f;
             }
         }
 
         /* EnvelopePlayData */
 
-        eD.inputData = ((bD.oscPlayData[0].outputData + bD.oscPlayData[1].outputData) << 8);
+        eD.inputData = (bD.oscPlayData[0].outputData + bD.oscPlayData[1].outputData) / 32768.0f;
 
         switch (eD.activeStage) {
-        case ENV_NONE:
-            eD.level = 0.0;
-            break;
+            case ENV_NONE:
+                eD.level = 0.0;
+                break;
 
-        case ENV_ATTACK:
-            eD.attack.sampleCounter += eD.attack.sampleInc = 1;
-            eD.attack.dataCurrent += eD.attack.dataInc;
-            eD.level = eD.attack.dataCurrent;
-            if (eD.attack.sampleCounter == eD.attack.sampleSize) {
-                switch (eD.type) {
-                case ENV_AD:
-                    eD.activeStage = ENV_DECAY;
-                    break;
+            case ENV_ATTACK:
+                eD.attack.sampleCounter += eD.attack.sampleInc = 1;
+                eD.attack.dataCurrent += eD.attack.dataInc;
+                eD.level = eD.attack.dataCurrent;
+                if (eD.attack.sampleCounter == eD.attack.sampleSize) {
+                    switch (eD.type) {
+                        case ENV_AD:
+                            eD.activeStage = ENV_DECAY;
+                            break;
 
-                case ENV_ASR:
-                case ENV_OFF:
-                    eD.activeStage = ENV_SUSTAIN;
-                    break;
+                        case ENV_ASR:
+                        case ENV_OFF:
+                            eD.activeStage = ENV_SUSTAIN;
+                            break;
 
-                case ENV_ADSR:
-                    eD.activeStage = ENV_DECAY;
-                    break;
+                        case ENV_ADSR:
+                            eD.activeStage = ENV_DECAY;
+                            break;
+                    }
                 }
-            }
-            break;
+                break;
 
-        case ENV_DECAY:
-            eD.decay.sampleCounter += eD.decay.sampleInc = 1;
-            eD.decay.dataCurrent += eD.decay.dataInc;
-            eD.level = eD.decay.dataCurrent;
-            if (eD.decay.sampleCounter == eD.decay.sampleSize) {
+            case ENV_DECAY:
+                eD.decay.sampleCounter += eD.decay.sampleInc = 1;
+                eD.decay.dataCurrent += eD.decay.dataInc;
+                eD.level = eD.decay.dataCurrent;
+                if (eD.decay.sampleCounter == eD.decay.sampleSize) {
+                    switch (eD.type) {
+                        case ENV_AD:
+                            bD.active = false;
+                            bD.sdramReadActive = false;
+                            eD.activeStage = ENV_OFF;
+                            bD.oscPlayData[0].active = false;
+                            bD.oscPlayData[1].active = false;
+                            sD.active = false;
+                            break;
+
+                        case ENV_ASR:
+                        case ENV_OFF:
+                            break;
+
+                        case ENV_ADSR:
+                            eD.activeStage = ENV_SUSTAIN;
+                            break;
+                    }
+                }
+                break;
+
+            case ENV_SUSTAIN:
+                eD.level = eD.sustain.dataCurrent;
                 switch (eD.type) {
-                case ENV_AD:
+                    case ENV_AD:
+                        break;
+
+                    case ENV_ASR:
+                    case ENV_OFF:
+                        break;
+
+                    case ENV_ADSR:
+                        break;
+                }
+                break;
+
+            case ENV_RELEASE:
+                eD.release.sampleCounter += eD.release.sampleInc;
+                eD.release.dataCurrent += eD.release.dataInc;
+                eD.level = eD.release.dataCurrent;
+                if (eD.release.sampleCounter == eD.release.sampleSize) {
                     bD.active = false;
                     bD.sdramReadActive = false;
                     eD.activeStage = ENV_OFF;
                     bD.oscPlayData[0].active = false;
                     bD.oscPlayData[1].active = false;
                     sD.active = false;
-                    break;
-
-                case ENV_ASR:
-                case ENV_OFF:
-                    break;
-
-                case ENV_ADSR:
-                    eD.activeStage = ENV_SUSTAIN;
-                    break;
                 }
-            }
-            break;
-
-        case ENV_SUSTAIN:
-            eD.level = eD.sustain.dataCurrent;
-            switch (eD.type) {
-            case ENV_AD:
                 break;
 
-            case ENV_ASR:
-            case ENV_OFF:
+            case ENV_END:
+                eD.end.sampleCounter += eD.end.sampleInc;
+                eD.end.dataCurrent += eD.end.dataInc;
+                eD.level = eD.end.dataCurrent;
+                if (eD.end.sampleCounter == eD.end.sampleSize) {
+                    bD.active = false;
+                    bD.sdramReadActive = false;
+                    eD.activeStage = ENV_OFF;
+                    bD.oscPlayData[0].active = false;
+                    bD.oscPlayData[1].active = false;
+                    sD.active = false;
+                }
                 break;
-
-            case ENV_ADSR:
-                break;
-            }
-            break;
-
-        case ENV_RELEASE:
-            eD.release.sampleCounter += eD.release.sampleInc;
-            eD.release.dataCurrent += eD.release.dataInc;
-            eD.level = eD.release.dataCurrent;
-            if (eD.release.sampleCounter == eD.release.sampleSize) {
-                bD.active = false;
-                bD.sdramReadActive = false;
-                eD.activeStage = ENV_OFF;
-                bD.oscPlayData[0].active = false;
-                bD.oscPlayData[1].active = false;
-                sD.active = false;
-            }
-            break;
-
-        case ENV_END:
-            eD.end.sampleCounter += eD.end.sampleInc;
-            eD.end.dataCurrent += eD.end.dataInc;
-            eD.level = eD.end.dataCurrent;
-            if (eD.end.sampleCounter == eD.end.sampleSize) {
-                bD.active = false;
-                bD.sdramReadActive = false;
-                eD.activeStage = ENV_OFF;
-                bD.oscPlayData[0].active = false;
-                bD.oscPlayData[1].active = false;
-                sD.active = false;
-            }
-            break;
         }
 
         switch (eD.curve) {
-        case 0: // log
-            eD.outputData = eD.inputData * eD.level;
-            break;
+            case 0:  // log
+                eD.outputData = eD.inputData * eD.level;
+                break;
 
-        case 1: // lin
-            eD.outputData = eD.inputData * pow(eD.level, 2);
-            break;
+            case 1:  // lin
+                eD.outputData = eD.inputData * (eD.level * eD.level);
+                break;
 
-        case 2: // exp
-            eD.outputData = eD.inputData * pow(eD.level, 3);
-            break;
+            case 2:  // exp
+                eD.outputData = eD.inputData * (eD.level * eD.level * eD.level);
+                break;
 
-        default:
-            eD.outputData = eD.inputData * eD.level;
-            break;
+            default:
+                eD.outputData = eD.inputData * eD.level;
+                break;
         }
 
         bD.data = eD.outputData;
     } else {
-        bD.data = 0;
+        bD.data = 0.0f;
     }
 }
 
-bool Controller::checkSdramReadActive() {
-    if ((!sD.beatPlayData[0].sdramReadActive) && (!sD.beatPlayData[1].sdramReadActive)) {
+bool Controller::checkSdramReadActive(uint8_t beatNum_) {
+    if (!sD.beatPlayData[beatNum_].sdramReadActive) {
         return false;
     } else {
         return true;
     }
+}
+
+/* Audio functions -----------------------------------------------------------*/
+
+void Controller::processAudioBlock(uint32_t* outputBuffer_) {
+    processAudioMetronome();
+    processAudioSong();
+    processAudioEq();
+    processAudioFilter();
+    processAudioEffect();
+    processAudioReverb();
+    processAudioSend(outputBuffer_);
+}
+
+void Controller::processAudioMetronome() {
+    memset(audioMetronomeBlock, 0x00, sizeof(audioMetronomeBlock));
+    const float kInvInt16 = 1.0f / 32768.0f;
+
+    if (!mD.active) {
+        return;
+    }
+
+    uint32_t remainingSampleCount = (mD.counterMax - mD.counter) + 1;
+    uint16_t readCount = (remainingSampleCount > I2S_BLOCK_SIZE) ? I2S_BLOCK_SIZE : remainingSampleCount;
+
+    if (readCount == 0) {
+        return;
+    }
+
+    for (uint16_t i = 0; i < readCount; i++) {
+        int16_t sample16 = kMetronomeDataLibrary[metronome.sample][mD.barMeasure][mD.counter + i];
+        audioMetronomeBlock[i] = ((float)sample16 * kInvInt16) * mD.volumeMultiplier;
+    }
+
+    if (readCount == remainingSampleCount) {
+        mD.counter = 0;
+        mD.active = false;
+    } else {
+        mD.counter += readCount;
+    }
+}
+
+void Controller::processAudioSong() {
+    for (uint8_t beatIndex = 0; beatIndex < 2; beatIndex++) {
+        BeatPlayData& bD = sD.beatPlayData[beatIndex];
+        for (uint8_t oscIndex = 0; oscIndex < kOscLibrarySize; oscIndex++) {
+            OscPlayData& oD = bD.oscPlayData[oscIndex];
+            if (!oD.sdramReadActive)
+                continue;
+            Osc& osc_ = osc[oscIndex];
+            uint8_t writeSector = osc_.writeWavetableSector;
+            if ((osc_.wavetableSector[writeSector].writeMode) &&
+                (oD.address == kRamWavetableAddressLibrary[oscIndex][writeSector])) {
+                oD.active = false;
+                oD.sdramReadActive = false;
+            }
+        }
+    }
+
+    memset(audioSongBlock, 0x00, sizeof(audioSongBlock));
+
+    // start data
+    if ((sD.startData.active) && (checkSdramReadActive(sD.startData.beatNum) == false)) {
+        startBeatPlayData(sD.startData.beatNum);
+        sD.startData.active = false;
+    }
+    // release data
+    else if (sD.releaseData.active) {
+        releaseBeatPlayData(sD.releaseData.beatNum);
+        sD.releaseData.active = false;
+    }
+    // end data
+    else if (sD.endData.active) {
+        endBeatPlayData(sD.endData.beatNum);
+        sD.endData.active = false;
+    }
+
+    for (uint16_t sampleIndex = 0; sampleIndex < I2S_BLOCK_SIZE; sampleIndex++) {
+        float sample = 0.0f;
+        for (uint8_t i = 0; i < 2; i++) {
+            calculateBeatPlayData(i);
+            sample += sD.beatPlayData[i].data;
+        }
+        audioSongBlock[sampleIndex] = sample * system.volumeFloat;
+    }
+
+    audioSong = audioSongBlock[0];
+}
+
+void Controller::processAudioEq() {
+    if ((!eq.active) && (!eq.genTransition.active)) {
+        memcpy(audioEqBlock, audioSongBlock, sizeof(audioEqBlock));
+        audioEq = audioEqBlock[0];
+        return;
+    }
+
+    bool activeLS = (eq.gainLowShelf != kEqGainZero);
+    bool activeHS = (eq.gainHighShelf != kEqGainZero);
+    bool activeP0 = (eq.gainPeak[0] != kEqGainZero);
+    bool activeP1 = (eq.gainPeak[1] != kEqGainZero);
+    bool activeP2 = (eq.gainPeak[2] != kEqGainZero);
+    bool activeP3 = (eq.gainPeak[3] != kEqGainZero);
+
+    for (uint16_t i = 0; i < I2S_BLOCK_SIZE; i++) {
+        float input = audioSongBlock[i];
+        float output = input;
+
+        output = processEqBiquad(eq.filterLowShelf, output, activeLS);
+        output = processEqBiquad(eq.filterHighShelf, output, activeHS);
+        output = processEqBiquad(eq.filterPeak[0], output, activeP0);
+        output = processEqBiquad(eq.filterPeak[1], output, activeP1);
+        output = processEqBiquad(eq.filterPeak[2], output, activeP2);
+        output = processEqBiquad(eq.filterPeak[3], output, activeP3);
+
+        if (eq.genTransition.active) {
+            audioEqBlock[i] = (eq.genTransition.activeWet * output) + (eq.genTransition.activeDry * input);
+        } else {
+            audioEqBlock[i] = output;
+        }
+    }
+}
+
+void Controller::processAudioFilter() {
+    for (uint16_t i = 0; i < I2S_BLOCK_SIZE; i++) {
+        float outputA = processAudioFilterHelper(0, audioEqBlock[i]);
+        float outputB = processAudioFilterHelper(1, outputA);
+        audioFilterBlock[i] = outputB;
+    }
+}
+
+void Controller::processAudioEffect() {
+    for (uint16_t i = 0; i < I2S_BLOCK_SIZE; i++) {
+        float outputA = processAudioEffectHelper(0, audioFilterBlock[i]);
+        float outputB = processAudioEffectHelper(1, outputA);
+        audioEffectBlock[i] = outputB;
+    }
+}
+
+void Controller::processAudioReverb() {
+    for (uint16_t i = 0; i < I2S_BLOCK_SIZE; i++) {
+        float input = audioEffectBlock[i];
+        float output_L;
+        float output_R;
+
+        if ((reverb.active) || (reverb.genTransition.active)) {
+            float inputSample = input + REVERB_ANTI_DENORMAL;
+
+            // preDelay
+
+            reverb.preDelayBuffer[reverb.preDelay_recordInterval] = inputSample;
+            float reverbInput = reverb.preDelayBuffer[reverb.preDelay_playInterval];
+
+            if (++reverb.preDelay_playInterval >= reverb.kPreDelayBufferSize)
+                reverb.preDelay_playInterval = 0;
+            if (++reverb.preDelay_recordInterval >= reverb.kPreDelayBufferSize)
+                reverb.preDelay_recordInterval = 0;
+
+            // comb filter
+
+            const float kCombInputScale = 0.015f;
+            float inputData = reverbInput * kCombInputScale;
+
+            float cFB = reverb.combFeedback;
+            float cD1 = reverb.combDecay1;
+            float cD2 = reverb.combDecay2;
+            float apFB = reverb.apassFeedback;
+
+            reverb.comb1Out = processReverbComb(reverb.comb1Buffer, reverb.comb1Index, reverb.comb1Size, reverb.comb1Filter, inputData, cFB, cD1, cD2);
+            reverb.comb2Out = processReverbComb(reverb.comb2Buffer, reverb.comb2Index, reverb.comb2Size, reverb.comb2Filter, inputData, cFB, cD1, cD2);
+            reverb.comb3Out = processReverbComb(reverb.comb3Buffer, reverb.comb3Index, reverb.comb3Size, reverb.comb3Filter, inputData, cFB, cD1, cD2);
+            reverb.comb4Out = processReverbComb(reverb.comb4Buffer, reverb.comb4Index, reverb.comb4Size, reverb.comb4Filter, inputData, cFB, cD1, cD2);
+            reverb.comb5Out = processReverbComb(reverb.comb5Buffer, reverb.comb5Index, reverb.comb5Size, reverb.comb5Filter, inputData, cFB, cD1, cD2);
+            reverb.comb6Out = processReverbComb(reverb.comb6Buffer, reverb.comb6Index, reverb.comb6Size, reverb.comb6Filter, inputData, cFB, cD1, cD2);
+            reverb.comb7Out = processReverbComb(reverb.comb7Buffer, reverb.comb7Index, reverb.comb7Size, reverb.comb7Filter, inputData, cFB, cD1, cD2);
+            reverb.comb8Out = processReverbComb(reverb.comb8Buffer, reverb.comb8Index, reverb.comb8Size, reverb.comb8Filter, inputData, cFB, cD1, cD2);
+
+            float combOutput = reverb.comb1Out + reverb.comb2Out + reverb.comb3Out + reverb.comb4Out + reverb.comb5Out + reverb.comb6Out + reverb.comb7Out + reverb.comb8Out;
+
+            // allpass filter
+
+            reverb.apass1Out = processReverbAllpass(reverb.apass1Buffer, reverb.apass1Index, reverb.apass1Size, combOutput, apFB);
+            reverb.apass2Out = processReverbAllpass(reverb.apass2Buffer, reverb.apass2Index, reverb.apass2Size, reverb.apass1Out, apFB);
+            reverb.apass3Out = processReverbAllpass(reverb.apass3Buffer, reverb.apass3Index, reverb.apass3Size, reverb.apass2Out, apFB);
+            reverb.apass4Out = processReverbAllpass(reverb.apass4Buffer, reverb.apass4Index, reverb.apass4Size, reverb.apass3Out, apFB);
+
+            float data = (reverb.apass4Out * reverb.wetFloat) + (inputSample * reverb.dryFloat);
+
+            float audioReverb;
+
+            if (reverb.genTransition.active) {
+                audioReverb = (data * reverb.genTransition.activeWet) + (inputSample * reverb.genTransition.activeDry);
+            } else {
+                audioReverb = data;
+            }
+
+            // surround
+
+            if ((reverb.genTransition.active) && ((reverb.genTransition.mode == REV_MODE_ACTIVE) || (reverb.genTransition.mode == REV_MODE_SURROUND))) {
+                reverb.surroundBuffer[reverb.surround_recordInterval] = audioReverb;
+                output_L = audioReverb;
+                output_R = (reverb.surroundBuffer[reverb.surround_playInterval] * reverb.genTransition.activeWet) + (audioReverb * reverb.genTransition.activeDry);
+            } else {
+                reverb.surroundBuffer[reverb.surround_recordInterval] = audioReverb;
+                output_L = audioReverb;
+                output_R = reverb.surroundBuffer[reverb.surround_playInterval];
+            }
+
+            if (++reverb.surround_playInterval >= reverb.kSurroundBufferSize)
+                reverb.surround_playInterval = 0;
+            if (++reverb.surround_recordInterval >= reverb.kSurroundBufferSize)
+                reverb.surround_recordInterval = 0;
+        } else {
+            // surround
+            output_L = input;
+            output_R = input;
+        }
+
+        audioReverbLBlock[i] = output_L;
+        audioReverbRBlock[i] = output_R;
+    }
+
+    audioReverb_L = audioReverbLBlock[0];
+    audioReverb_R = audioReverbRBlock[0];
+}
+
+void Controller::processAudioSend(uint32_t* outputBuffer_) {
+    const float kInt32MaxFloat = 2147483647.0f;
+
+    for (uint16_t i = 0; i < I2S_BLOCK_SIZE; i++) {
+        float outL = (audioReverbLBlock[i] + audioMetronomeBlock[i]) * system.volumeLeftFloat;
+        float outR = (audioReverbRBlock[i] + audioMetronomeBlock[i]) * system.volumeRightFloat;
+
+        if (lpf[0].active) outL = processAudioLpfHelper(0, outL);
+        if (lpf[1].active) outR = processAudioLpfHelper(1, outR);
+
+        if ((fabsf(outL) > 0.95f) || (fabsf(outR) > 0.95f)) {
+            limitAlertShowFlag = true;
+        }
+
+        outL = softKneeClip(outL);
+        outR = softKneeClip(outR);
+
+        // Never let a NaN/Inf reach the DAC: converting it to int32 yields garbage that
+        // would stream continuously. Force silence for that sample instead.
+        if (!std::isfinite(outL)) outL = 0.0f;
+        if (!std::isfinite(outR)) outR = 0.0f;
+
+        audioSend_L = outL;
+        audioSend_R = outR;
+
+        int32_t sampleL = (int32_t)(audioSend_L * kInt32MaxFloat);
+        int32_t sampleR = (int32_t)(audioSend_R * kInt32MaxFloat);
+
+        outputBuffer_[i * 2] = (uint32_t)sampleL;
+        outputBuffer_[(i * 2) + 1] = (uint32_t)sampleR;
+    }
+}
+
+float Controller::processAudioFilterHelper(uint8_t filterNum_, float audio_) {
+    Filter& filter_ = filter[filterNum_];
+    float input = audio_;
+    float output;
+
+    if ((filter_.active) || (filter_.genTransition.active)) {
+        float filteredSample = (filter_.b0 * input) + (filter_.b1 * filter_.x1) + (filter_.b2 * filter_.x2) - (filter_.a1 * filter_.y1) - (filter_.a2 * filter_.y2) + FILTER_ANTI_DENORMAL;
+
+        filter_.x2 = filter_.x1;
+        filter_.x1 = input;
+        filter_.y2 = filter_.y1;
+        filter_.y1 = filteredSample;
+
+        float data = (filteredSample * filter_.wetFloat) + (input * filter_.dryFloat);
+
+        if (filter_.slope == 0)
+            data = (data * 0.5f) + (input * 0.5f);
+
+        if (filter_.genTransition.active) {
+            output = (data * filter_.genTransition.activeWet) + (input * filter_.genTransition.activeDry);
+        } else {
+            output = data;
+        }
+    } else {
+        output = input;
+    }
+
+    return output;
+}
+
+float Controller::processAudioEffectHelper(uint8_t effectNum_, float audio_) {
+    Effect& effect_ = effect[effectNum_];
+    float input = audio_;
+    if ((!effect_.active) && (!effect_.genTransition.active)) {
+        return input;
+    }
+
+    uint8_t type = effect_.genTransition.active ? effect_.genTransition.activeType : effect_.type;
+    float output = input;
+
+    switch (type) {
+        case EF_DELAY: {
+            Delay& delay_ = effect_.delay;
+            float* delayBuffer = (float*)effect_.delayAddress;
+
+            float delayedData = delayBuffer[delay_.playInterval];
+            float feedbackTarget = (input * delay_.level) + (delayedData * delay_.feedback);
+            float filteredFeedback = delay_.lastFeedbackSample + (delay_.dampingAlpha * (feedbackTarget - delay_.lastFeedbackSample));
+            delay_.lastFeedbackSample = filteredFeedback;
+
+            delayBuffer[delay_.recordInterval] = filteredFeedback;
+
+            float playData = input + delayedData;
+            float data = (playData * effect_.wetFloat) + (input * effect_.dryFloat);
+            output = effect_.genTransition.active ? (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry) : data;
+
+            if (++delay_.playInterval > (kDelaySize - 1))
+                delay_.playInterval = 0;
+            if (++delay_.recordInterval > (kDelaySize - 1))
+                delay_.recordInterval = 0;
+            break;
+        }
+
+        case EF_CHORUS: {
+            Chorus& chorus_ = effect_.chorus;
+            float* chorusBuffer = (float*)effect_.chorusAddress;
+
+            float dataChorusDelay[2] = {0.0f, 0.0f};
+            for (uint8_t i = 0; i < 2; i++) {
+                ChorusDelay& cD = chorus_.chorusDelay[i];
+
+                cD.chorusInterval = cD.playInterval + cD.shiftInterval;
+                if (cD.chorusInterval < 0) {
+                    cD.chorusInterval += kChorusBufferSize;
+                } else if (cD.chorusInterval > kChorusBufferSize) {
+                    cD.chorusInterval -= kChorusBufferSize;
+                }
+
+                uint16_t interval_Int0 = (uint16_t)cD.chorusInterval;
+                uint16_t interval_Int1 = interval_Int0 + 1;
+                float remainder = cD.chorusInterval - interval_Int0;
+
+                if (interval_Int1 == kChorusBufferSize)
+                    interval_Int1 = 0;
+
+                float data0 = chorusBuffer[interval_Int0];
+                float data1 = chorusBuffer[interval_Int1];
+                dataChorusDelay[i] = data0 + ((data1 - data0) * remainder);
+
+                cD.shiftInterval += cD.shiftInc;
+                if (cD.shiftInterval <= cD.shiftMin) {
+                    cD.shiftInc *= -1;
+                    cD.shiftInterval = cD.shiftMin;
+                }
+                if (cD.shiftInterval >= cD.shiftMax) {
+                    cD.shiftInc *= -1;
+                    cD.shiftInterval = cD.shiftMax;
+                }
+            }
+
+            float dataChorus = ((dataChorusDelay[0] * chorus_.chorusDelay[0].mix) + (dataChorusDelay[1] * chorus_.chorusDelay[1].mix)) * chorus_.balance;
+
+            if (effect_.genTransition.active) {
+                chorusBuffer[chorus_.recordInterval] = (input + (dataChorus * chorus_.feedback)) * effect_.genTransition.activeRecordWet;
+            } else {
+                chorusBuffer[chorus_.recordInterval] = input + (dataChorus * chorus_.feedback);
+            }
+
+            float data = (dataChorus * effect_.wetFloat) + (chorusBuffer[chorus_.recordInterval] * effect_.dryFloat);
+            output = effect_.genTransition.active ? (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry) : data;
+
+            if ((++chorus_.recordInterval) > (kChorusBufferSize - 1))
+                chorus_.recordInterval = 0;
+            if ((++chorus_.chorusDelay[0].playInterval) > (kChorusBufferSize - 1))
+                chorus_.chorusDelay[0].playInterval = 0;
+            if ((++chorus_.chorusDelay[1].playInterval) > (kChorusBufferSize - 1))
+                chorus_.chorusDelay[1].playInterval = 0;
+            break;
+        }
+
+        case EF_FLANGER: {
+            Flanger& flanger_ = effect_.flanger;
+
+            flanger_.flangerInterval = flanger_.playInterval + flanger_.shiftInterval;
+            if (flanger_.flangerInterval < 0) {
+                flanger_.flangerInterval += kFlangerBufferSize;
+            } else if (flanger_.flangerInterval > kFlangerBufferSize) {
+                flanger_.flangerInterval -= kFlangerBufferSize;
+            }
+
+            uint16_t interval_Int0 = (uint16_t)flanger_.flangerInterval;
+            uint16_t interval_Int1 = interval_Int0 + 1;
+            float remainder = flanger_.flangerInterval - interval_Int0;
+
+            if (interval_Int1 == kFlangerBufferSize)
+                interval_Int1 = 0;
+
+            float data0 = effect_.flangerBuffer[interval_Int0];
+            float data1 = effect_.flangerBuffer[interval_Int1];
+            float dataFlanger = data0 + ((data1 - data0) * remainder);
+
+            float feedbackSignal = dataFlanger * flanger_.feedback * flanger_.feedbackBlend;
+            if (effect_.genTransition.active) {
+                effect_.flangerBuffer[flanger_.recordInterval] = (input + feedbackSignal) * effect_.genTransition.activeRecordWet;
+            } else {
+                effect_.flangerBuffer[flanger_.recordInterval] = input + feedbackSignal;
+            }
+
+            float data = (dataFlanger * effect_.wetFloat) + (effect_.flangerBuffer[flanger_.recordInterval] * effect_.dryFloat);
+            output = effect_.genTransition.active ? (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry) : data;
+
+            flanger_.shiftInterval += flanger_.shiftInc;
+            if (flanger_.shiftInterval <= flanger_.shiftMin) {
+                flanger_.shiftInc *= -1;
+                flanger_.shiftInterval = flanger_.shiftMin;
+            }
+            if (flanger_.shiftInterval >= flanger_.shiftMax) {
+                flanger_.shiftInc *= -1;
+                flanger_.shiftInterval = flanger_.shiftMax;
+            }
+
+            if ((++flanger_.recordInterval) > (kFlangerBufferSize - 1))
+                flanger_.recordInterval = 0;
+            if ((++flanger_.playInterval) > (kFlangerBufferSize - 1))
+                flanger_.playInterval = 0;
+            break;
+        }
+
+        case EF_PHASER: {
+            Phaser& phaser_ = effect_.phaser;
+
+            phaser_.lfo = (phaser_.depthFreq * sinf(2.0f * (float)M_PI * phaser_.dataY)) + phaser_.centerFreq;
+
+            phaser_.dataX += phaser_.Ts;
+            phaser_.dataY = phaser_.rate * phaser_.dataX;
+            if (phaser_.dataY >= 1.0f)
+                phaser_.dataX = 0;
+
+            float w0 = (2.0f * (float)M_PI * phaser_.lfo) / kAudioSampleRate;
+            float cosw0 = cosf(w0);
+            float sinw0 = sinf(w0);
+            float alpha = sinw0 / (2.0f * phaser_.Q);
+
+            float b0 = 1.0f - alpha;
+            float b1 = -2.0f * cosw0;
+            float b2 = 1.0f + alpha;
+
+            float a0 = 1.0f + alpha;
+            float a1 = -2.0f * cosw0;
+            float a2 = 1.0f - alpha;
+
+            float dataPhaser = ((b0 / a0) * input) + ((b1 / a0) * phaser_.ff[0]) + ((b2 / a0) * phaser_.ff[1]) - ((a1 / a0) * phaser_.fb[0]) - ((a2 / a0) * phaser_.fb[1]);
+            dataPhaser *= phaser_.wetStageGain;
+
+            float data = (dataPhaser * effect_.wetFloat) + (input * effect_.dryFloat);
+            output = effect_.genTransition.active ? (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry) : data;
+
+            phaser_.ff[1] = phaser_.ff[0];
+            phaser_.ff[0] = input;
+            phaser_.fb[1] = phaser_.fb[0];
+            phaser_.fb[0] = dataPhaser;
+            break;
+        }
+
+        case EF_COMPRESSOR: {
+            Compressor& compressor_ = effect_.compressor;
+
+            float in_abs = fabsf(input);
+            if (in_abs < 1.0e-6f)
+                in_abs = 1.0e-6f;
+            float in_dB = 20.0f * log10f(in_abs);
+
+            if (in_dB < compressor_.floorDb)
+                in_dB = compressor_.floorDb;
+
+            float gain = (in_dB > compressor_.threshold) ? (compressor_.threshold + (in_dB - compressor_.threshold) / compressor_.rate) : in_dB;
+            float gain_dB = gain - in_dB;
+
+            float gainSmooth;
+            if (gain_dB < compressor_.gainSmoothPrev) {
+                gainSmooth = ((1.0f - compressor_.attackAlpha) * gain_dB) + (compressor_.attackAlpha * compressor_.gainSmoothPrev);
+            } else {
+                gainSmooth = ((1.0f - compressor_.releaseAlpha) * gain_dB) + (compressor_.releaseAlpha * compressor_.gainSmoothPrev);
+            }
+            compressor_.gainSmoothPrev = gainSmooth;
+
+            float amp = powf(10.0f, gainSmooth / 20.0f);
+            float data = (amp * input * effect_.wetFloat) + (input * effect_.dryFloat);
+            output = effect_.genTransition.active ? (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry) : data;
+            break;
+        }
+
+        case EF_EXPANDER: {
+            Expander& expander_ = effect_.expander;
+
+            float in_abs = fabsf(input);
+            if (in_abs < 1.0e-9f)
+                in_abs = 1.0e-9f;
+            float in_dB = 20.0f * log10f(in_abs);
+
+            if (in_dB < expander_.floorDb)
+                in_dB = expander_.floorDb;
+
+            float gain = (in_dB > expander_.threshold) ? in_dB : (expander_.threshold + (in_dB - expander_.threshold) * expander_.rate);
+            float gain_dB = gain - in_dB;
+
+            float gainSmooth;
+            if (gain_dB > expander_.gainSmoothPrev) {
+                gainSmooth = ((1.0f - expander_.attackAlpha) * gain_dB) + (expander_.attackAlpha * expander_.gainSmoothPrev);
+            } else {
+                gainSmooth = ((1.0f - expander_.releaseAlpha) * gain_dB) + (expander_.releaseAlpha * expander_.gainSmoothPrev);
+            }
+            expander_.gainSmoothPrev = gainSmooth;
+
+            float amp = powf(10.0f, gainSmooth / 20.0f);
+            float data = (amp * input * effect_.wetFloat) + (input * effect_.dryFloat);
+            output = effect_.genTransition.active ? (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry) : data;
+            break;
+        }
+
+        case EF_OVERDRIVE: {
+            Overdrive& overdrive_ = effect_.overdrive;
+
+            float hpOut = input - overdrive_.hpState;
+            overdrive_.hpState = (overdrive_.preFilterAlpha * input) + ((1.0f - overdrive_.preFilterAlpha) * overdrive_.hpState);
+
+            float in_float = hpOut * overdrive_.gain;
+            float out_float;
+            if (in_float < -overdrive_.threshold) {
+                out_float = (-2.0f * overdrive_.threshold) / 3.0f;
+            } else if (in_float > overdrive_.threshold) {
+                out_float = (2.0f * overdrive_.threshold) / 3.0f;
+            } else {
+                out_float = in_float - ((in_float * in_float * in_float) / 3.0f);
+            }
+
+            if (out_float > 1.0f)
+                out_float = 1.0f;
+            if (out_float < -1.0f)
+                out_float = -1.0f;
+
+            overdrive_.dataIn[0] = out_float;
+            overdrive_.dataOut[0] = (overdrive_.a0 * overdrive_.dataIn[0]) + (overdrive_.a1 * overdrive_.dataIn[1]) + (overdrive_.a2 * overdrive_.dataIn[2]) - (overdrive_.b1 * overdrive_.dataOut[1]) - (overdrive_.b2 * overdrive_.dataOut[2]);
+
+            overdrive_.dataIn[2] = overdrive_.dataIn[1];
+            overdrive_.dataIn[1] = overdrive_.dataIn[0];
+
+            overdrive_.dataOut[2] = overdrive_.dataOut[1];
+            overdrive_.dataOut[1] = overdrive_.dataOut[0];
+
+            float filterOutput = overdrive_.dataOut[0];
+            float data = (filterOutput * effect_.wetFloat) + (input * effect_.dryFloat);
+            output = effect_.genTransition.active ? (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry) : data;
+            break;
+        }
+
+        case EF_DISTORTION: {
+            Distortion& distortion_ = effect_.distortion;
+
+            float in_float = (input * distortion_.gain) + distortion_.bias;
+            float out_float;
+            if (distortion_.gain > 0.0001f) {
+                out_float = (2.0f / distortion_.gain) * atanf(distortion_.gain * in_float) * distortion_.threshold;
+                out_float -= (distortion_.bias * 0.5f);
+            } else {
+                out_float = in_float * distortion_.threshold;
+            }
+
+            distortion_.dataIn[0] = out_float;
+            distortion_.dataOut[0] = (distortion_.a0 * distortion_.dataIn[0]) + (distortion_.a1 * distortion_.dataIn[1]) + (distortion_.a2 * distortion_.dataIn[2]) - (distortion_.b1 * distortion_.dataOut[1]) - (distortion_.b2 * distortion_.dataOut[2]);
+
+            distortion_.dataIn[2] = distortion_.dataIn[1];
+            distortion_.dataIn[1] = distortion_.dataIn[0];
+
+            distortion_.dataOut[2] = distortion_.dataOut[1];
+            distortion_.dataOut[1] = distortion_.dataOut[0];
+
+            float filterOutput = distortion_.dataOut[0];
+            float data = (filterOutput * effect_.wetFloat) + (input * effect_.dryFloat);
+            output = effect_.genTransition.active ? (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry) : data;
+            break;
+        }
+
+        case EF_BITCRUSHER: {
+            Bitcrusher& bitcrusher_ = effect_.bitcrusher;
+
+            bitcrusher_.sampleCounter += 1;
+            if (bitcrusher_.sampleCounter >= bitcrusher_.sampleCounterMax) {
+                bitcrusher_.sampleCounter = 0;
+
+                float sampleData = input;
+                float limitPos = bitcrusher_.limitMultiplier;
+                float limitNeg = -limitPos;
+
+                while ((sampleData < limitNeg) || (sampleData > limitPos)) {
+                    if (sampleData > limitPos) {
+                        if (bitcrusher_.mode == BIT_CLIP) {
+                            sampleData = limitPos;
+                        } else {
+                            sampleData = limitPos - (sampleData - limitPos);
+                            if (sampleData < 0.0f)
+                                sampleData *= -1.0f;
+                        }
+                    } else if (sampleData < limitNeg) {
+                        if (bitcrusher_.mode == BIT_CLIP) {
+                            sampleData = limitNeg;
+                        } else {
+                            sampleData = limitNeg - (sampleData - limitNeg);
+                            if (sampleData > 0.0f)
+                                sampleData *= -1.0f;
+                        }
+                    }
+                }
+
+                bitcrusher_.sampleData = (int32_t)(sampleData * (float)INT24_MAX);
+            }
+
+            int32_t dataOut = bitcrusher_.sampleData & bitcrusher_.resModifier;
+            float crushedOut = (float)dataOut / (float)INT24_MAX;
+            float smoothedOut = bitcrusher_.lastOutput + (bitcrusher_.smoothAlpha * (crushedOut - bitcrusher_.lastOutput));
+            bitcrusher_.lastOutput = smoothedOut;
+
+            float data = (smoothedOut * effect_.wetFloat) + (input * effect_.dryFloat);
+            output = effect_.genTransition.active ? (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry) : data;
+            break;
+        }
+
+        default:
+            output = input;
+            break;
+    }
+
+    return output;
+}
+
+float Controller::processAudioLpfHelper(uint8_t lpfNum_, float audio_) {
+    Lpf& lpf_ = lpf[lpfNum_];
+    if (!lpf_.active) return audio_;
+
+    float input = audio_ + FILTER_ANTI_DENORMAL;
+
+    float filteredSignal = (lpf_.a0 * input) + (lpf_.a1 * lpf_.dataIn[1]) + (lpf_.a2 * lpf_.dataIn[2]) - (lpf_.b1 * lpf_.dataOut[1]) - (lpf_.b2 * lpf_.dataOut[2]);
+
+    lpf_.dataIn[2] = lpf_.dataIn[1];
+    lpf_.dataIn[1] = input;
+
+    lpf_.dataOut[2] = lpf_.dataOut[1];
+    lpf_.dataOut[1] = filteredSignal;
+
+    return (filteredSignal * lpf_.wet) + (audio_ * lpf_.dry);
 }
 
 /* Interrupt functions -------------------------------------------------------*/
@@ -14113,23 +15674,25 @@ void Controller::interruptPlay() {
     // metro pre count state
     if (metronome.precountState) {
         // trigger bar beat
-        if ((metronome.precounter % barInterval == 0) && (!system.sync.slaveMode)) {
-            mD.active = true;
-            mD.counter = 0;
-            mD.counterMax = kMetroSize - 1;
-            mD.ramAddress = kRamMetronomeAddressLibrary[metronome.sample][0];
-            mD.volumeMultiplier = 0.75f * metronome.volumeFloat;
-
+        if (metronome.precounter % barInterval == 0) {
+            if (!system.sync.slaveMode) {
+                mD.active = true;
+                mD.counter = 0;
+                mD.counterMax = kMetronomeSampleSize - 1;
+                mD.barMeasure = false;
+                mD.volumeMultiplier = 0.75f * metronome.volumeFloat;
+            }
             metronome.countDownFlag = true;
         }
         // trigger measure beat
-        else if ((metronome.precounter % measureInterval == 0) && (!system.sync.slaveMode)) {
-            mD.active = true;
-            mD.counter = 0;
-            mD.counterMax = kMetroSize - 1;
-            mD.ramAddress = kRamMetronomeAddressLibrary[metronome.sample][1];
-            mD.volumeMultiplier = 0.75f * metronome.volumeFloat;
-
+        else if (metronome.precounter % measureInterval == 0) {
+            if (!system.sync.slaveMode) {
+                mD.active = true;
+                mD.counter = 0;
+                mD.counterMax = kMetronomeSampleSize - 1;
+                mD.barMeasure = true;
+                mD.volumeMultiplier = 0.75f * metronome.volumeFloat;
+            }
             metronome.countDownFlag = true;
         }
         // increment metro count play interval
@@ -14149,105 +15712,101 @@ void Controller::interruptPlay() {
             if ((playInterval % barInterval == 0) && (!system.sync.slaveMode)) {
                 mD.active = true;
                 mD.counter = 0;
-                mD.counterMax = kMetroSize - 1;
-                mD.ramAddress = kRamMetronomeAddressLibrary[metronome.sample][0];
+                mD.counterMax = kMetronomeSampleSize - 1;
+                mD.barMeasure = false;
                 mD.volumeMultiplier = 0.75f * metronome.volumeFloat;
             }
             // trigger measure beat
             else if ((playInterval % measureInterval == 0) && (!system.sync.slaveMode)) {
                 mD.active = true;
                 mD.counter = 0;
-                mD.counterMax = kMetroSize - 1;
-                mD.ramAddress = kRamMetronomeAddressLibrary[metronome.sample][1];
+                mD.counterMax = kMetronomeSampleSize - 1;
+                mD.barMeasure = true;
                 mD.volumeMultiplier = 0.75f * metronome.volumeFloat;
             }
         }
 
-        // beat sync
-        if ((system.syncOut == 2) && (playInterval % kMeasureHalfInterval == 0)) {
-            SYNC_OUT_ON;
-            startBeatSyncTimer();
-        }
-
         // check beat
-        Bank &bank = song.bankLibrary[activeBankNum];
+        Bank& bank = song.bankLibrary[activeBankNum];
         if (bank.lastActiveBeatNum != -1) {
-            if (bank.beatLibrary[bank.nextBeatNum].startInterval == playInterval) {
+            bool nextBeatValid = (bank.nextBeatNum >= 0) && (bank.nextBeatNum <= bank.lastActiveBeatNum);
+            if (!nextBeatValid) {
+                song_calculateNextBeatNum(activeBankNum, playInterval);
+                nextBeatValid = (bank.nextBeatNum >= 0) && (bank.nextBeatNum <= bank.lastActiveBeatNum);
+            }
+
+            bool playBeatValid = (bank.playBeatNum >= 0) && (bank.playBeatNum <= bank.lastActiveBeatNum);
+
+            if (nextBeatValid && (bank.beatLibrary[bank.nextBeatNum].startInterval == playInterval)) {
                 sD.startData.noteData = (bank.beatLibrary[bank.nextBeatNum].octave * 12) + (key.note + bank.beatLibrary[bank.nextBeatNum].note - 1);
 
                 // play note
                 if ((!recordActive) || ((recordActive) && (recordBeatNum == -1))) {
                     switch (sD.activeBeatNum) {
-                    case -1:
-                        sD.startData.active = true;
-                        sD.startData.beatNum = 0;
-                        break;
+                        case -1:
+                            sD.startData.beatNum = 0;
+                            __DMB();
+                            sD.startData.active = true;
+                            break;
 
-                    case 0:
-                        sD.startData.active = true;
-                        sD.startData.beatNum = 1;
+                        case 0:
+                            sD.startData.beatNum = 1;
+                            sD.endData.beatNum = 0;
+                            __DMB();
+                            sD.startData.active = true;
+                            sD.endData.active = true;
+                            break;
 
-                        sD.endData.active = true;
-                        sD.endData.beatNum = 0;
-                        break;
-
-                    case 1:
-                        sD.startData.active = true;
-                        sD.startData.beatNum = 0;
-
-                        sD.endData.active = true;
-                        sD.endData.beatNum = 1;
-                        break;
+                        case 1:
+                            sD.startData.beatNum = 0;
+                            sD.endData.beatNum = 1;
+                            __DMB();
+                            sD.startData.active = true;
+                            sD.endData.active = true;
+                            break;
                     }
                 }
 
                 bank.playBeatNum = bank.nextBeatNum;
                 (bank.nextBeatNum < bank.lastActiveBeatNum) ? bank.nextBeatNum += 1 : bank.nextBeatNum = 0;
-            } else if ((bank.beatLibrary[bank.playBeatNum].endInterval == playInterval)) {
+            } else if (playBeatValid && (bank.beatLibrary[bank.playBeatNum].endInterval == playInterval)) {
                 if ((!recordActive) || ((recordActive) && (bank.playBeatNum != bank.playBeatNum))) {
-                    sD.releaseData.active = true;
                     sD.releaseData.beatNum = sD.activeBeatNum;
+                    __DMB();
+                    sD.releaseData.active = true;
                 }
             }
         }
 
         // increment play interval
+        uint16_t previousPlayInterval = playInterval;
         playInterval += 1;
-        if (playInterval < songInterval) {
-            if (stopFlag) {
-                if (stopInterval == playInterval) {
-                    stop();
-                    if (playInterval == (songInterval - 1)) {
-                        playInterval = 0;
-                        if (bankShiftFlag) {
-                            bankShiftFlag = false;
-                            activeBankNum = targetBankNum;
-                            bankActionFlag = true;
-                        }
-                        Bank &bank = song.bankLibrary[activeBankNum];
-                        if (bank.lastActiveBeatNum != -1) {
-                            bank.nextBeatNum = 0;
-                        } else {
-                            bank.nextBeatNum = -1;
-                        }
+        bool wrappedToSongStart = (playInterval >= songInterval);
+        uint16_t currentPlayInterval = wrappedToSongStart ? 0 : playInterval;
 
-                        lcd_restartPlay();
-                    }
-                } else if (playInterval % (measureInterval / 2) == 0) {
-                    stopIcon.flag = true;
-                    stopIcon.mode = !stopIcon.mode;
-                }
+        if (stopFlag) {
+            if (hasReachedTransportInterval(previousPlayInterval, currentPlayInterval, stopInterval)) {
+                stop();
+            } else if (currentPlayInterval % (measureInterval / 2) == 0) {
+                stopIcon.flag = true;
+                stopIcon.mode = !stopIcon.mode;
             }
+        }
 
-            if (resetFlag) {
-                if (resetInterval == playInterval) {
-                    reset();
-                } else if (playInterval % (measureInterval / 2) == 0) {
-                    resetIcon.flag = true;
-                    resetIcon.mode = !resetIcon.mode;
-                }
+        if (resetFlag) {
+            if (hasReachedTransportInterval(previousPlayInterval, currentPlayInterval, resetInterval)) {
+                reset();
+            } else if (currentPlayInterval % (measureInterval / 2) == 0) {
+                resetIcon.flag = true;
+                resetIcon.mode = !resetIcon.mode;
             }
-        } else {
+        }
+
+        if (!playActive) {
+            return;
+        }
+
+        if (wrappedToSongStart) {
             if (recordBeatNum != -1)
                 song_endRecordBeat(activeBankNum, playInterval);
             playInterval = 0;
@@ -14256,7 +15815,7 @@ void Controller::interruptPlay() {
                 activeBankNum = targetBankNum;
                 bankActionFlag = true;
             }
-            Bank &bank = song.bankLibrary[activeBankNum];
+            Bank& bank = song.bankLibrary[activeBankNum];
             if (bank.lastActiveBeatNum != -1) {
                 bank.nextBeatNum = 0;
             } else {
@@ -14268,846 +15827,29 @@ void Controller::interruptPlay() {
     }
 }
 
-void Controller::interruptAudioMetronome() {
-    audioMetronome = 0;
-
-    if (mD.active) {
-        uint32_t address = (uint32_t)(mD.ramAddress + (mD.counter * 3));
-        audioMetronome = (sdram_read24BitAudio(address) << 8) * mD.volumeMultiplier;
-
-        if (mD.counter < mD.counterMax) {
-            mD.counter += 1;
-        } else {
-            mD.counter = 0;
-            mD.active = false;
-        }
-    }
-}
-
-void Controller::interruptAudioSong() {
-    audioSong = 0;
-
-    // start data
-    if ((sD.startData.active) && (checkSdramReadActive() == false)) {
-        startBeatPlayData(sD.startData.beatNum);
-        sD.startData.active = false;
-    }
-    // release data
-    else if (sD.releaseData.active) {
-        releaseBeatPlayData(sD.releaseData.beatNum);
-        sD.releaseData.active = false;
-    }
-    // end data
-    else if (sD.endData.active) {
-        endBeatPlayData(sD.endData.beatNum);
-        sD.endData.active = false;
-    }
-    // calculate play data
-    for (uint8_t i = 0; i < 2; i++) {
-        calculateBeatPlayData(i);
-        audioSong += sD.beatPlayData[i].data;
-    }
-
-    audioSong *= system.volumeFloat;
-
-    /*
-        if (wavRead) {
-            wavData[wavCounter] = sD.beatPlayData[0].data;
-            wavCounter += 1;
-            if (wavCounter >= 88200) {
-                wavRead = false;
-                wavWriteFlag = true;
-            }
-        }
-    */
-}
-
-void Controller::interruptAudioLpf() {
-    int32_t input = audioSong;
-
-    if (lpf.active) {
-        lpf.dataIn[0] = input;
-        lpf.dataOut[0] = (lpf.a0 * lpf.dataIn[0]) + (lpf.a1 * lpf.dataIn[1]) + (lpf.a2 * lpf.dataIn[2]) - (lpf.b1 * lpf.dataOut[1]) - (lpf.b2 * lpf.dataOut[2]);
-
-        lpf.dataIn[2] = lpf.dataIn[1];
-        lpf.dataIn[1] = lpf.dataIn[0];
-
-        lpf.dataOut[2] = lpf.dataOut[1];
-        lpf.dataOut[1] = lpf.dataOut[0];
-
-        audioLpf = (lpf.dataOut[0] * lpf.wet) + (input * lpf.dry);
-    } else {
-        audioLpf = input;
-    }
-}
-
-void Controller::interruptAudioEq() {
-    int32_t input = audioLpf;
-    int32_t output;
-
-    if ((eq.active) || (eq.genTransition.active)) {
-        // low shelf filter
-        eq.filterLowShelf.dataIn[0] = input;
-        if (eq.gainLowShelf != kEqGainZero) {
-            eq.filterLowShelf.dataOut[0] = (eq.filterLowShelf.a0 * eq.filterLowShelf.dataIn[0]) + (eq.filterLowShelf.a1 * eq.filterLowShelf.dataIn[1]) +
-                                           (eq.filterLowShelf.a2 * eq.filterLowShelf.dataIn[2]) - (eq.filterLowShelf.b1 * eq.filterLowShelf.dataOut[1]) - (eq.filterLowShelf.b2 * eq.filterLowShelf.dataOut[2]);
-        } else {
-            eq.filterLowShelf.dataOut[0] = eq.filterLowShelf.dataIn[0];
-        }
-        eq.filterLowShelf.dataIn[2] = eq.filterLowShelf.dataIn[1];
-        eq.filterLowShelf.dataIn[1] = eq.filterLowShelf.dataIn[0];
-
-        eq.filterLowShelf.dataOut[2] = eq.filterLowShelf.dataOut[1];
-        eq.filterLowShelf.dataOut[1] = eq.filterLowShelf.dataOut[0];
-
-        // high shelf filter
-        eq.filterHighShelf.dataIn[0] = eq.filterLowShelf.dataOut[0];
-        if (eq.gainHighShelf != kEqGainZero) {
-            eq.filterHighShelf.dataOut[0] = (eq.filterHighShelf.a0 * eq.filterHighShelf.dataIn[0]) + (eq.filterHighShelf.a1 * eq.filterHighShelf.dataIn[1]) +
-                                            (eq.filterHighShelf.a2 * eq.filterHighShelf.dataIn[2]) - (eq.filterHighShelf.b1 * eq.filterHighShelf.dataOut[1]) - (eq.filterHighShelf.b2 * eq.filterHighShelf.dataOut[2]);
-        } else {
-            eq.filterHighShelf.dataOut[0] = eq.filterHighShelf.dataIn[0];
-        }
-        eq.filterHighShelf.dataIn[2] = eq.filterHighShelf.dataIn[1];
-        eq.filterHighShelf.dataIn[1] = eq.filterHighShelf.dataIn[0];
-
-        eq.filterHighShelf.dataOut[2] = eq.filterHighShelf.dataOut[1];
-        eq.filterHighShelf.dataOut[1] = eq.filterHighShelf.dataOut[0];
-
-        // peak 1
-        eq.filterPeak[0].dataIn[0] = eq.filterHighShelf.dataOut[0];
-        if (eq.gainPeak[0] != kEqGainZero) {
-            eq.filterPeak[0].dataOut[0] = (eq.filterPeak[0].a0 * eq.filterPeak[0].dataIn[0]) + (eq.filterPeak[0].a1 * eq.filterPeak[0].dataIn[1]) +
-                                          (eq.filterPeak[0].a2 * eq.filterPeak[0].dataIn[2]) - (eq.filterPeak[0].b1 * eq.filterPeak[0].dataOut[1]) - (eq.filterPeak[0].b2 * eq.filterPeak[0].dataOut[2]);
-        } else {
-            eq.filterPeak[0].dataOut[0] = eq.filterPeak[0].dataIn[0];
-        }
-        eq.filterPeak[0].dataIn[2] = eq.filterPeak[0].dataIn[1];
-        eq.filterPeak[0].dataIn[1] = eq.filterPeak[0].dataIn[0];
-
-        eq.filterPeak[0].dataOut[2] = eq.filterPeak[0].dataOut[1];
-        eq.filterPeak[0].dataOut[1] = eq.filterPeak[0].dataOut[0];
-
-        // peak 2
-        eq.filterPeak[1].dataIn[0] = eq.filterPeak[0].dataOut[0];
-        if (eq.gainPeak[1] != kEqGainZero) {
-            eq.filterPeak[1].dataOut[0] = (eq.filterPeak[1].a0 * eq.filterPeak[1].dataIn[0]) + (eq.filterPeak[1].a1 * eq.filterPeak[1].dataIn[1]) +
-                                          (eq.filterPeak[1].a2 * eq.filterPeak[1].dataIn[2]) - (eq.filterPeak[1].b1 * eq.filterPeak[1].dataOut[1]) - (eq.filterPeak[1].b2 * eq.filterPeak[1].dataOut[2]);
-        } else {
-            eq.filterPeak[1].dataOut[0] = eq.filterPeak[1].dataIn[0];
-        }
-        eq.filterPeak[1].dataIn[2] = eq.filterPeak[1].dataIn[1];
-        eq.filterPeak[1].dataIn[1] = eq.filterPeak[1].dataIn[0];
-
-        eq.filterPeak[1].dataOut[2] = eq.filterPeak[1].dataOut[1];
-        eq.filterPeak[1].dataOut[1] = eq.filterPeak[1].dataOut[0];
-
-        // peak 3
-        eq.filterPeak[2].dataIn[0] = eq.filterPeak[1].dataOut[0];
-        if (eq.gainPeak[2] != kEqGainZero) {
-            eq.filterPeak[2].dataOut[0] = (eq.filterPeak[2].a0 * eq.filterPeak[2].dataIn[0]) + (eq.filterPeak[2].a1 * eq.filterPeak[2].dataIn[1]) +
-                                          (eq.filterPeak[2].a2 * eq.filterPeak[2].dataIn[2]) - (eq.filterPeak[2].b1 * eq.filterPeak[2].dataOut[1]) - (eq.filterPeak[2].b2 * eq.filterPeak[2].dataOut[2]);
-        } else {
-            eq.filterPeak[2].dataOut[0] = eq.filterPeak[2].dataIn[0];
-        }
-        eq.filterPeak[2].dataIn[2] = eq.filterPeak[2].dataIn[1];
-        eq.filterPeak[2].dataIn[1] = eq.filterPeak[2].dataIn[0];
-
-        eq.filterPeak[2].dataOut[2] = eq.filterPeak[2].dataOut[1];
-        eq.filterPeak[2].dataOut[1] = eq.filterPeak[2].dataOut[0];
-
-        // peak 4
-        eq.filterPeak[3].dataIn[0] = eq.filterPeak[2].dataOut[0];
-        if (eq.gainPeak[3] != kEqGainZero) {
-            eq.filterPeak[3].dataOut[0] = (eq.filterPeak[3].a0 * eq.filterPeak[3].dataIn[0]) + (eq.filterPeak[3].a1 * eq.filterPeak[3].dataIn[1]) +
-                                          (eq.filterPeak[3].a2 * eq.filterPeak[3].dataIn[2]) - (eq.filterPeak[3].b1 * eq.filterPeak[3].dataOut[1]) - (eq.filterPeak[3].b2 * eq.filterPeak[3].dataOut[2]);
-        } else {
-            eq.filterPeak[3].dataOut[0] = eq.filterPeak[3].dataIn[0];
-        }
-        eq.filterPeak[3].dataIn[2] = eq.filterPeak[3].dataIn[1];
-        eq.filterPeak[3].dataIn[1] = eq.filterPeak[3].dataIn[0];
-
-        eq.filterPeak[3].dataOut[2] = eq.filterPeak[3].dataOut[1];
-        eq.filterPeak[3].dataOut[1] = eq.filterPeak[3].dataOut[0];
-
-        output = eq.filterPeak[3].dataOut[0];
-    } else {
-        output = input;
-    }
-
-    if (eq.genTransition.active) {
-        audioEq = (eq.genTransition.activeWet * output) + (eq.genTransition.activeDry * input);
-    } else {
-        audioEq = output;
-    }
-}
-
-void Controller::interruptAudioFilter() {
-    int32_t outputA = processAudioFilter(0, audioEq);
-    int32_t outputB = processAudioFilter(1, outputA);
-    audioFilter = outputB;
-}
-
-void Controller::interruptAudioEffect() {
-    int32_t outputA = processAudioEffect(0, audioFilter);
-    int32_t outputB = processAudioEffect(1, outputA);
-    audioEffect = outputB;
-
-    if ((audioEffect >= INT24_MAX) || (audioEffect <= INT24_MIN)) {
-        limitAlertShowFlag = true;
-        if ((system.limiter) && (!system.volumeTransition.active) && (system.volume > kMinSystemVolume)) {
-            system_setVolume(system.volume - 1);
-        }
-    }
-}
-
-void Controller::interruptAudioReverb() {
-    int32_t input = (audioEffect << 8);
-    int32_t output_L;
-    int32_t output_R;
-
-    if ((reverb.active) || (reverb.genTransition.active)) {
-        // preDelay
-
-        reverb.preDelayBuffer[reverb.preDelay_recordInterval] = input;
-        int32_t reverbInput = reverb.preDelayBuffer[reverb.preDelay_playInterval];
-
-        if (++reverb.preDelay_playInterval > (reverb.kPreDelayBufferSize - 1))
-            reverb.preDelay_playInterval = 0;
-        if (++reverb.preDelay_recordInterval > (reverb.kPreDelayBufferSize - 1))
-            reverb.preDelay_recordInterval = 0;
-
-        // comb filter
-
-        int32_t inputData = 0;
-        int32_t combOutput = 0;
-
-        inputData = reverbInput * 0.015;
-
-        reverb.comb1Out = reverb.comb1Buffer[reverb.comb1Index];
-        reverb.comb1Filter = (reverb.comb1Out * reverb.combDecay2) + (reverb.comb1Filter * reverb.combDecay1);
-        reverb.comb1Buffer[reverb.comb1Index] = inputData + (reverb.comb1Filter * reverb.combFeedback);
-        if (++reverb.comb1Index >= reverb.comb1Size)
-            reverb.comb1Index = 0;
-        combOutput += reverb.comb1Out;
-
-        reverb.comb2Out = reverb.comb2Buffer[reverb.comb2Index];
-        reverb.comb2Filter = (reverb.comb2Out * reverb.combDecay2) + (reverb.comb2Filter * reverb.combDecay1);
-        reverb.comb2Buffer[reverb.comb2Index] = inputData + (reverb.comb2Filter * reverb.combFeedback);
-        if (++reverb.comb2Index >= reverb.comb2Size)
-            reverb.comb2Index = 0;
-        combOutput += reverb.comb2Out;
-
-        reverb.comb3Out = reverb.comb3Buffer[reverb.comb3Index];
-        reverb.comb3Filter = (reverb.comb3Out * reverb.combDecay2) + (reverb.comb3Filter * reverb.combDecay1);
-        reverb.comb3Buffer[reverb.comb3Index] = inputData + (reverb.comb3Filter * reverb.combFeedback);
-        if (++reverb.comb3Index >= reverb.comb3Size)
-            reverb.comb3Index = 0;
-        combOutput += reverb.comb3Out;
-
-        reverb.comb4Out = reverb.comb4Buffer[reverb.comb4Index];
-        reverb.comb4Filter = (reverb.comb4Out * reverb.combDecay2) + (reverb.comb4Filter * reverb.combDecay1);
-        reverb.comb4Buffer[reverb.comb4Index] = inputData + (reverb.comb4Filter * reverb.combFeedback);
-        if (++reverb.comb4Index >= reverb.comb4Size)
-            reverb.comb4Index = 0;
-        combOutput += reverb.comb4Out;
-
-        reverb.comb5Out = reverb.comb5Buffer[reverb.comb5Index];
-        reverb.comb5Filter = (reverb.comb5Out * reverb.combDecay2) + (reverb.comb5Filter * reverb.combDecay1);
-        reverb.comb5Buffer[reverb.comb5Index] = inputData + (reverb.comb5Filter * reverb.combFeedback);
-        if (++reverb.comb5Index >= reverb.comb5Size)
-            reverb.comb5Index = 0;
-        combOutput += reverb.comb5Out;
-
-        reverb.comb6Out = reverb.comb6Buffer[reverb.comb6Index];
-        reverb.comb6Filter = (reverb.comb6Out * reverb.combDecay2) + (reverb.comb6Filter * reverb.combDecay1);
-        reverb.comb6Buffer[reverb.comb6Index] = inputData + (reverb.comb6Filter * reverb.combFeedback);
-        if (++reverb.comb6Index >= reverb.comb6Size)
-            reverb.comb6Index = 0;
-        combOutput += reverb.comb6Out;
-
-        reverb.comb7Out = reverb.comb7Buffer[reverb.comb7Index];
-        reverb.comb7Filter = (reverb.comb7Out * reverb.combDecay2) + (reverb.comb7Filter * reverb.combDecay1);
-        reverb.comb7Buffer[reverb.comb7Index] = inputData + (reverb.comb7Filter * reverb.combFeedback);
-        if (++reverb.comb7Index >= reverb.comb7Size)
-            reverb.comb7Index = 0;
-        combOutput += reverb.comb7Out;
-
-        reverb.comb8Out = reverb.comb8Buffer[reverb.comb8Index];
-        reverb.comb8Filter = (reverb.comb8Out * reverb.combDecay2) + (reverb.comb8Filter * reverb.combDecay1);
-        reverb.comb8Buffer[reverb.comb8Index] = inputData + (reverb.comb8Filter * reverb.combFeedback);
-        if (++reverb.comb8Index >= reverb.comb8Size)
-            reverb.comb8Index = 0;
-        combOutput += reverb.comb8Out;
-
-        // allpass filter
-
-        reverb.apass1Out = reverb.apass1Buffer[reverb.apass1Index] - combOutput;
-        reverb.apass1Buffer[reverb.apass1Index] = combOutput + (reverb.apass1Buffer[reverb.apass1Index] * reverb.apassFeedback);
-        if (++reverb.apass1Index >= reverb.apass1Size)
-            reverb.apass1Index = 0;
-
-        reverb.apass2Out =
-            reverb.apass2Buffer[reverb.apass2Index] - reverb.apass1Out;
-        reverb.apass2Buffer[reverb.apass2Index] = reverb.apass1Out + (reverb.apass2Buffer[reverb.apass2Index] * reverb.apassFeedback);
-        if (++reverb.apass2Index >= reverb.apass2Size)
-            reverb.apass2Index = 0;
-
-        reverb.apass3Out =
-            reverb.apass3Buffer[reverb.apass3Index] - reverb.apass2Out;
-        reverb.apass3Buffer[reverb.apass3Index] = reverb.apass2Out + (reverb.apass3Buffer[reverb.apass3Index] * reverb.apassFeedback);
-        if (++reverb.apass3Index >= reverb.apass3Size)
-            reverb.apass3Index = 0;
-
-        reverb.apass4Out =
-            reverb.apass4Buffer[reverb.apass4Index] - reverb.apass3Out;
-        reverb.apass4Buffer[reverb.apass4Index] = reverb.apass3Out + (reverb.apass4Buffer[reverb.apass4Index] * reverb.apassFeedback);
-        if (++reverb.apass4Index >= reverb.apass4Size)
-            reverb.apass4Index = 0;
-
-        int32_t data =
-            (reverb.apass4Out * reverb.wetFloat) + (input * reverb.dryFloat);
-
-        int32_t audioReverb;
-
-        if (reverb.genTransition.active) {
-            audioReverb = (data * reverb.genTransition.activeWet) + (input * reverb.genTransition.activeDry);
-        } else {
-            audioReverb = data;
-        }
-
-        // surround
-
-        if ((reverb.genTransition.active) && ((reverb.genTransition.mode == REV_MODE_ACTIVE) || (reverb.genTransition.mode == REV_MODE_SURROUND))) {
-            reverb.surroundBuffer[reverb.surround_recordInterval] = audioReverb * reverb.genTransition.activeWet;
-            output_L = audioReverb;
-            output_R = (reverb.surroundBuffer[reverb.surround_playInterval] * reverb.genTransition.activeWet) + (audioReverb * reverb.genTransition.activeDry);
-        } else {
-            reverb.surroundBuffer[reverb.surround_recordInterval] = audioReverb;
-            output_L = audioReverb;
-            output_R = reverb.surroundBuffer[reverb.surround_playInterval];
-        }
-
-        if (++reverb.surround_playInterval > (reverb.kSurroundBufferSize - 1))
-            reverb.surround_playInterval = 0;
-        if (++reverb.surround_recordInterval > (reverb.kSurroundBufferSize - 1))
-            reverb.surround_recordInterval = 0;
-    } else {
-        // surround
-        output_L = input;
-        output_R = input;
-    }
-
-    audioReverb_L = output_L;
-    audioReverb_R = output_R;
-}
-
-void Controller::interruptAudioSend() {
-    audioSend_L = (audioReverb_L + audioMetronome) * system.volumeLeftFloat;
-    audioSend_R = (audioReverb_R + audioMetronome) * system.volumeRightFloat;
-
-    uint16_t audio_L0 = (uint16_t)((audioSend_L >> 16) & (0xFFFF));
-    uint16_t audio_L1 = (uint16_t)(audioSend_L & 0xFFFF);
-
-    uint16_t audio_R0 = (uint16_t)((audioSend_R >> 16) & (0xFFFF));
-    uint16_t audio_R1 = (uint16_t)(audioSend_R & 0xFFFF);
-
-    dac.i2s_data[0] = audio_L0;
-    dac.i2s_data[1] = audio_L1;
-
-    dac.i2s_data[2] = audio_R0;
-    dac.i2s_data[3] = audio_R1;
-}
-
-int32_t Controller::processAudioFilter(uint8_t filterNum_, int32_t audio_) {
-    Filter &filter_ = filter[filterNum_];
-    int32_t input = audio_;
-    int32_t output;
-
-    if ((filter_.active) || (filter_.genTransition.active)) {
-        filter_.dataIn[0] = input;
-        filter_.dataOut[0] = (filter_.a0 * filter_.dataIn[0]) + (filter_.a1 * filter_.dataIn[1]) + (filter_.a2 * filter_.dataIn[2]) - (filter_.b1 * filter_.dataOut[1]) - (filter_.b2 * filter_.dataOut[2]);
-
-        filter_.dataIn[2] = filter_.dataIn[1];
-        filter_.dataIn[1] = filter_.dataIn[0];
-
-        filter_.dataOut[2] = filter_.dataOut[1];
-        filter_.dataOut[1] = filter_.dataOut[0];
-
-        int32_t data = (filter_.dataOut[0] * filter_.wetFloat) + (input * filter_.dryFloat);
-
-        if (filter_.slope == 0)
-            data = (data / 2) + (input / 2);
-
-        if (filter_.genTransition.active) {
-            output = (data * filter_.genTransition.activeWet) + (input * filter_.genTransition.activeDry);
-        } else {
-            output = data;
-        }
-    } else {
-        output = input;
-    }
-
-    return output;
-}
-
-int32_t Controller::processAudioEffect(uint8_t effectNum_, int32_t audio_) {
-    Effect &effect_ = effect[effectNum_];
-    int32_t input = audio_;
-    int32_t output;
-
-    if ((effect_.active) || (effect_.genTransition.active)) {
-        // type selection
-        uint8_t type;
-        (effect_.genTransition.active) ? type = effect_.genTransition.activeType : type = effect_.type;
-
-        // delay
-
-        if (type == EF_DELAY) {
-            Delay &delay_ = effect_.delay;
-
-            volatile int32_t *playPtr = (volatile int32_t *)(effect_.delayAddress + (delay_.playInterval * 4));
-            volatile int32_t *recordPtr = (volatile int32_t *)(effect_.delayAddress + (delay_.recordInterval * 4));
-
-            int32_t playData = input + *playPtr;
-
-            *recordPtr = (input * delay_.level) + (*playPtr * delay_.feedback);
-
-            int32_t data = (playData * effect_.wetFloat) + (input * effect_.dryFloat);
-
-            if (effect_.genTransition.active) {
-                output = (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry);
-            } else {
-                output = data;
-            }
-
-            if (++delay_.playInterval > (kDelaySize - 1))
-                delay_.playInterval = 0;
-            if (++delay_.recordInterval > (kDelaySize - 1))
-                delay_.recordInterval = 0;
-        }
-
-        // chorus
-
-        else if (type == EF_CHORUS) {
-            Chorus &chorus_ = effect_.chorus;
-
-            int32_t dataChorus;
-            int32_t dataChorusDelay[2];
-
-            for (uint8_t i = 0; i < 2; i++) {
-                ChorusDelay &cD = chorus_.chorusDelay[i];
-
-                cD.chorusInterval = cD.playInterval + cD.shiftInterval;
-
-                if (cD.chorusInterval < 0) {
-                    cD.chorusInterval += kChorusBufferSize;
-                } else if (cD.chorusInterval > kChorusBufferSize) {
-                    cD.chorusInterval -= kChorusBufferSize;
-                }
-
-                uint16_t interval_Int0 = (uint16_t)cD.chorusInterval;
-                uint16_t interval_Int1 = interval_Int0 + 1;
-                float remainder = cD.chorusInterval - interval_Int0;
-
-                if (interval_Int1 == kChorusBufferSize)
-                    interval_Int1 = 0;
-
-                volatile int32_t *dataPtr0 = (volatile int32_t *)(effect_.chorusAddress + (interval_Int0 * 4));
-                volatile int32_t *dataPtr1 = (volatile int32_t *)(effect_.chorusAddress + (interval_Int1 * 4));
-                dataChorusDelay[i] = *dataPtr0 + ((*dataPtr1 - *dataPtr0) * remainder);
-
-                cD.shiftInterval += cD.shiftInc;
-
-                if (cD.shiftInterval <= cD.shiftMin) {
-                    cD.shiftInc *= -1;
-                    cD.shiftInterval = cD.shiftMin;
-                }
-
-                if (cD.shiftInterval >= cD.shiftMax) {
-                    cD.shiftInc *= -1;
-                    cD.shiftInterval = cD.shiftMax;
-                }
-            }
-
-            dataChorus = (dataChorusDelay[0] * chorus_.chorusDelay[0].mix) + (dataChorusDelay[1] * chorus_.chorusDelay[1].mix);
-
-            volatile int32_t *recordPtr = (volatile int32_t *)(effect_.chorusAddress + (chorus_.recordInterval * 4));
-
-            if (effect_.genTransition.active) {
-                *recordPtr = (input + (dataChorus * chorus_.feedback)) * effect_.genTransition.activeRecordWet;
-            } else {
-                *recordPtr = input + (dataChorus * chorus_.feedback);
-            }
-
-            int32_t data = (dataChorus * effect_.wetFloat) + (*recordPtr * effect_.dryFloat);
-
-            if (effect_.genTransition.active) {
-                output = (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry);
-            } else {
-                output = data;
-            }
-
-            if ((++chorus_.recordInterval) > (kChorusBufferSize - 1))
-                chorus_.recordInterval = 0;
-            if ((++chorus_.chorusDelay[0].playInterval) > (kChorusBufferSize - 1))
-                chorus_.chorusDelay[0].playInterval = 0;
-            if ((++chorus_.chorusDelay[1].playInterval) > (kChorusBufferSize - 1))
-                chorus_.chorusDelay[1].playInterval = 0;
-        }
-
-        // flanger
-
-        else if (type == EF_FLANGER) {
-            Flanger &flanger_ = effect_.flanger;
-
-            int32_t dataFlanger;
-
-            flanger_.flangerInterval = flanger_.playInterval + flanger_.shiftInterval;
-
-            if (flanger_.flangerInterval < 0) {
-                flanger_.flangerInterval += kFlangerBufferSize;
-            } else if (flanger_.flangerInterval > kFlangerBufferSize) {
-                flanger_.flangerInterval -= kFlangerBufferSize;
-            }
-
-            uint16_t interval_Int0 = (uint16_t)flanger_.flangerInterval;
-            uint16_t interval_Int1 = interval_Int0 + 1;
-            float remainder = flanger_.flangerInterval - interval_Int0;
-
-            if (interval_Int1 == kFlangerBufferSize)
-                interval_Int1 = 0;
-
-            int32_t data0 = effect_.flangerBuffer[interval_Int0];
-            int32_t data1 = effect_.flangerBuffer[interval_Int1];
-            dataFlanger = data0 + ((data1 - data0) * remainder);
-
-            if (effect_.genTransition.active) {
-                effect_.flangerBuffer[flanger_.recordInterval] = (input + (dataFlanger * flanger_.feedback)) * effect_.genTransition.activeRecordWet;
-            } else {
-                effect_.flangerBuffer[flanger_.recordInterval] = input + (dataFlanger * flanger_.feedback);
-            }
-
-            int32_t data = (dataFlanger * effect_.wetFloat) + (effect_.flangerBuffer[flanger_.recordInterval] * effect_.dryFloat);
-
-            if (effect_.genTransition.active) {
-                output = (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry);
-            } else {
-                output = data;
-            }
-
-            flanger_.shiftInterval += flanger_.shiftInc;
-
-            if (flanger_.shiftInterval <= flanger_.shiftMin) {
-                flanger_.shiftInc *= -1;
-                flanger_.shiftInterval = flanger_.shiftMin;
-            }
-
-            if (flanger_.shiftInterval >= flanger_.shiftMax) {
-                flanger_.shiftInc *= -1;
-                flanger_.shiftInterval = flanger_.shiftMax;
-            }
-
-            if ((++flanger_.recordInterval) > (kFlangerBufferSize - 1))
-                flanger_.recordInterval = 0;
-            if ((++flanger_.playInterval) > (kFlangerBufferSize - 1))
-                flanger_.playInterval = 0;
-        }
-
-        // phaser
-
-        else if (type == EF_PHASER) {
-            Phaser &phaser_ = effect_.phaser;
-
-            phaser_.lfo = phaser_.depthFreq * sin(2 * M_PI * phaser_.dataY) + phaser_.centerFreq;
-
-            phaser_.dataX += phaser_.Ts;
-            phaser_.dataY = phaser_.rate * phaser_.dataX;
-            if (phaser_.dataY >= 1.0)
-                phaser_.dataX = 0;
-
-            float w0 = 2 * M_PI * phaser_.lfo / kAudioSampleRate;
-            float cosw0 = cos(w0);
-            float sinw0 = sin(w0);
-            float alpha = sinw0 / (2 * phaser_.Q);
-
-            float b0 = 1.0 - alpha;
-            float b1 = -2.0 * cosw0;
-            float b2 = 1.0 + alpha;
-
-            float a0 = 1.0 + alpha;
-            float a1 = -2.0 * cosw0;
-            float a2 = 1.0 - alpha;
-
-            int32_t dataPhaser = ((b0 / a0) * input) + ((b1 / a0) * phaser_.ff[0]) + ((b2 / a0) * phaser_.ff[1]) - ((a1 / a0) * phaser_.fb[0]) - ((a2 / a0) * phaser_.fb[1]);
-
-            int32_t data = (dataPhaser * effect_.wetFloat) + (input * effect_.dryFloat);
-
-            if (effect_.genTransition.active) {
-                output = (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry);
-            } else {
-                output = data;
-            }
-
-            phaser_.ff[1] = phaser_.ff[0];
-            phaser_.ff[0] = input;
-            phaser_.fb[1] = phaser_.fb[0];
-            phaser_.fb[0] = dataPhaser;
-        }
-
-        // compressor
-
-        else if (type == EF_COMPRESSOR) {
-            Compressor &compressor_ = effect_.compressor;
-
-            float in_float = (float)(input) / INT24_MAX;
-            float in_abs = abs(in_float);
-            float in_dB = 20.0 * log10(in_abs / 1.0);
-
-            float gain;
-            float gain_dB;
-            float gainSmooth;
-
-            if (in_dB < -96.0)
-                in_dB = -96.0;
-            if (in_dB > compressor_.threshold) {
-                gain = compressor_.threshold + (in_dB - compressor_.threshold) / compressor_.rate;
-            } else {
-                gain = in_dB;
-            }
-            gain_dB = gain - in_dB;
-
-            if (gain_dB < compressor_.gainSmoothPrev) {
-                // attack mode
-                gainSmooth = ((1 - compressor_.attackAlpha) * gain_dB) + (compressor_.attackAlpha * compressor_.gainSmoothPrev);
-            } else {
-                // release mode
-                gainSmooth = ((1 - compressor_.releaseAlpha) * gain_dB) + (compressor_.releaseAlpha * compressor_.gainSmoothPrev);
-            }
-            compressor_.gainSmoothPrev = gainSmooth;
-
-            float amp = pow(10.0, gainSmooth / 20.0);
-
-            int32_t data =
-                (amp * input * effect_.wetFloat) + (input * effect_.dryFloat);
-
-            if (effect_.genTransition.active) {
-                output = (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry);
-            } else {
-                output = data;
-            }
-        }
-
-        // expander
-
-        else if (type == EF_EXPANDER) {
-            Expander &expander_ = effect_.expander;
-
-            float in_float = (float)(input) / INT24_MAX;
-            float in_abs = abs(in_float);
-            float in_dB = 20.0 * log10(in_abs / 1.0);
-
-            float gain;
-            float gain_dB;
-            float gainSmooth;
-
-            if (in_dB < -144.0)
-                in_dB = -144.0;
-            if (in_dB > expander_.threshold) {
-                gain = in_dB;
-            } else {
-                gain = expander_.threshold + (in_dB - expander_.threshold) * expander_.rate;
-            }
-            gain_dB = gain - in_dB;
-
-            if (gain_dB > expander_.gainSmoothPrev) {
-                // attack mode
-                gainSmooth = ((1 - expander_.attackAlpha) * gain_dB) + (expander_.attackAlpha * expander_.gainSmoothPrev);
-            } else {
-                // release mode
-                gainSmooth = ((1 - expander_.releaseAlpha) * gain_dB) + (expander_.releaseAlpha * expander_.gainSmoothPrev);
-            }
-            expander_.gainSmoothPrev = gainSmooth;
-
-            float amp = pow(10.0, gainSmooth / 20.0);
-
-            int32_t data =
-                (amp * input * effect_.wetFloat) + (input * effect_.dryFloat);
-
-            if (effect_.genTransition.active) {
-                output = (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry);
-            } else {
-                output = data;
-            }
-        }
-
-        // overdrive
-
-        else if (type == EF_OVERDRIVE) {
-            Overdrive &overdrive_ = effect_.overdrive;
-
-            double in_double = ((double)(input) / INT24_MAX) * overdrive_.gain;
-            double out_double;
-            if (in_double < -overdrive_.threshold) {
-                out_double = -2 * overdrive_.threshold / 3;
-            } else if (in_double > overdrive_.threshold) {
-                out_double = 2 * overdrive_.threshold / 3;
-            } else {
-                out_double = in_double - (in_double * in_double * in_double) / 3;
-            }
-
-            if (out_double > 1.0)
-                out_double = 1.0;
-            if (out_double < -1.0)
-                out_double = -1.0;
-
-            int32_t filterInput = out_double * INT24_MAX;
-            int32_t filterOutput;
-
-            overdrive_.dataIn[0] = filterInput;
-            overdrive_.dataOut[0] = (overdrive_.a0 * overdrive_.dataIn[0]) + (overdrive_.a1 * overdrive_.dataIn[1]) +
-                                    (overdrive_.a2 * overdrive_.dataIn[2]) - (overdrive_.b1 * overdrive_.dataOut[1]) - (overdrive_.b2 * overdrive_.dataOut[2]);
-
-            overdrive_.dataIn[2] = overdrive_.dataIn[1];
-            overdrive_.dataIn[1] = overdrive_.dataIn[0];
-
-            overdrive_.dataOut[2] = overdrive_.dataOut[1];
-            overdrive_.dataOut[1] = overdrive_.dataOut[0];
-
-            filterOutput = overdrive_.dataOut[0];
-
-            int32_t data =
-                (filterOutput * effect_.wetFloat) + (input * effect_.dryFloat);
-
-            if (effect_.genTransition.active) {
-                output = (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry);
-            } else {
-                output = data;
-            }
-        }
-
-        // distortion
-
-        else if (type == EF_DISTORTION) {
-            Distortion &distortion_ = effect_.distortion;
-
-            float in_float = ((float)(input) / INT24_MAX) * distortion_.gain;
-
-            // float out_float = (2.0 / M_PI) * atan(in_float) *
-            // distortion_.threshold; float out_float = copysign(1.0, in_float) * (1 -
-            // exp(-abs(distortion_.gain * in_float))) * distortion_.threshold; float
-            // out_float = tanh(distortion_.gain * in_float) * distortion_.threshold;
-            // float out_float = (2.0f / distortion_.gain) * tanhf(distortion_.gain *
-            // in_float) * distortion_.threshold;
-            float out_float = (2.0f / distortion_.gain) * atanf(distortion_.gain * in_float) * distortion_.threshold;
-
-            int32_t filterInput = out_float * INT24_MAX;
-            int32_t filterOutput;
-
-            distortion_.dataIn[0] = filterInput;
-            distortion_.dataOut[0] = (distortion_.a0 * distortion_.dataIn[0]) + (distortion_.a1 * distortion_.dataIn[1]) +
-                                     (distortion_.a2 * distortion_.dataIn[2]) - (distortion_.b1 * distortion_.dataOut[1]) - (distortion_.b2 * distortion_.dataOut[2]);
-
-            distortion_.dataIn[2] = distortion_.dataIn[1];
-            distortion_.dataIn[1] = distortion_.dataIn[0];
-
-            distortion_.dataOut[2] = distortion_.dataOut[1];
-            distortion_.dataOut[1] = distortion_.dataOut[0];
-
-            filterOutput = distortion_.dataOut[0];
-
-            int32_t data =
-                (filterOutput * effect_.wetFloat) + (input * effect_.dryFloat);
-
-            if (effect_.genTransition.active) {
-                output = (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry);
-            } else {
-                output = data;
-            }
-        }
-
-        // bitcrusher
-
-        else if (type == EF_BITCRUSHER) {
-            Bitcrusher &bitcrusher_ = effect_.bitcrusher;
-
-            bitcrusher_.sampleCounter += 1;
-            if (bitcrusher_.sampleCounter >= bitcrusher_.sampleCounterMax) {
-                bitcrusher_.sampleCounter = 0;
-
-                bitcrusher_.sampleData = input;
-
-                while ((bitcrusher_.sampleData < bitcrusher_.limitNeg) || (bitcrusher_.sampleData > bitcrusher_.limitPos)) {
-                    if (bitcrusher_.sampleData > bitcrusher_.limitPos) {
-                        switch (bitcrusher_.mode) {
-                        case BIT_CLIP:
-                            bitcrusher_.sampleData = bitcrusher_.limitPos;
-                            break;
-
-                        case BIT_FOLD:
-                            bitcrusher_.sampleData =
-                                bitcrusher_.limitPos -
-                                (bitcrusher_.sampleData - bitcrusher_.limitPos);
-                            if (bitcrusher_.sampleData < 0)
-                                bitcrusher_.sampleData *= -1;
-                            break;
-                        }
-                    } else if (bitcrusher_.sampleData < bitcrusher_.limitNeg) {
-                        switch (bitcrusher_.mode) {
-                        case BIT_CLIP:
-                            bitcrusher_.sampleData = bitcrusher_.limitNeg;
-                            break;
-
-                        case BIT_FOLD:
-                            bitcrusher_.sampleData =
-                                bitcrusher_.limitNeg -
-                                (bitcrusher_.sampleData - bitcrusher_.limitNeg);
-                            if (bitcrusher_.sampleData > 0)
-                                bitcrusher_.sampleData *= -1;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            int32_t dataOut = bitcrusher_.sampleData & bitcrusher_.resModifier;
-
-            int32_t data = (dataOut * effect_.wetFloat) + (input * effect_.dryFloat);
-
-            if (effect_.genTransition.active) {
-                output = (data * effect_.genTransition.activeWet) + (input * effect_.genTransition.activeDry);
-            } else {
-                output = data;
-            }
-        }
-    } else {
-        output = input;
-    }
-
-    return output;
-}
-
 void Controller::interruptTransition() {
+    static const float kChangeVal = 0.0002;
+
     // system transition
     if (system.volumeTransition.active) {
-        SystemVolumeTransition &vTransition = system.volumeTransition;
+        SystemVolumeTransition& vTransition = system.volumeTransition;
 
         switch (vTransition.actionVolume) {
-        case SYS_ACTION_UP:
-            if (system.volumeFloat >= vTransition.targetVolume) {
-                vTransition.actionVolume = SYS_ACTION_NONE;
-            } else {
-                system.volumeFloat += 0.0001;
-            }
-            break;
+            case SYS_ACTION_UP:
+                if (system.volumeFloat >= vTransition.targetVolume) {
+                    vTransition.actionVolume = SYS_ACTION_NONE;
+                } else {
+                    system.volumeFloat += kChangeVal;
+                }
+                break;
 
-        case SYS_ACTION_DOWN:
-            if (system.volumeFloat <= vTransition.targetVolume) {
-                vTransition.actionVolume = SYS_ACTION_NONE;
-            } else {
-                system.volumeFloat -= 0.0001;
-            }
-            break;
+            case SYS_ACTION_DOWN:
+                if (system.volumeFloat <= vTransition.targetVolume) {
+                    vTransition.actionVolume = SYS_ACTION_NONE;
+                } else {
+                    system.volumeFloat -= kChangeVal;
+                }
+                break;
         }
 
         if (vTransition.actionVolume == SYS_ACTION_NONE) {
@@ -15116,42 +15858,42 @@ void Controller::interruptTransition() {
     }
 
     if (system.panTransition.active) {
-        SystemPanTransition &pTransition = system.panTransition;
+        SystemPanTransition& pTransition = system.panTransition;
 
         switch (pTransition.actionVolumeLeft) {
-        case SYS_ACTION_UP:
-            if (system.volumeLeftFloat >= pTransition.targetVolumeLeft) {
-                pTransition.actionVolumeLeft = SYS_ACTION_NONE;
-            } else {
-                system.volumeLeftFloat += 0.0001;
-            }
-            break;
+            case SYS_ACTION_UP:
+                if (system.volumeLeftFloat >= pTransition.targetVolumeLeft) {
+                    pTransition.actionVolumeLeft = SYS_ACTION_NONE;
+                } else {
+                    system.volumeLeftFloat += kChangeVal;
+                }
+                break;
 
-        case SYS_ACTION_DOWN:
-            if (system.volumeLeftFloat <= pTransition.targetVolumeLeft) {
-                pTransition.actionVolumeLeft = SYS_ACTION_NONE;
-            } else {
-                system.volumeLeftFloat -= 0.0001;
-            }
-            break;
+            case SYS_ACTION_DOWN:
+                if (system.volumeLeftFloat <= pTransition.targetVolumeLeft) {
+                    pTransition.actionVolumeLeft = SYS_ACTION_NONE;
+                } else {
+                    system.volumeLeftFloat -= kChangeVal;
+                }
+                break;
         }
 
         switch (pTransition.actionVolumeRight) {
-        case SYS_ACTION_UP:
-            if (system.volumeRightFloat >= pTransition.targetVolumeRight) {
-                pTransition.actionVolumeRight = SYS_ACTION_NONE;
-            } else {
-                system.volumeRightFloat += 0.0001;
-            }
-            break;
+            case SYS_ACTION_UP:
+                if (system.volumeRightFloat >= pTransition.targetVolumeRight) {
+                    pTransition.actionVolumeRight = SYS_ACTION_NONE;
+                } else {
+                    system.volumeRightFloat += kChangeVal;
+                }
+                break;
 
-        case SYS_ACTION_DOWN:
-            if (system.volumeRightFloat <= pTransition.targetVolumeRight) {
-                pTransition.actionVolumeRight = SYS_ACTION_NONE;
-            } else {
-                system.volumeRightFloat -= 0.0001;
-            }
-            break;
+            case SYS_ACTION_DOWN:
+                if (system.volumeRightFloat <= pTransition.targetVolumeRight) {
+                    pTransition.actionVolumeRight = SYS_ACTION_NONE;
+                } else {
+                    system.volumeRightFloat -= kChangeVal;
+                }
+                break;
         }
 
         if ((pTransition.actionVolumeLeft == SYS_ACTION_NONE) &&
@@ -15162,24 +15904,24 @@ void Controller::interruptTransition() {
 
     // metronome transition
     if (metronome.volumeTransition.active) {
-        MetronomeVolumeTransition &vTransition = metronome.volumeTransition;
+        MetronomeVolumeTransition& vTransition = metronome.volumeTransition;
 
         switch (vTransition.actionVolume) {
-        case MET_ACTION_UP:
-            if (metronome.volumeFloat >= vTransition.targetVolume) {
-                vTransition.actionVolume = MET_ACTION_NONE;
-            } else {
-                metronome.volumeFloat += 0.0001;
-            }
-            break;
+            case MET_ACTION_UP:
+                if (metronome.volumeFloat >= vTransition.targetVolume) {
+                    vTransition.actionVolume = MET_ACTION_NONE;
+                } else {
+                    metronome.volumeFloat += kChangeVal;
+                }
+                break;
 
-        case MET_ACTION_DOWN:
-            if (metronome.volumeFloat <= vTransition.targetVolume) {
-                vTransition.actionVolume = MET_ACTION_NONE;
-            } else {
-                metronome.volumeFloat -= 0.0001;
-            }
-            break;
+            case MET_ACTION_DOWN:
+                if (metronome.volumeFloat <= vTransition.targetVolume) {
+                    vTransition.actionVolume = MET_ACTION_NONE;
+                } else {
+                    metronome.volumeFloat -= kChangeVal;
+                }
+                break;
         }
 
         if (vTransition.actionVolume == MET_ACTION_NONE) {
@@ -15189,60 +15931,60 @@ void Controller::interruptTransition() {
 
     // eq transition
     if (eq.genTransition.active) {
-        EqGenTransition &gTransition = eq.genTransition;
+        EqGenTransition& gTransition = eq.genTransition;
 
         switch (gTransition.actionDry) {
-        case EQ_ACTION_UP:
-            if (gTransition.activeDry >= gTransition.targetDry) {
-                gTransition.actionDry = EQ_ACTION_NONE;
-            } else {
-                gTransition.activeDry += 0.0001;
-            }
-            break;
+            case EQ_ACTION_UP:
+                if (gTransition.activeDry >= gTransition.targetDry) {
+                    gTransition.actionDry = EQ_ACTION_NONE;
+                } else {
+                    gTransition.activeDry += kChangeVal;
+                }
+                break;
 
-        case EQ_ACTION_DOWN:
-            if (gTransition.activeDry <= gTransition.targetDry) {
-                gTransition.actionDry = EQ_ACTION_NONE;
-            } else {
-                gTransition.activeDry -= 0.0001;
-            }
-            break;
+            case EQ_ACTION_DOWN:
+                if (gTransition.activeDry <= gTransition.targetDry) {
+                    gTransition.actionDry = EQ_ACTION_NONE;
+                } else {
+                    gTransition.activeDry -= kChangeVal;
+                }
+                break;
         }
 
         switch (gTransition.actionWet) {
-        case EQ_ACTION_UP:
-            if (gTransition.activeWet >= gTransition.targetWet) {
-                gTransition.actionWet = EQ_ACTION_NONE;
-            } else {
-                gTransition.activeWet += 0.0001;
-            }
-            break;
+            case EQ_ACTION_UP:
+                if (gTransition.activeWet >= gTransition.targetWet) {
+                    gTransition.actionWet = EQ_ACTION_NONE;
+                } else {
+                    gTransition.activeWet += kChangeVal;
+                }
+                break;
 
-        case EQ_ACTION_DOWN:
-            if (gTransition.activeWet <= gTransition.targetWet) {
-                gTransition.actionWet = EQ_ACTION_NONE;
-            } else {
-                gTransition.activeWet -= 0.0001;
-            }
-            break;
+            case EQ_ACTION_DOWN:
+                if (gTransition.activeWet <= gTransition.targetWet) {
+                    gTransition.actionWet = EQ_ACTION_NONE;
+                } else {
+                    gTransition.activeWet -= kChangeVal;
+                }
+                break;
         }
 
         if ((gTransition.actionDry == EQ_ACTION_NONE) &&
             (gTransition.actionWet == EQ_ACTION_NONE)) {
             switch (gTransition.mode) {
-            case EQ_MODE_NONE:
-                gTransition.active = false;
-                gTransition.mode = EQ_MODE_NONE;
-                gTransition.phase = EQ_PHASE_NONE;
-                transitionClearFlag = true;
-                break;
+                case EQ_MODE_NONE:
+                    gTransition.active = false;
+                    gTransition.mode = EQ_MODE_NONE;
+                    gTransition.phase = EQ_PHASE_NONE;
+                    transitionClearFlag = true;
+                    break;
 
-            case EQ_MODE_ACTIVE:
-                gTransition.active = false;
-                gTransition.mode = EQ_MODE_NONE;
-                gTransition.phase = EQ_PHASE_NONE;
-                transitionClearFlag = true;
-                break;
+                case EQ_MODE_ACTIVE:
+                    gTransition.active = false;
+                    gTransition.mode = EQ_MODE_NONE;
+                    gTransition.phase = EQ_PHASE_NONE;
+                    transitionClearFlag = true;
+                    break;
             }
         }
     }
@@ -15250,136 +15992,136 @@ void Controller::interruptTransition() {
     // filter transition
     for (uint8_t i = 0; i < kFilterLibrarySize; i++) {
         if (filter[i].genTransition.active) {
-            FilterGenTransition &gTransition = filter[i].genTransition;
+            FilterGenTransition& gTransition = filter[i].genTransition;
 
             switch (gTransition.actionDry) {
-            case FIL_ACTION_UP:
-                if (gTransition.activeDry >= gTransition.targetDry) {
-                    gTransition.actionDry = FIL_ACTION_NONE;
-                } else {
-                    gTransition.activeDry += 0.0001;
-                }
-                break;
+                case FIL_ACTION_UP:
+                    if (gTransition.activeDry >= gTransition.targetDry) {
+                        gTransition.actionDry = FIL_ACTION_NONE;
+                    } else {
+                        gTransition.activeDry += kChangeVal;
+                    }
+                    break;
 
-            case FIL_ACTION_DOWN:
-                if (gTransition.activeDry <= gTransition.targetDry) {
-                    gTransition.actionDry = FIL_ACTION_NONE;
-                } else {
-                    gTransition.activeDry -= 0.0001;
-                }
-                break;
+                case FIL_ACTION_DOWN:
+                    if (gTransition.activeDry <= gTransition.targetDry) {
+                        gTransition.actionDry = FIL_ACTION_NONE;
+                    } else {
+                        gTransition.activeDry -= kChangeVal;
+                    }
+                    break;
             }
 
             switch (gTransition.actionWet) {
-            case FIL_ACTION_UP:
-                if (gTransition.activeWet >= gTransition.targetWet) {
-                    gTransition.actionWet = FIL_ACTION_NONE;
-                } else {
-                    gTransition.activeWet += 0.0001;
-                }
-                break;
+                case FIL_ACTION_UP:
+                    if (gTransition.activeWet >= gTransition.targetWet) {
+                        gTransition.actionWet = FIL_ACTION_NONE;
+                    } else {
+                        gTransition.activeWet += kChangeVal;
+                    }
+                    break;
 
-            case FIL_ACTION_DOWN:
-                if (gTransition.activeWet <= gTransition.targetWet) {
-                    gTransition.actionWet = FIL_ACTION_NONE;
-                } else {
-                    gTransition.activeWet -= 0.0001;
-                }
-                break;
+                case FIL_ACTION_DOWN:
+                    if (gTransition.activeWet <= gTransition.targetWet) {
+                        gTransition.actionWet = FIL_ACTION_NONE;
+                    } else {
+                        gTransition.activeWet -= kChangeVal;
+                    }
+                    break;
             }
 
             if ((gTransition.actionDry == FIL_ACTION_NONE) &&
                 (gTransition.actionWet == FIL_ACTION_NONE)) {
                 switch (gTransition.mode) {
-                case FIL_MODE_NONE:
-                    gTransition.active = false;
-                    gTransition.mode = FIL_MODE_NONE;
-                    gTransition.phase = FIL_PHASE_NONE;
-                    transitionClearFlag = true;
-                    break;
-
-                case FIL_MODE_ACTIVE:
-                    gTransition.active = false;
-                    gTransition.mode = FIL_MODE_NONE;
-                    gTransition.phase = FIL_PHASE_NONE;
-                    transitionClearFlag = true;
-                    break;
-
-                case FIL_MODE_TYPE:
-                    switch (gTransition.phase) {
-                    case EF_PHASE_NONE:
+                    case FIL_MODE_NONE:
                         gTransition.active = false;
                         gTransition.mode = FIL_MODE_NONE;
                         gTransition.phase = FIL_PHASE_NONE;
                         transitionClearFlag = true;
                         break;
 
-                    case EF_PHASE_A:
-                        filter[i].calculateCoef();
-
-                        gTransition.phase = FIL_PHASE_B;
-
-                        gTransition.activeDry = 1.0;
-                        gTransition.targetDry = 0.0;
-
-                        gTransition.activeWet = 0.0;
-                        gTransition.targetWet = 1.0;
-
-                        filter_calculateGenTransition(i);
-
-                        transitionShowFlag = 2;
-                        break;
-
-                    case EF_PHASE_B:
+                    case FIL_MODE_ACTIVE:
                         gTransition.active = false;
                         gTransition.mode = FIL_MODE_NONE;
                         gTransition.phase = FIL_PHASE_NONE;
                         transitionClearFlag = true;
                         break;
-                    }
-                    break;
+
+                    case FIL_MODE_TYPE:
+                        switch (gTransition.phase) {
+                            case EF_PHASE_NONE:
+                                gTransition.active = false;
+                                gTransition.mode = FIL_MODE_NONE;
+                                gTransition.phase = FIL_PHASE_NONE;
+                                transitionClearFlag = true;
+                                break;
+
+                            case EF_PHASE_A:
+                                filter[i].calculateCoef();
+
+                                gTransition.phase = FIL_PHASE_B;
+
+                                gTransition.activeDry = 1.0;
+                                gTransition.targetDry = 0.0;
+
+                                gTransition.activeWet = 0.0;
+                                gTransition.targetWet = 1.0;
+
+                                filter_calculateGenTransition(i);
+
+                                transitionShowFlag = 2;
+                                break;
+
+                            case EF_PHASE_B:
+                                gTransition.active = false;
+                                gTransition.mode = FIL_MODE_NONE;
+                                gTransition.phase = FIL_PHASE_NONE;
+                                transitionClearFlag = true;
+                                break;
+                        }
+                        break;
                 }
             }
         }
 
         if (filter[i].mixTransition.active) {
-            Filter &filter_ = filter[i];
-            FilterMixTransition &mTransition = filter[i].mixTransition;
+            Filter& filter_ = filter[i];
+            FilterMixTransition& mTransition = filter[i].mixTransition;
 
             switch (mTransition.actionDry) {
-            case FIL_ACTION_UP:
-                if (filter_.dryFloat >= mTransition.targetDry) {
-                    mTransition.actionDry = FIL_ACTION_NONE;
-                } else {
-                    filter_.dryFloat += 0.0001;
-                }
-                break;
+                case FIL_ACTION_UP:
+                    if (filter_.dryFloat >= mTransition.targetDry) {
+                        mTransition.actionDry = FIL_ACTION_NONE;
+                    } else {
+                        filter_.dryFloat += kChangeVal;
+                    }
+                    break;
 
-            case FIL_ACTION_DOWN:
-                if (filter_.dryFloat <= mTransition.targetDry) {
-                    mTransition.actionDry = FIL_ACTION_NONE;
-                } else {
-                    filter_.dryFloat -= 0.0001;
-                }
-                break;
+                case FIL_ACTION_DOWN:
+                    if (filter_.dryFloat <= mTransition.targetDry) {
+                        mTransition.actionDry = FIL_ACTION_NONE;
+                    } else {
+                        filter_.dryFloat -= kChangeVal;
+                    }
+                    break;
             }
 
             switch (mTransition.actionWet) {
-            case FIL_ACTION_UP:
-                if (filter_.wetFloat >= mTransition.targetWet) {
-                    mTransition.actionWet = FIL_ACTION_NONE;
-                } else {
-                    filter_.wetFloat += 0.0001;
-                }
-                break;
+                case FIL_ACTION_UP:
+                    if (filter_.wetFloat >= mTransition.targetWet) {
+                        mTransition.actionWet = FIL_ACTION_NONE;
+                    } else {
+                        filter_.wetFloat += kChangeVal;
+                    }
+                    break;
 
-            case FIL_ACTION_DOWN:
-                if (filter_.wetFloat <= mTransition.targetWet) {
-                    mTransition.actionWet = FIL_ACTION_NONE;
-                } else {
-                    filter_.wetFloat -= 0.0001;
-                }
-                break;
+                case FIL_ACTION_DOWN:
+                    if (filter_.wetFloat <= mTransition.targetWet) {
+                        mTransition.actionWet = FIL_ACTION_NONE;
+                    } else {
+                        filter_.wetFloat -= kChangeVal;
+                    }
+                    break;
             }
 
             if ((mTransition.actionDry == FIL_ACTION_NONE) &&
@@ -15392,195 +16134,196 @@ void Controller::interruptTransition() {
     // effect transition
     for (uint8_t i = 0; i < kEffectLibrarySize; i++) {
         if (effect[i].genTransition.active) {
-            EffectGenTransition &gTransition = effect[i].genTransition;
+            EffectGenTransition& gTransition = effect[i].genTransition;
 
             switch (gTransition.actionDry) {
-            case EF_ACTION_UP:
-                if (gTransition.activeDry >= gTransition.targetDry) {
-                    gTransition.actionDry = EF_ACTION_NONE;
-                } else {
-                    gTransition.activeDry += 0.0001;
-                }
-                break;
+                case EF_ACTION_UP:
+                    if (gTransition.activeDry >= gTransition.targetDry) {
+                        gTransition.actionDry = EF_ACTION_NONE;
+                    } else {
+                        gTransition.activeDry += kChangeVal;
+                    }
+                    break;
 
-            case EF_ACTION_DOWN:
-                if (gTransition.activeDry <= gTransition.targetDry) {
-                    gTransition.actionDry = EF_ACTION_NONE;
-                } else {
-                    gTransition.activeDry -= 0.0001;
-                }
-                break;
+                case EF_ACTION_DOWN:
+                    if (gTransition.activeDry <= gTransition.targetDry) {
+                        gTransition.actionDry = EF_ACTION_NONE;
+                    } else {
+                        gTransition.activeDry -= kChangeVal;
+                    }
+                    break;
             }
 
             switch (gTransition.actionWet) {
-            case EF_ACTION_UP:
-                if (gTransition.activeWet >= gTransition.targetWet) {
-                    gTransition.actionWet = EF_ACTION_NONE;
-                } else {
-                    gTransition.activeWet += 0.0001;
-                }
-                break;
+                case EF_ACTION_UP:
+                    if (gTransition.activeWet >= gTransition.targetWet) {
+                        gTransition.actionWet = EF_ACTION_NONE;
+                    } else {
+                        gTransition.activeWet += kChangeVal;
+                    }
+                    break;
 
-            case EF_ACTION_DOWN:
-                if (gTransition.activeWet <= gTransition.targetWet) {
-                    gTransition.actionWet = EF_ACTION_NONE;
-                } else {
-                    gTransition.activeWet -= 0.0001;
-                }
-                break;
+                case EF_ACTION_DOWN:
+                    if (gTransition.activeWet <= gTransition.targetWet) {
+                        gTransition.actionWet = EF_ACTION_NONE;
+                    } else {
+                        gTransition.activeWet -= kChangeVal;
+                    }
+                    break;
             }
 
             switch (gTransition.actionRecordWet) {
-            case EF_ACTION_UP:
-                if (gTransition.activeRecordWet >= gTransition.targetRecordWet) {
-                    gTransition.actionRecordWet = EF_ACTION_NONE;
-                } else {
-                    gTransition.activeRecordWet += 0.0001;
-                }
-                break;
+                case EF_ACTION_UP:
+                    if (gTransition.activeRecordWet >= gTransition.targetRecordWet) {
+                        gTransition.actionRecordWet = EF_ACTION_NONE;
+                    } else {
+                        gTransition.activeRecordWet += kChangeVal;
+                    }
+                    break;
 
-            case EF_ACTION_DOWN:
-                if (gTransition.activeRecordWet <= gTransition.targetRecordWet) {
-                    gTransition.actionRecordWet = EF_ACTION_NONE;
-                } else {
-                    gTransition.activeRecordWet -= 0.0001;
-                }
-                break;
+                case EF_ACTION_DOWN:
+                    if (gTransition.activeRecordWet <= gTransition.targetRecordWet) {
+                        gTransition.actionRecordWet = EF_ACTION_NONE;
+                    } else {
+                        gTransition.activeRecordWet -= kChangeVal;
+                    }
+                    break;
             }
 
             if ((gTransition.actionDry == EF_ACTION_NONE) && (gTransition.actionWet == EF_ACTION_NONE) && (gTransition.actionRecordWet == EF_ACTION_NONE)) {
                 switch (gTransition.mode) {
-                case EF_MODE_NONE:
-                    gTransition.active = false;
-                    gTransition.mode = EF_MODE_NONE;
-                    gTransition.phase = EF_PHASE_NONE;
-                    transitionClearFlag = true;
-                    break;
-
-                case EF_MODE_ACTIVE:
-                    gTransition.active = false;
-                    gTransition.mode = EF_MODE_NONE;
-                    gTransition.phase = EF_PHASE_NONE;
-                    transitionClearFlag = true;
-                    break;
-
-                case EF_MODE_TYPE:
-                case EF_MODE_TIME:
-                case EF_MODE_FEEDBACK:
-                    switch (gTransition.phase) {
-                    case EF_PHASE_NONE:
+                    case EF_MODE_NONE:
                         gTransition.active = false;
                         gTransition.mode = EF_MODE_NONE;
                         gTransition.phase = EF_PHASE_NONE;
                         transitionClearFlag = true;
                         break;
 
-                    case EF_PHASE_A:
-                        switch (gTransition.mode) {
-                        case EF_MODE_TYPE:
-                            gTransition.activeType = gTransition.targetType;
-                            break;
+                    case EF_MODE_ACTIVE:
+                        gTransition.active = false;
+                        gTransition.mode = EF_MODE_NONE;
+                        gTransition.phase = EF_PHASE_NONE;
+                        transitionClearFlag = true;
+                        break;
 
-                        case EF_MODE_TIME:
-                            switch (effect[i].type) {
-                            case EF_DELAY:
-                                effect[i].delay.time = kDelayTimeDataLibrary[effect[i].delay.aTime].data;
-                                effect[i].delay.update(rhythm.tempo);
+                    case EF_MODE_TYPE:
+                    case EF_MODE_TIME:
+                    case EF_MODE_FEEDBACK:
+                        switch (gTransition.phase) {
+                            case EF_PHASE_NONE:
+                                gTransition.active = false;
+                                gTransition.mode = EF_MODE_NONE;
+                                gTransition.phase = EF_PHASE_NONE;
+                                transitionClearFlag = true;
                                 break;
 
-                            case EF_CHORUS:
-                                effect[i].chorus.time = kChorusTimeDataLibrary[effect[i].chorus.aTime].data;
-                                effect[i].chorus.update();
+                            case EF_PHASE_A:
+                                switch (gTransition.mode) {
+                                    case EF_MODE_TYPE:
+                                        gTransition.activeType = gTransition.targetType;
+                                        effect_updateMixFloats(i);
+                                        break;
+
+                                    case EF_MODE_TIME:
+                                        switch (effect[i].type) {
+                                            case EF_DELAY:
+                                                effect[i].delay.time = kDelayTimeDataLibrary[effect[i].delay.aTime].data;
+                                                effect[i].delay.update(rhythm.tempo);
+                                                break;
+
+                                            case EF_CHORUS:
+                                                effect[i].chorus.time = kChorusTimeDataLibrary[effect[i].chorus.aTime].data;
+                                                effect[i].chorus.update();
+                                                break;
+
+                                            case EF_FLANGER:
+                                                effect[i].flanger.time = kFlangerTimeDataLibrary[effect[i].flanger.aTime].data;
+                                                effect[i].flanger.update();
+                                                break;
+                                        }
+                                        break;
+
+                                    case EF_MODE_FEEDBACK:
+                                        switch (effect[i].type) {
+                                            case EF_CHORUS:
+                                                effect[i].chorus.feedback = kChorusFeedbackDataLibrary[effect[i].chorus.bFeedback].data;
+                                                effect[i].chorus.update();
+                                                break;
+
+                                            case EF_FLANGER:
+                                                effect[i].flanger.feedback = kFlangerFeedbackDataLibrary[effect[i].flanger.bFeedback].data;
+                                                effect[i].flanger.update();
+                                                break;
+                                        }
+                                        break;
+                                }
+
+                                gTransition.phase = EF_PHASE_B;
+
+                                gTransition.activeDry = 1.0;
+                                gTransition.targetDry = 0.0;
+
+                                gTransition.activeWet = 0.0;
+                                gTransition.targetWet = 1.0;
+
+                                gTransition.activeRecordWet = 0.0;
+                                gTransition.targetRecordWet = 1.0;
+
+                                effect_calculateGenTransition(i);
+
+                                transitionShowFlag = 2;
                                 break;
 
-                            case EF_FLANGER:
-                                effect[i].flanger.time = kFlangerTimeDataLibrary[effect[i].flanger.aTime].data;
-                                effect[i].flanger.update();
+                            case EF_PHASE_B:
+                                gTransition.active = false;
+                                gTransition.mode = EF_MODE_NONE;
+                                gTransition.phase = EF_PHASE_NONE;
+                                transitionClearFlag = true;
                                 break;
-                            }
-                            break;
-
-                        case EF_MODE_FEEDBACK:
-                            switch (effect[i].type) {
-                            case EF_CHORUS:
-                                effect[i].chorus.feedback = kChorusFeedbackDataLibrary[effect[i].chorus.bFeedback].data;
-                                effect[i].chorus.update();
-                                break;
-
-                            case EF_FLANGER:
-                                effect[i].flanger.feedback = kFlangerFeedbackDataLibrary[effect[i].flanger.bFeedback].data;
-                                effect[i].flanger.update();
-                                break;
-                            }
-                            break;
                         }
-
-                        gTransition.phase = EF_PHASE_B;
-
-                        gTransition.activeDry = 1.0;
-                        gTransition.targetDry = 0.0;
-
-                        gTransition.activeWet = 0.0;
-                        gTransition.targetWet = 1.0;
-
-                        gTransition.activeRecordWet = 0.0;
-                        gTransition.targetRecordWet = 1.0;
-
-                        effect_calculateGenTransition(i);
-
-                        transitionShowFlag = 2;
                         break;
-
-                    case EF_PHASE_B:
-                        gTransition.active = false;
-                        gTransition.mode = EF_MODE_NONE;
-                        gTransition.phase = EF_PHASE_NONE;
-                        transitionClearFlag = true;
-                        break;
-                    }
-                    break;
                 }
             }
         }
 
         if (effect[i].mixTransition.active) {
-            Effect &effect_ = effect[i];
-            EffectMixTransition &mTransition = effect[i].mixTransition;
+            Effect& effect_ = effect[i];
+            EffectMixTransition& mTransition = effect[i].mixTransition;
 
             switch (mTransition.actionDry) {
-            case EF_ACTION_UP:
-                if (effect_.dryFloat >= mTransition.targetDry) {
-                    mTransition.actionDry = EF_ACTION_NONE;
-                } else {
-                    effect_.dryFloat += 0.0001;
-                }
-                break;
+                case EF_ACTION_UP:
+                    if (effect_.dryFloat >= mTransition.targetDry) {
+                        mTransition.actionDry = EF_ACTION_NONE;
+                    } else {
+                        effect_.dryFloat += kChangeVal;
+                    }
+                    break;
 
-            case EF_ACTION_DOWN:
-                if (effect_.dryFloat <= mTransition.targetDry) {
-                    mTransition.actionDry = EF_ACTION_NONE;
-                } else {
-                    effect_.dryFloat -= 0.0001;
-                }
-                break;
+                case EF_ACTION_DOWN:
+                    if (effect_.dryFloat <= mTransition.targetDry) {
+                        mTransition.actionDry = EF_ACTION_NONE;
+                    } else {
+                        effect_.dryFloat -= kChangeVal;
+                    }
+                    break;
             }
 
             switch (mTransition.actionWet) {
-            case EF_ACTION_UP:
-                if (effect_.wetFloat >= mTransition.targetWet) {
-                    mTransition.actionWet = EF_ACTION_NONE;
-                } else {
-                    effect_.wetFloat += 0.0001;
-                }
-                break;
+                case EF_ACTION_UP:
+                    if (effect_.wetFloat >= mTransition.targetWet) {
+                        mTransition.actionWet = EF_ACTION_NONE;
+                    } else {
+                        effect_.wetFloat += kChangeVal;
+                    }
+                    break;
 
-            case EF_ACTION_DOWN:
-                if (effect_.wetFloat <= mTransition.targetWet) {
-                    mTransition.actionWet = EF_ACTION_NONE;
-                } else {
-                    effect_.wetFloat -= 0.0001;
-                }
-                break;
+                case EF_ACTION_DOWN:
+                    if (effect_.wetFloat <= mTransition.targetWet) {
+                        mTransition.actionWet = EF_ACTION_NONE;
+                    } else {
+                        effect_.wetFloat -= kChangeVal;
+                    }
+                    break;
             }
 
             if ((mTransition.actionDry == EF_ACTION_NONE) && (mTransition.actionWet == EF_ACTION_NONE)) {
@@ -15591,142 +16334,142 @@ void Controller::interruptTransition() {
 
     // reverb transition
     if (reverb.genTransition.active) {
-        ReverbGenTransition &gTransition = reverb.genTransition;
+        ReverbGenTransition& gTransition = reverb.genTransition;
 
         switch (gTransition.actionDry) {
-        case REV_ACTION_UP:
-            if (gTransition.activeDry >= gTransition.targetDry) {
-                gTransition.actionDry = REV_ACTION_NONE;
-            } else {
-                gTransition.activeDry += 0.0001;
-            }
-            break;
+            case REV_ACTION_UP:
+                if (gTransition.activeDry >= gTransition.targetDry) {
+                    gTransition.actionDry = REV_ACTION_NONE;
+                } else {
+                    gTransition.activeDry += kChangeVal;
+                }
+                break;
 
-        case REV_ACTION_DOWN:
-            if (gTransition.activeDry <= gTransition.targetDry) {
-                gTransition.actionDry = REV_ACTION_NONE;
-            } else {
-                gTransition.activeDry -= 0.0001;
-            }
-            break;
+            case REV_ACTION_DOWN:
+                if (gTransition.activeDry <= gTransition.targetDry) {
+                    gTransition.actionDry = REV_ACTION_NONE;
+                } else {
+                    gTransition.activeDry -= kChangeVal;
+                }
+                break;
         }
 
         switch (gTransition.actionWet) {
-        case REV_ACTION_UP:
-            if (gTransition.activeWet >= gTransition.targetWet) {
-                gTransition.actionWet = REV_ACTION_NONE;
-            } else {
-                gTransition.activeWet += 0.0001;
-            }
-            break;
+            case REV_ACTION_UP:
+                if (gTransition.activeWet >= gTransition.targetWet) {
+                    gTransition.actionWet = REV_ACTION_NONE;
+                } else {
+                    gTransition.activeWet += kChangeVal;
+                }
+                break;
 
-        case REV_ACTION_DOWN:
-            if (gTransition.activeWet <= gTransition.targetWet) {
-                gTransition.actionWet = REV_ACTION_NONE;
-            } else {
-                gTransition.activeWet -= 0.0001;
-            }
-            break;
+            case REV_ACTION_DOWN:
+                if (gTransition.activeWet <= gTransition.targetWet) {
+                    gTransition.actionWet = REV_ACTION_NONE;
+                } else {
+                    gTransition.activeWet -= kChangeVal;
+                }
+                break;
         }
 
         if ((gTransition.actionDry == REV_ACTION_NONE) && (gTransition.actionWet == REV_ACTION_NONE)) {
             switch (gTransition.mode) {
-            case REV_MODE_NONE:
-                gTransition.active = false;
-                gTransition.mode = REV_MODE_NONE;
-                gTransition.phase = REV_PHASE_NONE;
-                transitionClearFlag = true;
-                break;
-
-            case REV_MODE_ACTIVE:
-                gTransition.active = false;
-                gTransition.mode = REV_MODE_NONE;
-                gTransition.phase = REV_PHASE_NONE;
-                transitionClearFlag = true;
-                break;
-
-            case REV_MODE_PREDELAY:
-            case REV_MODE_SURROUND:
-                switch (gTransition.phase) {
-                case REV_PHASE_NONE:
+                case REV_MODE_NONE:
                     gTransition.active = false;
                     gTransition.mode = REV_MODE_NONE;
                     gTransition.phase = REV_PHASE_NONE;
                     transitionClearFlag = true;
                     break;
 
-                case REV_PHASE_A:
-                    switch (gTransition.mode) {
-                    case REV_MODE_PREDELAY:
-                        reverb.setPreDelay(kReverbPreDelayDataLibrary[reverb.preDelay].data);
-                        break;
+                case REV_MODE_ACTIVE:
+                    gTransition.active = false;
+                    gTransition.mode = REV_MODE_NONE;
+                    gTransition.phase = REV_PHASE_NONE;
+                    transitionClearFlag = true;
+                    break;
 
-                    case REV_MODE_SURROUND:
-                        reverb.setSurround(kReverbSurroundDataLibrary[reverb.surround].data);
-                        break;
+                case REV_MODE_PREDELAY:
+                case REV_MODE_SURROUND:
+                    switch (gTransition.phase) {
+                        case REV_PHASE_NONE:
+                            gTransition.active = false;
+                            gTransition.mode = REV_MODE_NONE;
+                            gTransition.phase = REV_PHASE_NONE;
+                            transitionClearFlag = true;
+                            break;
+
+                        case REV_PHASE_A:
+                            switch (gTransition.mode) {
+                                case REV_MODE_PREDELAY:
+                                    reverb.setPreDelay(kReverbPreDelayDataLibrary[reverb.preDelay].data);
+                                    break;
+
+                                case REV_MODE_SURROUND:
+                                    reverb.setSurround(kReverbSurroundDataLibrary[reverb.surround].data);
+                                    break;
+                            }
+                            gTransition.phase = REV_PHASE_B;
+
+                            gTransition.activeDry = 1.0;
+                            gTransition.targetDry = 0.0;
+
+                            gTransition.activeWet = 0.0;
+                            gTransition.targetWet = 1.0;
+
+                            reverb_calculateGenTransition();
+
+                            transitionShowFlag = 2;
+                            break;
+
+                        case REV_PHASE_B:
+                            gTransition.active = false;
+                            gTransition.mode = REV_MODE_NONE;
+                            gTransition.phase = REV_PHASE_NONE;
+                            transitionClearFlag = true;
+                            break;
                     }
-                    gTransition.phase = REV_PHASE_B;
-
-                    gTransition.activeDry = 1.0;
-                    gTransition.targetDry = 0.0;
-
-                    gTransition.activeWet = 0.0;
-                    gTransition.targetWet = 1.0;
-
-                    reverb_calculateGenTransition();
-
-                    transitionShowFlag = 2;
                     break;
-
-                case REV_PHASE_B:
-                    gTransition.active = false;
-                    gTransition.mode = REV_MODE_NONE;
-                    gTransition.phase = REV_PHASE_NONE;
-                    transitionClearFlag = true;
-                    break;
-                }
-                break;
             }
         }
     }
 
     if (reverb.mixTransition.active) {
-        ReverbMixTransition &mTransition = reverb.mixTransition;
+        ReverbMixTransition& mTransition = reverb.mixTransition;
 
         switch (mTransition.actionDry) {
-        case REV_ACTION_UP:
-            if (reverb.dryFloat >= mTransition.targetDry) {
-                mTransition.actionDry = REV_ACTION_NONE;
-            } else {
-                reverb.dryFloat += 0.0001;
-            }
-            break;
+            case REV_ACTION_UP:
+                if (reverb.dryFloat >= mTransition.targetDry) {
+                    mTransition.actionDry = REV_ACTION_NONE;
+                } else {
+                    reverb.dryFloat += kChangeVal;
+                }
+                break;
 
-        case REV_ACTION_DOWN:
-            if (reverb.dryFloat <= mTransition.targetDry) {
-                mTransition.actionDry = REV_ACTION_NONE;
-            } else {
-                reverb.dryFloat -= 0.0001;
-            }
-            break;
+            case REV_ACTION_DOWN:
+                if (reverb.dryFloat <= mTransition.targetDry) {
+                    mTransition.actionDry = REV_ACTION_NONE;
+                } else {
+                    reverb.dryFloat -= kChangeVal;
+                }
+                break;
         }
 
         switch (mTransition.actionWet) {
-        case REV_ACTION_UP:
-            if (reverb.wetFloat >= mTransition.targetWet) {
-                mTransition.actionWet = REV_ACTION_NONE;
-            } else {
-                reverb.wetFloat += 0.0001;
-            }
-            break;
+            case REV_ACTION_UP:
+                if (reverb.wetFloat >= mTransition.targetWet) {
+                    mTransition.actionWet = REV_ACTION_NONE;
+                } else {
+                    reverb.wetFloat += kChangeVal;
+                }
+                break;
 
-        case REV_ACTION_DOWN:
-            if (reverb.wetFloat <= mTransition.targetWet) {
-                mTransition.actionWet = REV_ACTION_NONE;
-            } else {
-                reverb.wetFloat -= 0.0001;
-            }
-            break;
+            case REV_ACTION_DOWN:
+                if (reverb.wetFloat <= mTransition.targetWet) {
+                    mTransition.actionWet = REV_ACTION_NONE;
+                } else {
+                    reverb.wetFloat -= kChangeVal;
+                }
+                break;
         }
 
         if ((mTransition.actionDry == REV_ACTION_NONE) && (mTransition.actionWet == REV_ACTION_NONE)) {
@@ -15755,383 +16498,546 @@ void Controller::interruptBeatButtonTrigger() {
 
 void Controller::interruptLeftButtonRead() {
     switch (keyboard.leftButtonState) {
-    case PASSIVE:
-        break;
+        case PASSIVE:
+            break;
 
-    case PREWAIT:
-        if (keyboard.leftButtonCounter < 50) {
-            keyboard.leftButtonCounter += 1;
-        } else {
-            keyboard.leftButtonState = READ;
-            keyboard.leftButtonCounter = 0;
-        }
-        break;
-
-    case READ:
-        if (keyboard.leftButtonCounter < 32) {
-            switch (keyboard.leftButtonCounter % 2) {
-            case 0:
-                CT0_SCL_LOW;
-                break;
-
-            case 1:
-                bool value = CT0_SDO_READ;
-                if (!value) {
-                    keyboard.leftButtonTemp = (keyboard.leftButtonCounter / 2) + 1;
-                }
-                CT0_SCL_HIGH;
-                break;
+        case PREWAIT:
+            if (keyboard.leftButtonCounter < 50) {
+                keyboard.leftButtonCounter += 1;
+            } else {
+                keyboard.leftButtonState = READ;
+                keyboard.leftButtonCounter = 0;
+                keyboard.leftButtonActiveCount = 0;
+                keyboard.leftButtonConfirmActiveCount = 0;
             }
-            keyboard.leftButtonCounter += 1;
-        } else {
-            keyboard.leftButtonState = POSTWAIT;
-            keyboard.leftButtonCounter = 0;
-        }
-        break;
+            break;
 
-    case POSTWAIT:
-        if (keyboard.leftButtonCounter < 1000) {
-            keyboard.leftButtonCounter += 1;
-        } else {
-            keyboard.leftButtonState = PASSIVE;
-            keyboard.leftButtonCounter = 0;
-            keyboard.leftButton = keyboard.leftButtonTemp;
-            keyboard.leftButtonTemp = 0;
-            stopLeftButtonTimer();
-        }
-        break;
+        case READ:
+            if (keyboard.leftButtonCounter < 32) {
+                switch (keyboard.leftButtonCounter % 2) {
+                    case 0:
+                        CT0_SCL_LOW;
+                        break;
 
-    default:
-        break;
+                    case 1:
+                        bool value = CT0_SDO_READ;
+                        if (!value) {
+                            keyboard.leftButtonTemp = (keyboard.leftButtonCounter / 2) + 1;
+                            keyboard.leftButtonActiveCount += 1;
+                        }
+                        CT0_SCL_HIGH;
+                        break;
+                }
+                keyboard.leftButtonCounter += 1;
+                if (keyboard.leftButtonCounter == 32) {
+                    if (keyboard.leftButtonActiveCount != 1) {
+                        keyboard.leftButtonTemp = 0;
+                    }
+                }
+            } else if (keyboard.leftButtonCounter < 64) {
+                switch (keyboard.leftButtonCounter % 2) {
+                    case 0:
+                        CT0_SCL_LOW;
+                        break;
+
+                    case 1:
+                        bool value = CT0_SDO_READ;
+                        if (!value) {
+                            keyboard.leftButtonConfirmTemp = ((keyboard.leftButtonCounter - 32) / 2) + 1;
+                            keyboard.leftButtonConfirmActiveCount += 1;
+                        }
+                        CT0_SCL_HIGH;
+                        break;
+                }
+                keyboard.leftButtonCounter += 1;
+                if (keyboard.leftButtonCounter == 64) {
+                    if (keyboard.leftButtonConfirmActiveCount != 1) {
+                        keyboard.leftButtonConfirmTemp = 0;
+                    }
+                    if (keyboard.leftButtonTemp != keyboard.leftButtonConfirmTemp) {
+                        keyboard.leftButtonTemp = 0;
+                    }
+                    keyboard.leftButtonState = POSTWAIT;
+                    keyboard.leftButtonCounter = 0;
+                }
+            }
+            break;
+
+        case POSTWAIT:
+            if (keyboard.leftButtonCounter < 1000) {
+                keyboard.leftButtonCounter += 1;
+            } else {
+                keyboard.leftButtonState = PASSIVE;
+                keyboard.leftButtonCounter = 0;
+                keyboard.leftButton = keyboard.leftButtonTemp;
+                keyboard.leftButtonTemp = 0;
+                stopLeftButtonTimer();
+            }
+            break;
+
+        default:
+            break;
     }
 }
 
 void Controller::interruptRightButtonRead() {
     switch (keyboard.rightButtonState) {
-    case PASSIVE:
-        break;
+        case PASSIVE:
+            break;
 
-    case PREWAIT:
-        if (keyboard.rightButtonCounter < 50) {
-            keyboard.rightButtonCounter += 1;
-        } else {
-            keyboard.rightButtonState = READ;
-            keyboard.rightButtonCounter = 0;
-        }
-        break;
-
-    case READ:
-        if (keyboard.rightButtonCounter < 32) {
-            switch (keyboard.rightButtonCounter % 2) {
-            case 0:
-                CT1_SCL_LOW;
-                break;
-
-            case 1:
-                bool value = CT1_SDO_READ;
-                if (!value) {
-                    keyboard.rightButtonTemp = (keyboard.rightButtonCounter / 2) + 1;
-                }
-                CT1_SCL_HIGH;
-                break;
+        case PREWAIT:
+            if (keyboard.rightButtonCounter < 50) {
+                keyboard.rightButtonCounter += 1;
+            } else {
+                keyboard.rightButtonState = READ;
+                keyboard.rightButtonCounter = 0;
+                keyboard.rightButtonActiveCount = 0;
+                keyboard.rightButtonConfirmActiveCount = 0;
             }
-            keyboard.rightButtonCounter += 1;
-        } else {
-            keyboard.rightButtonState = POSTWAIT;
-            keyboard.rightButtonCounter = 0;
-        }
-        break;
+            break;
 
-    case POSTWAIT:
-        if (keyboard.rightButtonCounter < 1000) {
-            keyboard.rightButtonCounter += 1;
-        } else {
-            keyboard.rightButtonState = PASSIVE;
-            keyboard.rightButtonCounter = 0;
-            keyboard.rightButton = keyboard.rightButtonTemp;
-            keyboard.rightButtonTemp = 0;
-            stopRightButtonTimer();
-        }
-        break;
+        case READ:
+            if (keyboard.rightButtonCounter < 32) {
+                switch (keyboard.rightButtonCounter % 2) {
+                    case 0:
+                        CT1_SCL_LOW;
+                        break;
 
-    default:
-        break;
+                    case 1:
+                        bool value = CT1_SDO_READ;
+                        if (!value) {
+                            keyboard.rightButtonTemp = (keyboard.rightButtonCounter / 2) + 1;
+                            keyboard.rightButtonActiveCount += 1;
+                        }
+                        CT1_SCL_HIGH;
+                        break;
+                }
+                keyboard.rightButtonCounter += 1;
+                if (keyboard.rightButtonCounter == 32) {
+                    if (keyboard.rightButtonActiveCount != 1) {
+                        keyboard.rightButtonTemp = 0;
+                    }
+                }
+            } else if (keyboard.rightButtonCounter < 64) {
+                switch (keyboard.rightButtonCounter % 2) {
+                    case 0:
+                        CT1_SCL_LOW;
+                        break;
+
+                    case 1:
+                        bool value = CT1_SDO_READ;
+                        if (!value) {
+                            keyboard.rightButtonConfirmTemp = ((keyboard.rightButtonCounter - 32) / 2) + 1;
+                            keyboard.rightButtonConfirmActiveCount += 1;
+                        }
+                        CT1_SCL_HIGH;
+                        break;
+                }
+                keyboard.rightButtonCounter += 1;
+                if (keyboard.rightButtonCounter == 64) {
+                    if (keyboard.rightButtonConfirmActiveCount != 1) {
+                        keyboard.rightButtonConfirmTemp = 0;
+                    }
+                    if (keyboard.rightButtonTemp != keyboard.rightButtonConfirmTemp) {
+                        keyboard.rightButtonTemp = 0;
+                    }
+                    keyboard.rightButtonState = POSTWAIT;
+                    keyboard.rightButtonCounter = 0;
+                }
+            }
+            break;
+
+        case POSTWAIT:
+            if (keyboard.rightButtonCounter < 1000) {
+                keyboard.rightButtonCounter += 1;
+            } else {
+                keyboard.rightButtonState = PASSIVE;
+                keyboard.rightButtonCounter = 0;
+                keyboard.rightButton = keyboard.rightButtonTemp;
+                keyboard.rightButtonTemp = 0;
+                stopRightButtonTimer();
+            }
+            break;
+
+        default:
+            break;
     }
 }
 
 void Controller::interruptBeatButtonRead() {
     switch (keyboard.beatButtonState) {
-    case PASSIVE:
-        break;
+        case PASSIVE:
+            break;
 
-    case PREWAIT:
-        if (keyboard.beatButtonCounter < 50) {
-            keyboard.beatButtonCounter += 1;
-        } else {
-            keyboard.beatButtonState = READ;
-            keyboard.beatButtonCounter = 0;
-        }
-        break;
-
-    case READ:
-        if (keyboard.beatButtonCounter < 32) {
-            switch (keyboard.beatButtonCounter % 2) {
-            case 0:
-                CT2_SCL_LOW;
-                break;
-
-            case 1:
-                bool value = CT2_SDO_READ;
-                if (!value) {
-                    keyboard.beatButtonTemp = (keyboard.beatButtonCounter / 2) + 1;
-                }
-                CT2_SCL_HIGH;
-                break;
+        case PREWAIT:
+            if (keyboard.beatButtonCounter < 50) {
+                keyboard.beatButtonCounter += 1;
+            } else {
+                keyboard.beatButtonState = READ;
+                keyboard.beatButtonCounter = 0;
+                keyboard.beatButtonActiveCount = 0;
+                keyboard.beatButtonConfirmActiveCount = 0;
             }
-            keyboard.beatButtonCounter += 1;
-        } else {
-            keyboard.beatButtonState = POSTWAIT;
-            keyboard.beatButtonCounter = 0;
-        }
-        break;
+            break;
 
-    case POSTWAIT:
-        if (keyboard.beatButtonCounter < 1000) {
-            keyboard.beatButtonCounter += 1;
-        } else {
-            keyboard.beatButtonState = PASSIVE;
-            keyboard.beatButtonCounter = 0;
-            keyboard.beatButton = keyboard.beatButtonTemp;
-            keyboard.beatButtonTemp = 0;
-            stopBeatButtonTimer();
-        }
-        break;
+        case READ:
+            if (keyboard.beatButtonCounter < 32) {
+                switch (keyboard.beatButtonCounter % 2) {
+                    case 0:
+                        CT2_SCL_LOW;
+                        break;
 
-    default:
-        break;
+                    case 1:
+                        bool value = CT2_SDO_READ;
+                        if (!value) {
+                            keyboard.beatButtonTemp = (keyboard.beatButtonCounter / 2) + 1;
+                            keyboard.beatButtonActiveCount += 1;
+                        }
+                        CT2_SCL_HIGH;
+                        break;
+                }
+                keyboard.beatButtonCounter += 1;
+                if (keyboard.beatButtonCounter == 32) {
+                    if (keyboard.beatButtonActiveCount != 1) {
+                        keyboard.beatButtonTemp = 0;
+                    }
+                }
+            } else if (keyboard.beatButtonCounter < 64) {
+                switch (keyboard.beatButtonCounter % 2) {
+                    case 0:
+                        CT2_SCL_LOW;
+                        break;
+
+                    case 1:
+                        bool value = CT2_SDO_READ;
+                        if (!value) {
+                            keyboard.beatButtonConfirmTemp = ((keyboard.beatButtonCounter - 32) / 2) + 1;
+                            keyboard.beatButtonConfirmActiveCount += 1;
+                        }
+                        CT2_SCL_HIGH;
+                        break;
+                }
+                keyboard.beatButtonCounter += 1;
+                if (keyboard.beatButtonCounter == 64) {
+                    if (keyboard.beatButtonConfirmActiveCount != 1) {
+                        keyboard.beatButtonConfirmTemp = 0;
+                    }
+                    if (keyboard.beatButtonTemp != keyboard.beatButtonConfirmTemp) {
+                        keyboard.beatButtonTemp = 0;
+                    }
+                    keyboard.beatButtonState = POSTWAIT;
+                    keyboard.beatButtonCounter = 0;
+                }
+            }
+            break;
+
+        case POSTWAIT:
+            if (keyboard.beatButtonCounter < 1000) {
+                keyboard.beatButtonCounter += 1;
+            } else {
+                keyboard.beatButtonState = PASSIVE;
+                keyboard.beatButtonCounter = 0;
+                keyboard.beatButton = keyboard.beatButtonTemp;
+                keyboard.beatButtonTemp = 0;
+                stopBeatButtonTimer();
+            }
+            break;
+
+        default:
+            break;
     }
 }
 
 void Controller::interruptUpDownButtonRead() {
     if (upDownButtonCounter < 2) {
         upDownButtonCounter += 1;
+    } else if (upDownRepeatCount >= kMaxUpDownRepeatCount) {
+        upButtonFlag = false;
+        downButtonFlag = false;
+        upDownRepeatCount = 0;
+        stopUpDownButtonTimer();
     } else {
+        upDownRepeatCount += 1;
         if (!alertFlag) {
             if (upButtonFlag) {
                 switch (menu) {
-                case FILE_MENU:
-                    file_menuUp();
-                    break;
+                    case FILE_MENU:
+                        file_menuUp();
+                        break;
 
-                case SYNTHKIT_MENU:
-                    synthkit_menuUp();
-                    break;
+                    case SYNTHKIT_MENU:
+                        synthkit_menuUp();
+                        break;
 
-                case SYSTEM_MENU:
-                    if ((menuTab != 3) && (menuTab != 6) && (menuTab != 7)) {
-                        system_menuUp();
-                    }
-                    break;
+                    case SYSTEM_MENU:
+                        if ((menuTab != 3) && ((menuTab != 6) || keyboard.shiftButtonPress) && ((menuTab != 7) || keyboard.shiftButtonPress)) {
+                            system_menuUp();
+                        }
+                        break;
 
-                case RHYTHM_MENU:
-                    rhythm_menuUp();
-                    break;
+                    case RHYTHM_MENU:
+                        rhythm_menuUp();
+                        break;
 
-                case METRO_MENU:
-                    if ((menuTab != 0) && (menuTab != 1)) {
-                        metro_menuUp();
-                    }
-                    break;
+                    case METRO_MENU:
+                        if ((menuTab != 0) && (menuTab != 1)) {
+                            metro_menuUp();
+                        }
+                        break;
 
-                case EQ_MENU:
-                    if (menuTab != 0) {
-                        eq_menuUp();
-                    }
-                    break;
+                    case EQ_MENU:
+                        if (menuTab != 0) {
+                            eq_menuUp();
+                        }
+                        break;
 
-                case OSC_A0_MENU:
-                    if ((menuTab != 0) && (menuTab != 2) && (menuTab != 7)) {
-                        osc_menuUp(osc[0]);
-                    }
-                    break;
+                    case OSC_A0_MENU:
+                        if ((menuTab != 0) && (menuTab != 2) && (menuTab != 7)) {
+                            osc_menuUp(osc[0]);
+                        }
+                        break;
 
-                case OSC_A1_MENU:
-                    if ((menuTab != 6) && (menuTab != 7)) {
-                        osc_menuUp(osc[0]);
-                    }
-                    break;
+                    case OSC_A1_MENU:
+                        if ((menuTab != 6) && (menuTab != 7)) {
+                            osc_menuUp(osc[0]);
+                        }
+                        break;
 
-                case OSC_A2_MENU:
-                case OSC_A3_MENU:
-                    if ((menuTab != 0) && (menuTab != 4) && (menuTab != 7)) {
-                        osc_menuUp(osc[0]);
-                    }
-                    break;
+                    case OSC_A2_MENU:
+                    case OSC_A3_MENU:
+                        if ((menuTab != 0) && (menuTab != 4) && (menuTab != 7)) {
+                            osc_menuUp(osc[0]);
+                        }
+                        break;
 
-                case OSC_B0_MENU:
-                    if ((menuTab != 0) && (menuTab != 2) && (menuTab != 7)) {
-                        osc_menuUp(osc[1]);
-                    }
-                    break;
+                    case OSC_B0_MENU:
+                        if ((menuTab != 0) && (menuTab != 2) && (menuTab != 7)) {
+                            osc_menuUp(osc[1]);
+                        }
+                        break;
 
-                case OSC_B1_MENU:
-                    if ((menuTab != 6) && (menuTab != 7)) {
-                        osc_menuUp(osc[1]);
-                    }
-                    break;
+                    case OSC_B1_MENU:
+                        if ((menuTab != 6) && (menuTab != 7)) {
+                            osc_menuUp(osc[1]);
+                        }
+                        break;
 
-                case OSC_B2_MENU:
-                case OSC_B3_MENU:
-                    if ((menuTab != 0) && (menuTab != 4) && (menuTab != 7)) {
-                        osc_menuUp(osc[1]);
-                    }
-                    break;
+                    case OSC_B2_MENU:
+                    case OSC_B3_MENU:
+                        if ((menuTab != 0) && (menuTab != 4) && (menuTab != 7)) {
+                            osc_menuUp(osc[1]);
+                        }
+                        break;
 
-                case FILTER_0_MENU:
-                case FILTER_1_MENU:
-                    if ((menuTab != 0) && (menuTab != 5)) {
-                        filter_menuUp();
-                    }
-                    break;
+                    case FILTER_0_MENU:
+                    case FILTER_1_MENU:
+                        if ((menuTab != 0) && (menuTab != 5)) {
+                            filter_menuUp();
+                        }
+                        break;
 
-                case ENVELOPE_MENU:
-                    if (menuTab != 0) {
-                        envelope_menuUp();
-                    }
-                    break;
+                    case ENVELOPE_MENU:
+                        if (menuTab != 0) {
+                            envelope_menuUp();
+                        }
+                        break;
 
-                case EFFECT_0_MENU:
-                case EFFECT_1_MENU:
-                    if (menuTab != 0) {
-                        effect_menuUp();
-                    }
-                    break;
+                    case EFFECT_0_MENU:
+                    case EFFECT_1_MENU:
+                        if (menuTab != 0) {
+                            effect_menuUp();
+                        }
+                        break;
 
-                case REVERB_MENU:
-                    if (menuTab != 0) {
-                        reverb_menuUp();
-                    }
-                    break;
+                    case REVERB_MENU:
+                        if (menuTab != 0) {
+                            reverb_menuUp();
+                        }
+                        break;
 
-                case KEY_MENU:
-                    if ((menuTab != 2) && (menuTab != 7)) {
-                        key_menuUp();
-                    }
-                    break;
+                    case KEY_MENU:
+                        if ((menuTab != 2) && (menuTab != 7)) {
+                            key_menuUp();
+                        }
+                        break;
 
-                case SONG_MENU:
-                    song_menuUp();
-                    break;
+                    case SONG_MENU:
+                        song_menuUp();
+                        break;
                 }
             } else if (downButtonFlag) {
                 switch (menu) {
-                case FILE_MENU:
-                    file_menuDown();
-                    break;
+                    case FILE_MENU:
+                        file_menuDown();
+                        break;
 
-                case SYNTHKIT_MENU:
-                    synthkit_menuDown();
-                    break;
+                    case SYNTHKIT_MENU:
+                        synthkit_menuDown();
+                        break;
 
-                case SYSTEM_MENU:
-                    if ((menuTab != 3) && (menuTab != 6) && (menuTab != 7)) {
-                        system_menuDown();
-                    }
-                    break;
+                    case SYSTEM_MENU:
+                        if ((menuTab != 3) && ((menuTab != 6) || keyboard.shiftButtonPress) && ((menuTab != 7) || keyboard.shiftButtonPress)) {
+                            system_menuDown();
+                        }
+                        break;
 
-                case RHYTHM_MENU:
-                    rhythm_menuDown();
-                    break;
+                    case RHYTHM_MENU:
+                        rhythm_menuDown();
+                        break;
 
-                case METRO_MENU:
-                    if ((menuTab != 0) && (menuTab != 1)) {
-                        metro_menuDown();
-                    }
-                    break;
+                    case METRO_MENU:
+                        if ((menuTab != 0) && (menuTab != 1)) {
+                            metro_menuDown();
+                        }
+                        break;
 
-                case EQ_MENU:
-                    if (menuTab != 0) {
-                        eq_menuDown();
-                    }
-                    break;
+                    case EQ_MENU:
+                        if (menuTab != 0) {
+                            eq_menuDown();
+                        }
+                        break;
 
-                case OSC_A0_MENU:
-                    if ((menuTab != 0) && (menuTab != 2) && (menuTab != 7)) {
-                        osc_menuDown(osc[0]);
-                    }
-                    break;
+                    case OSC_A0_MENU:
+                        if ((menuTab != 0) && (menuTab != 2) && (menuTab != 7)) {
+                            osc_menuDown(osc[0]);
+                        }
+                        break;
 
-                case OSC_A1_MENU:
-                    if ((menuTab != 6) && (menuTab != 7)) {
-                        osc_menuDown(osc[0]);
-                    }
-                    break;
+                    case OSC_A1_MENU:
+                        if ((menuTab != 6) && (menuTab != 7)) {
+                            osc_menuDown(osc[0]);
+                        }
+                        break;
 
-                case OSC_A2_MENU:
-                case OSC_A3_MENU:
-                    if ((menuTab != 0) && (menuTab != 4) && (menuTab != 7)) {
-                        osc_menuDown(osc[0]);
-                    }
-                    break;
+                    case OSC_A2_MENU:
+                    case OSC_A3_MENU:
+                        if ((menuTab != 0) && (menuTab != 4) && (menuTab != 7)) {
+                            osc_menuDown(osc[0]);
+                        }
+                        break;
 
-                case OSC_B0_MENU:
-                    if ((menuTab != 0) && (menuTab != 2) && (menuTab != 7)) {
-                        osc_menuDown(osc[1]);
-                    }
-                    break;
+                    case OSC_B0_MENU:
+                        if ((menuTab != 0) && (menuTab != 2) && (menuTab != 7)) {
+                            osc_menuDown(osc[1]);
+                        }
+                        break;
 
-                case OSC_B1_MENU:
-                    if ((menuTab != 6) && (menuTab != 7)) {
-                        osc_menuDown(osc[1]);
-                    }
-                    break;
+                    case OSC_B1_MENU:
+                        if ((menuTab != 6) && (menuTab != 7)) {
+                            osc_menuDown(osc[1]);
+                        }
+                        break;
 
-                case OSC_B2_MENU:
-                case OSC_B3_MENU:
-                    if ((menuTab != 0) && (menuTab != 4) && (menuTab != 7)) {
-                        osc_menuDown(osc[1]);
-                    }
-                    break;
+                    case OSC_B2_MENU:
+                    case OSC_B3_MENU:
+                        if ((menuTab != 0) && (menuTab != 4) && (menuTab != 7)) {
+                            osc_menuDown(osc[1]);
+                        }
+                        break;
 
-                case FILTER_0_MENU:
-                case FILTER_1_MENU:
-                    if ((menuTab != 0) && (menuTab != 5)) {
-                        filter_menuDown();
-                    }
-                    break;
+                    case FILTER_0_MENU:
+                    case FILTER_1_MENU:
+                        if ((menuTab != 0) && (menuTab != 5)) {
+                            filter_menuDown();
+                        }
+                        break;
 
-                case ENVELOPE_MENU:
-                    if (menuTab != 0) {
-                        envelope_menuDown();
-                    }
-                    break;
+                    case ENVELOPE_MENU:
+                        if (menuTab != 0) {
+                            envelope_menuDown();
+                        }
+                        break;
 
-                case EFFECT_0_MENU:
-                case EFFECT_1_MENU:
-                    if (menuTab != 0) {
-                        effect_menuDown();
-                    }
-                    break;
+                    case EFFECT_0_MENU:
+                    case EFFECT_1_MENU:
+                        if (menuTab != 0) {
+                            effect_menuDown();
+                        }
+                        break;
 
-                case REVERB_MENU:
-                    if (menuTab != 0) {
-                        reverb_menuDown();
-                    }
-                    break;
+                    case REVERB_MENU:
+                        if (menuTab != 0) {
+                            reverb_menuDown();
+                        }
+                        break;
 
-                case KEY_MENU:
-                    if ((menuTab != 2) && (menuTab != 7)) {
-                        key_menuDown();
-                    }
-                    break;
+                    case KEY_MENU:
+                        if ((menuTab != 2) && (menuTab != 7)) {
+                            key_menuDown();
+                        }
+                        break;
 
-                case SONG_MENU:
-                    song_menuDown();
-                    break;
+                    case SONG_MENU:
+                        song_menuDown();
+                        break;
                 }
             }
         }
     }
+}
+
+void Controller::interruptSyncInGate() {
+    if (system.syncIn != 2) return;
+
+    bool gateHigh = (HAL_GPIO_ReadPin(SYNC_IN_GATE_GPIO_Port, SYNC_IN_GATE_Pin) == GPIO_PIN_SET);
+    if (gateHigh != system.sync.rxGateHigh) {
+        system.sync.rxGateHigh = gateHigh;
+        if (gateHigh) {
+            system.sync.rxPlayFlag = true;
+        } else {
+            system.sync.rxStopFlag = true;
+        }
+    }
+}
+
+void Controller::interruptSyncInPulse() {
+    if (system.syncIn > 0) {
+        LED1_TOGGLE;
+    }
+
+    if (system.syncIn == 0) return;
+
+    static uint32_t rxPulseLastUs = 0;
+    static uint32_t rxPulseFilteredUs = 0;
+
+    uint32_t nowMs = HAL_GetTick();
+    uint32_t nowUs = dwt_getMicros();
+
+    if (system.sync.rxPulseLastTick == 0) {
+        rxPulseLastUs = 0;
+        rxPulseFilteredUs = 0;
+    }
+
+    if (rxPulseLastUs > 0) {
+        uint32_t intervalUs = nowUs - rxPulseLastUs;
+        const uint8_t syncInPpqnIdx = (systemSyncInPpqn <= kMaxSystemSyncPpqn) ? systemSyncInPpqn : kInitialSystemSyncInPpqn;
+        uint8_t ppqn = kSystemSyncPpqnDataLibrary[syncInPpqnIdx].ppqn;
+        uint32_t minBeatUs = 60000000UL / kMaxTempo;
+        uint32_t maxBeatUs = 60000000UL / kMinTempo;
+        uint32_t beatUsRaw = intervalUs * ppqn;
+
+        if ((intervalUs > 0) && (beatUsRaw >= minBeatUs) && (beatUsRaw <= maxBeatUs)) {
+            if (rxPulseFilteredUs == 0) {
+                rxPulseFilteredUs = intervalUs;
+            } else {
+                rxPulseFilteredUs = (rxPulseFilteredUs * 3UL + intervalUs) / 4UL;
+            }
+
+            uint32_t beatUsFiltered = rxPulseFilteredUs * ppqn;
+            system.sync.rxPulseInterval = (rxPulseFilteredUs + 500UL) / 1000UL;
+            system.sync.rxPulseBpm = (uint16_t)((60000000UL + beatUsFiltered / 2UL) / beatUsFiltered);
+            system.sync.rxPulseFlag = true;
+        }
+    }
+
+    // MODE-A: local armed play/record starts on first incoming pulse.
+    // MODE-B: gate edges drive play/stop, but if gate is already HIGH when armed, trigger on first pulse.
+    if ((syncInPlayArmed || syncInRecordArmed) && (!playActive) && ((system.syncIn != 2) || system.sync.rxGateHigh)) {
+        system.sync.rxPlayFlag = true;
+    }
+
+    rxPulseLastUs = nowUs;
+    system.sync.rxPulseLastTick = nowMs;
 }
 
 void Controller::interruptLongButtonRead() {
@@ -16153,25 +17059,25 @@ void Controller::interruptLongButtonRead() {
             if (songBeatButtonFlag) {
                 keyboard.longButtonCounter = 0;
                 switch (songBeatButtonStage) {
-                case 0:
-                    song_generateBeat(0);
-                    songBeatButtonStage = 1;
-                    break;
+                    case 0:
+                        song_generateBeat(0);
+                        songBeatButtonStage = 1;
+                        break;
 
-                case 1:
-                    song_generateBeat(1);
-                    songBeatButtonStage = 2;
-                    break;
+                    case 1:
+                        song_generateBeat(1);
+                        songBeatButtonStage = 2;
+                        break;
 
-                case 2:
-                    song_generateBeat(2);
-                    songBeatButtonFlag = false;
-                    stopLongButtonTimer();
-                    keyboard.longButtonCounter = 0;
-                    break;
+                    case 2:
+                        song_generateBeat(2);
+                        songBeatButtonFlag = false;
+                        stopLongButtonTimer();
+                        keyboard.longButtonCounter = 0;
+                        break;
 
-                default:
-                    break;
+                    default:
+                        break;
                 }
             }
 
@@ -16290,16 +17196,28 @@ void Controller::interruptBeatSync() {
     stopBeatSyncTimer();
 }
 
+void Controller::interruptMidiTxClock() {
+    if (system.midi.txSync) {
+        static const uint8_t kMidiClock = 0xF8;
+        enqueueMidiTx(&kMidiClock, 1);
+    }
+
+    const bool syncClockEnabled = (system.syncOut == 1) || ((system.syncOut == 2) && playActive);
+    if (syncClockEnabled && system.sync.syncOutBeat) {
+        static const uint16_t kMidiTicksPerBeat = 24;
+        syncOutPulseTickAccumulator += kSystemSyncPpqnDataLibrary[systemSyncOutPpqn].ppqn;
+        while (syncOutPulseTickAccumulator >= kMidiTicksPerBeat) {
+            syncOutPulseTickAccumulator -= kMidiTicksPerBeat;
+            SYNC_OUT_ON;
+            startBeatSyncTimer();
+        }
+    } else {
+        syncOutPulseTickAccumulator = 0;
+        SYNC_OUT_OFF;
+    }
+}
+
 void Controller::interruptLimitAlert() {
     stopLimitAlertTimer();
     limitAlertClearFlag = true;
 }
-
-/*
-void Controller::writeWavData() {
-    f_open(&sd.file, "Record.wav", FA_WRITE | FA_CREATE_ALWAYS);
-    f_write(&sd.file, wavIntro, sizeof(wavIntro), &sd.byteswritten);
-    f_write(&sd.file, &wavData[0], 176400, &sd.byteswritten);
-    f_close(&sd.file);
-}
-*/

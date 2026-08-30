@@ -82,7 +82,7 @@ void Dac::initialize() {
     writeRegisterFull(LINREG_CTRL_REG, 0x006C);
     writeRegisterFull(REF_CTRL_REG, 0x01F2);
     writeRegisterFull(LINE_OUT_CTRL_REG, 0x0F22);
-    writeRegisterFull(SHORT_CTRL_REG, 0x4446);
+    writeRegisterFull(SHORT_CTRL_REG, 0x4400);
     writeRegisterFull(ANA_CTRL_REG, 0x0137);
 
     // DAP Control
@@ -96,10 +96,6 @@ void Dac::initialize() {
     // writeRegisterMask(DAP_PEQ_REG, DAP_PEQ_EN_MASK, DAP_PEQ_EN_SHIFT, 0x07);
 
     writeRegisterMask(REF_CTRL_REG, REF_CTRL_SMALL_POP_MASK, REF_CTRL_SMALL_POP_SHIFT, 0x01);
-
-    // __HAL_UNLOCK(&hi2s3);
-    // __HAL_I2S_ENABLE(&hi2s3);
-    // HAL_I2S_Transmit_DMA(&hi2s3, (uint16_t*)i2s_data, 4);
 
     writeRegisterFull(ANA_POWER_REG, 0x40FF);
     writeRegisterFull(DIG_POWER_REG, 0x0073);
@@ -116,14 +112,6 @@ void Dac::initialize() {
 
     writeRegisterMask(DAP_CONTROL_REG, DAP_CONTROL_DAP_EN_MASK, DAP_CONTROL_DAP_EN_SHIFT, 0x01);
 
-    // AVC
-    // enableAVC();
-    // Surround
-    // enableSurround();
-    // setSurround(0x07);
-    // Bass Enhance
-    // disableBassEnhance();
-    // setBassEnhance(0x05, 0x1F);
     // DAC Volume
     writeRegisterMask(ADCDAC_CTRL_REG, ADCDAC_CTRL_DAC_MUTE_LEFT_MASK, ADCDAC_CTRL_DAC_MUTE_LEFT_SHIFT, 0x00);
     writeRegisterMask(ADCDAC_CTRL_REG, ADCDAC_CTRL_DAC_MUTE_RIGHT_MASK, ADCDAC_CTRL_DAC_MUTE_RIGHT_SHIFT, 0x00);

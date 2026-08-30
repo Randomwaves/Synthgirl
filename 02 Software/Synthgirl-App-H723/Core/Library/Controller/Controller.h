@@ -15,17 +15,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-extern "C" uint8_t syncInData[2];
-extern "C" uint8_t syncOutData[2];
-
 extern "C" uint8_t midiRxData;
-
-extern "C" UART_HandleTypeDef huart4; // sync-out
-extern "C" UART_HandleTypeDef huart7; // sync-in
 
 extern "C" UART_HandleTypeDef huart1; // midi-rx
 extern "C" UART_HandleTypeDef huart6; // midi-tx
 
+extern "C" TIM_HandleTypeDef htim4;  // midi clock timer
 extern "C" TIM_HandleTypeDef htim5;  // transition timer
 extern "C" TIM_HandleTypeDef htim6;  // left button timer
 extern "C" TIM_HandleTypeDef htim7;  // right button timer
@@ -46,7 +41,7 @@ bool recordBeat;
     Sys system;
     Rhythm rhythm;
     Metronome metronome;
-    Lpf lpf;
+    Lpf lpf[kLpfLibrarySize];
     Eq eq;
     Osc osc[kOscLibrarySize];
     Filter filter[kFilterLibrarySize];
@@ -60,16 +55,23 @@ bool recordBeat;
     MetroPlayData mD;
     SongPlayData sD;
 
-    int32_t audioMetronome; // 32-bit
-    int32_t audioSong;      // 24-bit
-    int32_t audioLpf;       // 24-bit
-    int32_t audioEq;        // 24-bit
-    int32_t audioFilter;    // 24-bit
-    int32_t audioEffect;    // 24-bit
-    int32_t audioReverb_L;  // 32-bit
-    int32_t audioReverb_R;  // 32-bit
-    int32_t audioSend_L;    // 32-bit
-    int32_t audioSend_R;    // 32-bit
+    float audioMetronomeBlock[I2S_BLOCK_SIZE] = {0.0f};
+    float audioSongBlock[I2S_BLOCK_SIZE] = {0.0f};
+    float audioEqBlock[I2S_BLOCK_SIZE] = {0.0f};
+    float audioFilterBlock[I2S_BLOCK_SIZE] = {0.0f};
+    float audioEffectBlock[I2S_BLOCK_SIZE] = {0.0f};
+    float audioReverbLBlock[I2S_BLOCK_SIZE] = {0.0f};
+    float audioReverbRBlock[I2S_BLOCK_SIZE] = {0.0f};
+
+    float audioMetronome;
+    float audioSong;
+    float audioEq;
+    float audioFilter;
+    float audioEffect;
+    float audioReverb_L;
+    float audioReverb_R;
+    float audioSend_L;
+    float audioSend_R;
 
     int8_t selectedBeatNum;
     int8_t recordNoteNum;
@@ -125,8 +127,12 @@ bool recordBeat;
 
     bool playActive;
     bool recordActive;
+    bool syncInPlayArmed;
+    bool syncInRecordArmed;
 
     uint32_t playTimerPeriod;
+    bool midiSyncStopRewindPending;
+    bool ignoreNextMidiStopAfterSpecialCmd;
 
     uint16_t playX;
     float playXRatio;
@@ -142,8 +148,10 @@ bool recordBeat;
     bool upButtonFlag;
     bool downButtonFlag;
     uint8_t upDownButtonCounter;
+    uint16_t upDownRepeatCount;
 
     bool songBeatButtonFlag;
+    bool songShiftButtonFlag;
     bool songClearButtonFlag;
 
     bool noteCopyButtonFlag;
@@ -162,6 +170,7 @@ bool recordBeat;
     bool limitAlertShowFlag;
     bool limitAlertClearFlag;
     bool limitAlertActive;
+    bool lastArmedAlertState;
 
     int8_t copyBeatNote;
     int8_t copyBeatOctave;
@@ -178,14 +187,14 @@ bool recordBeat;
     bool animation;
     bool textShow;
 
-    /*
-    uint32_t wavCounter = 0;
-    bool wavReadFlag = false;
-    bool wavWriteFlag = false;
-    bool wavRead = false;
-    int16_t wavData[88200] = {0};
-    void writeWavData();
-    */
+    uint16_t midiClockTickAccumulator = 0;
+    uint16_t syncOutPulseTickAccumulator = 0;
+    uint8_t systemSyncInPpqn = kInitialSystemSyncInPpqn;
+    uint8_t systemSyncOutPpqn = kInitialSystemSyncOutPpqn;
+
+    uint8_t midiTxBuffer[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+    uint8_t sdReadFailCount = 0;
 
 public:
     Controller();
@@ -208,12 +217,17 @@ public:
     void systemReset();
     void systemUpdate_A();
     void systemUpdate_B();
+    bool enqueueMidiTx(const uint8_t *data, uint8_t len);
+    void startMidiTx();
+    void serviceMidiTx();
     bool sendMidiCommand(uint8_t command_, uint8_t data0_, uint8_t data1_);
     void receiveMidiCommand();
     bool sendSyncCommand(uint8_t data_);
     void receiveSyncCommand();
     void calculateSongInterval();
     uint16_t calculateTriggerInterval();
+    bool hasJustCrossedTriggerBoundary();
+    void applyMidiSyncStopRewind();
     void adjustMeasureBarTiming();
     void updatePlayTimerPeriod();
 
@@ -226,6 +240,8 @@ public:
     void keyboard_initialize();
     void keyboard_check_A();
     void keyboard_check_B();
+    void keyboard_check_B_notes();
+    void keyboard_check_B_noteOff();
     void keyboard_check_C();
     void keyboard_enable();
     void keyboard_disable();
@@ -289,6 +305,12 @@ public:
     void stopLongButtonTimer() {
         HAL_TIM_Base_Stop_IT(&htim13);
         __HAL_TIM_SET_COUNTER(&htim13, 0);
+    }
+    void startMidiClockTimer() {
+        HAL_TIM_Base_Start_IT(&htim4);
+    }
+    void stopMidiClockTimer() {
+        HAL_TIM_Base_Stop_IT(&htim4);
     }
     void startPlayTimer() {
         HAL_TIM_Base_Start_IT(&htim14);
@@ -398,6 +420,7 @@ public:
     void lcd_clearAlert();
     // limit functions
     void lcd_drawLimitAlert();
+    void lcd_drawArmedAlert();
     // sd functions
     void lcd_drawSdDataIntro();
     void lcd_drawSdData();
@@ -444,7 +467,7 @@ public:
     void lcd_drawSystemMenu();
     void lcd_drawSystem_VolumeData();
     void lcd_drawSystem_PanData();
-    void lcd_drawSystem_LimiterData();
+    void lcd_drawSystem_NormalizeData();
     void lcd_drawSystem_MidiInData();
     void lcd_drawSystem_MidiOutData();
     void lcd_drawSystem_SyncInData();
@@ -660,11 +683,15 @@ public:
 
     void system_setVolume(uint8_t volume_);
     void system_setPan(uint8_t pan_);
-    void system_setLimiter(bool mode_);
+    void system_setNormalize(bool mode_);
     void system_setMidiIn(uint8_t mode_);
     void system_setMidiOut(uint8_t mode_);
+    void system_setMidiInChannel(uint8_t channel_);
+    void system_setMidiOutChannel(uint8_t channel_);
     void system_setSyncIn(uint8_t mode_);
     void system_setSyncOut(uint8_t mode_);
+    void system_setSyncInPpqn(uint8_t ppqnIdx_);
+    void system_setSyncOutPpqn(uint8_t ppqnIdx_);
 
     void system_volumeTransition(float volumeFloat_);
     void system_panTransition(float volumeLeftFloat_, float volumeRightFloat_);
@@ -723,7 +750,6 @@ public:
     void eq_setGainHighShelf(uint8_t gain_);
     void eq_setFreqPeak(uint8_t peakNum_, uint8_t freq_);
     void eq_setGainPeak(uint8_t peakNum_, uint8_t gain_);
-    void eq_setQPeak(uint8_t peakNum_, uint8_t q_);
 
     void eq_genTransition(EqTransitionMode mode_, bool activeActive_, bool targetActive_);
     void eq_calculateActiveTransition();
@@ -821,6 +847,7 @@ public:
     void effect_mixTransition(uint8_t effectNum_, float dryFloat_, float wetFloat_);
     void effect_calculateGenTransition(uint8_t effectNum_);
     void effect_calculateMixTransition(uint8_t effectNum_);
+    void effect_updateMixFloats(uint8_t effectNum_);
 
     void effect_cleanMemory(uint8_t effectNum_, uint8_t type_);
 
@@ -875,6 +902,7 @@ public:
     void song_menuLeft();
     void song_menuUp();
     void song_menuDown();
+    void song_shiftSelectedBeat(bool direction_);
 
     void song_startRecordBeat(uint8_t bankNum_, uint16_t interval_, uint8_t octaveNum_, uint8_t noteNum_);
     void song_endRecordBeat(uint8_t bankNum_, uint16_t interval_);
@@ -909,7 +937,7 @@ public:
 
     /* Play functions --------------------------------------------------------*/
 
-    void record();
+    void record(bool bypassPrecount = false);
     void play();
     void stop();
     void reset();
@@ -923,23 +951,28 @@ public:
     void releaseBeatPlayData(uint8_t beatNum_);
     void endBeatPlayData(uint8_t beatNum_);
     void calculateBeatPlayData(uint8_t beatNum_);
-    bool checkSdramReadActive();
+    bool checkSdramReadActive(uint8_t beatNum_);
+
+    /* Audio functions -------------------------------------------------------*/
+
+    void processAudioBlock(uint32_t *outputBuffer_);
+    
+    void processAudioMetronome();
+    void processAudioSong();
+    void processAudioEq();
+    void processAudioFilter();
+    void processAudioEffect();
+    void processAudioReverb();
+    void processAudioSend(uint32_t *outputBuffer_);
+
+    float processAudioFilterHelper(uint8_t filterNum_, float audio_);
+    float processAudioEffectHelper(uint8_t effectNum_, float audio_);
+    float processAudioLpfHelper(uint8_t lpfNum_, float audio_);
 
     /* Interrupt functions ---------------------------------------------------*/
 
+    void interruptMidiTxClock();
     void interruptPlay();
-
-    void interruptAudioMetronome();
-    void interruptAudioSong();
-    void interruptAudioLpf();
-    void interruptAudioEq();
-    void interruptAudioFilter();
-    void interruptAudioEffect();
-    void interruptAudioReverb();
-    void interruptAudioSend();
-
-    int32_t processAudioFilter(uint8_t filterNum_, int32_t audio_);
-    int32_t processAudioEffect(uint8_t effectNum_, int32_t audio_);
 
     void interruptTransition();
 
@@ -956,6 +989,8 @@ public:
     void interruptText();
     void interruptSd();
     void interruptBeatSync();
+    void interruptSyncInPulse();
+        void interruptSyncInGate();
     void interruptLimitAlert();
 
     /* Debug functions -------------------------------------------------------*/

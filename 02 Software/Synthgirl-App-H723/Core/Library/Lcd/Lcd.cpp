@@ -2029,14 +2029,40 @@ void Lcd::drawInitSdAlert(SdResult sdResult) {
             alertPtr = kSdAlertTextWavetableFolder;
             break;
 
+        case SD_ERROR_FILEFOLDER:
+            alertPtr = kSdAlertTextFileFolder;
+            break;
+
+        case SD_ERROR_SYNTHKITFOLDER:
+            alertPtr = kSdAlertTextSynthkitFolder;
+            break;
+
+        case SD_ERROR_SOUNDFOLDER:
+            alertPtr = kSdAlertTextSoundFolder;
+            break;
+
+        case SD_ERROR_IMAGEFOLDER:
+            alertPtr = kSdAlertTextImageFolder;
+            break;
+
+        case SD_ERROR_FIRMWAREFOLDER:
+            alertPtr = kSdAlertTextFirmwareFolder;
+            break;
+
         case SD_ERROR_SYSTEMFILE:
             alertPtr = kSdAlertTextSystemFile;
+            break;
+
+        default:
+            alertPtr = kSdAlertTextFormat;
             break;
     }
 
     setAlignment(CENTER);
     setFont(FONT_07x09);
-    drawText(alertPtr, strlen(alertPtr), 427, 390);
+    if (alertPtr != NULL) {
+        drawText(alertPtr, strlen(alertPtr), 427, 390);
+    }
 }
 
 void Lcd::drawInitSdReadAlert() {
